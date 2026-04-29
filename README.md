@@ -10,7 +10,7 @@ It provides:
 - a reusable Rust library for embedding the same workflows in other tools
 - shell hooks for automatic relinking when you move between repositories
 
-The current version is `0.1.2`.
+The current version is `0.1.3`.
 
 ## Install
 
@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.1.2
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.1.3
 ```
 
 Install from GitHub with Cargo:
