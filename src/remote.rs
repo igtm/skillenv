@@ -11,7 +11,8 @@ use walkdir::WalkDir;
 
 use crate::{
     LinkOptions, Report, Result, ScopeSelector, SkillenvError, TargetOverride, detect_repo_root,
-    ensure_dir, link_repo, normalize_path, slugify_or,
+    ensure_dir, include_claude_target, link_repo, load_config, normalize_path,
+    require_repo_initialized, slugify_or,
 };
 
 const LOCK_FILE_NAME: &str = "skillenv.lock.json";
@@ -143,6 +144,11 @@ enum InstalledScope {
 pub fn add_source(cwd: impl AsRef<Path>, options: AddSourceOptions) -> Result<AddSourceReport> {
     let cwd = cwd.as_ref();
     let repo_root = detect_repo_root(cwd).ok_or(SkillenvError::RepoRequired)?;
+    let loaded = load_config(None)?;
+    require_repo_initialized(
+        &repo_root,
+        include_claude_target(&loaded.config, options.claude),
+    )?;
     let parsed = parse_source(&options.source, cwd, options.ref_name.as_deref())?;
     let name = options
         .name
@@ -209,6 +215,11 @@ pub fn update_sources(
 ) -> Result<UpdateSourcesReport> {
     let cwd = cwd.as_ref();
     let repo_root = detect_repo_root(cwd).ok_or(SkillenvError::RepoRequired)?;
+    let loaded = load_config(None)?;
+    require_repo_initialized(
+        &repo_root,
+        include_claude_target(&loaded.config, options.claude),
+    )?;
     let mut lock_file = load_lock_file(&repo_root)?;
     let requested_names = normalize_selected_skills(&options.names);
     validate_requested_names(&lock_file, &requested_names)?;
@@ -1060,6 +1071,7 @@ fn run_git(args: &[String], cwd: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{InitOptions, init_repo};
 
     #[test]
     fn add_source_installs_selected_skills_and_writes_lock() -> Result<()> {
@@ -1068,6 +1080,7 @@ mod tests {
         write_skill(upstream.path(), "skills/frontend-design", "frontend")?;
         write_skill(upstream.path(), "skills/testing", "testing")?;
         commit_all(upstream.path(), "initial")?;
+        init_repo(repo.path(), InitOptions::default())?;
 
         let report = add_source(
             repo.path(),
@@ -1114,6 +1127,7 @@ mod tests {
         let upstream = git_fixture("single-skill")?;
         write_skill(upstream.path(), "web-design-guidelines", "skill body")?;
         commit_all(upstream.path(), "initial")?;
+        init_repo(repo.path(), InitOptions::default())?;
 
         let report = add_source(
             repo.path(),
@@ -1146,6 +1160,7 @@ mod tests {
         let upstream = git_fixture("agent-skills")?;
         write_skill(upstream.path(), "skills/frontend-design", "v1")?;
         commit_all(upstream.path(), "initial")?;
+        init_repo(repo.path(), InitOptions::default())?;
 
         let first = add_source(
             repo.path(),
@@ -1193,6 +1208,30 @@ mod tests {
             .unwrap()
             .contains("v2")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn add_source_requires_initialized_repo() -> Result<()> {
+        let repo = repo_fixture()?;
+        let upstream = git_fixture("agent-skills")?;
+        write_skill(upstream.path(), "skills/frontend-design", "frontend")?;
+        commit_all(upstream.path(), "initial")?;
+
+        let error = add_source(
+            repo.path(),
+            AddSourceOptions {
+                source: upstream.path().display().to_string(),
+                into: None,
+                skills: Vec::new(),
+                ref_name: None,
+                name: None,
+                claude: TargetOverride::UseConfig,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SkillenvError::RepoNotInitialized));
         Ok(())
     }
 

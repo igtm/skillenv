@@ -18,21 +18,27 @@ description: skillenv リポジトリで repo-local skill の link/unlink、remo
 ## クイックスタート
 
 ```bash
-# 1. repo-local skill を link
+# 1. repo を初期化
+skillenv init
+
+# 2. repo-local skill を link
 skillenv link
 
-# 2. remote skill pack を追加
+# 3. remote skill pack を追加
 skillenv add vercel-labs/agent-skills --skill frontend-design
 
-# 3. 現在の linked 状態を確認
+# 4. 現在の linked 状態を確認
 skillenv status
 
-# 4. 管理中の remote source を更新
+# 5. 管理中の remote source を更新
 skillenv update
 ```
 
 ## 主要 CLI
 
+- `skillenv init [--claude|--no-claude]`
+  - `skillenv/default` `skillenv/local` `skillenv/profiles` を作成します。
+  - 管理対象の `skillenv` エントリだけを `.gitignore` に追記します。
 - `skillenv link [--all] [--profile <name>...] [--claude|--no-claude] [--quiet]`
   - repo-local source と managed source を target dir に reconcile します。
   - 既定では `default` と `local` だけを対象にします。
@@ -42,8 +48,10 @@ skillenv update
   - `.agents/skills` / `.claude/skills` の linked 状態を表示します。
 - `skillenv add <source> [--skill <slug>...] [--ref <git-ref>] [--into <dir>] [--name <logical-name>]`
   - GitHub shorthand、GitHub URL、local path を managed source として導入します。
+  - 実行前に `skillenv init` が必要です。
   - `skillenv.lock.json` に記録し、install 後に即 `link` します。
 - `skillenv update [<name>...] [--claude|--no-claude]`
+  - 実行前に `skillenv init` が必要です。
   - lock 済み managed source を全件または個別更新します。
 - `skillenv hook zsh`
   - `chpwd` hook を出力します。
@@ -68,10 +76,12 @@ managed remote source は install 後に同じ layout へ正規化されます�
 ### 1. repo-local skill だけを反映する
 
 ```bash
+skillenv init
 skillenv link
 ```
 
-- `default` と `local` だけを target dir に反映します。
+- `init` は layout と `.gitignore` を 1 回だけ整えます。
+- `link` は `default` と `local` だけを target dir に反映します。
 - generated skill は `skillenv-<repo>-<scope>-<skill>` 名になります。
 
 ### 2. review profile だけを反映する
@@ -99,6 +109,9 @@ skillenv update vercel
 ### 5. zsh/bash で自動 relink する
 
 ```bash
+# 先に repo 側を 1 回初期化
+skillenv init
+
 # zsh
 eval "$(skillenv hook zsh)"
 
@@ -106,9 +119,20 @@ eval "$(skillenv hook zsh)"
 eval "$(skillenv hook bash)"
 ```
 
+- hook は `skillenv link --quiet` だけを実行し、`.gitignore` は更新しません。
+- 旧 `gitignore.auto_update` 設定に頼らず、repo ごとに `skillenv init` を実行します。
+
 ## Rust library API
 
 この crate は CLI の薄い wrapper だけでなく library としても使えます。
+
+### repo-local layout の初期化
+
+```rust
+use skillenv::{init_repo, InitOptions};
+
+let report = init_repo(".", InitOptions::default())?;
+```
 
 ### repo-local / managed source の反映
 
@@ -161,6 +185,8 @@ let report = update_sources(
 
 - `LinkOptions`
   - `selector`, `claude`, `quiet`
+- `InitOptions`
+  - `claude`
 - `UnlinkOptions`
   - `selector`, `claude`, `quiet`
 - `StatusOptions`
@@ -181,5 +207,6 @@ let report = update_sources(
 ## 判断基準
 
 - repo-local skill を反映したいだけなら `link_repo` / `skillenv link`
+- repo の layout と `.gitignore` を整えたいなら `init_repo` / `skillenv init`
 - GitHub や local git repo を lock 付きで扱いたいなら `add_source` / `update_sources`
 - shell integration が必要なら `hook_script` / `skillenv hook <shell>`

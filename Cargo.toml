@@ -1,6 +1,6 @@
 [package]
 name = "skillenv"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Manage repo-local and remote AI skills, then link them into agent skill directories."
 license = "MIT"

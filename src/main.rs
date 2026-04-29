@@ -2,10 +2,10 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use skillenv::{
-    AddSourceOptions, LinkOptions, ScopeSelector, Shell, StatusOptions, TargetOverride,
-    UnlinkOptions, UpdateSourcesOptions, add_source, format_add_source_report, format_link_report,
-    format_status_report, format_update_sources_report, hook_script, link_repo, status_repo,
-    unlink_repo, update_sources,
+    AddSourceOptions, InitOptions, LinkOptions, ScopeSelector, Shell, StatusOptions,
+    TargetOverride, UnlinkOptions, UpdateSourcesOptions, add_source, format_add_source_report,
+    format_init_report, format_link_report, format_status_report, format_update_sources_report,
+    hook_script, init_repo, link_repo, status_repo, unlink_repo, update_sources,
 };
 
 #[derive(Debug, Parser)]
@@ -19,6 +19,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Add(AddArgs),
+    Init(TargetArgs),
     Link(ScopeArgs),
     Unlink(ScopeArgs),
     Status(TargetArgs),
@@ -114,6 +115,15 @@ fn run(cli: Cli) -> skillenv::Result<String> {
                 },
             )?;
             Ok(format_add_source_report(&report))
+        }
+        Command::Init(args) => {
+            let report = init_repo(
+                ".",
+                InitOptions {
+                    claude: target_override(args.claude, args.no_claude),
+                },
+            )?;
+            Ok(format_init_report(&report))
         }
         Command::Link(args) => {
             let report = link_repo(

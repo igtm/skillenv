@@ -4,11 +4,12 @@
 
 It provides:
 
+- a one-time repo initializer for scaffolding `skillenv/` and safe `.gitignore` entries
 - a CLI for linking repo skills, installing remote skill packs, and updating them with a lock file
 - a reusable Rust library for embedding the same workflows in other tools
 - shell hooks for automatic relinking when you move between repositories
 
-The current version is `0.1.0`.
+The current version is `0.1.1`.
 
 ## Install
 
@@ -27,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.1.0
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.1.1
 ```
 
 Install from GitHub with Cargo:
@@ -45,6 +46,14 @@ cargo install --path . --locked
 ## Shell Setup
 
 `skillenv` can relink skills automatically when you change directories.
+
+Initialize each repo once before you run `link`, `add`, `update`, or any shell hook:
+
+```bash
+skillenv init
+```
+
+This creates `skillenv/default/`, `skillenv/local/`, and `skillenv/profiles/`, then adds managed `skillenv` entries to `.gitignore`. The hook only runs `skillenv link --quiet`; it does not edit `.gitignore`.
 
 For `zsh`, add this to `~/.zshrc`:
 
@@ -82,6 +91,13 @@ Generated skills are linked into:
 
 ## CLI Usage
 
+### Initialize a repo
+
+```bash
+skillenv init
+skillenv init --claude
+```
+
 ### Link repo-local skills
 
 ```bash
@@ -93,6 +109,8 @@ skillenv status
 ```
 
 ### Install remote skill packs
+
+Run `skillenv init` first so generated links and `skillenv/local/` stay ignored.
 
 Add a GitHub repo shorthand:
 
@@ -156,9 +174,6 @@ Current supported keys:
 agents = true
 claude = false
 
-[gitignore]
-auto_update = true
-
 [defaults]
 strategy = "render" # or "symlink"
 
@@ -167,15 +182,19 @@ name = "shared"
 path = "/path/to/skills"
 ```
 
+Older `[gitignore].auto_update` settings are ignored as of `0.1.1`. Use `skillenv init` to manage repo-local ignore entries instead.
+
 ## Library Usage
 
 `skillenv` also exports a Rust library.
 
 ```rust
 use skillenv::{
-    add_source, link_repo, status_repo, AddSourceOptions, LinkOptions, ScopeSelector,
-    StatusOptions, TargetOverride,
+    add_source, init_repo, link_repo, status_repo, AddSourceOptions, InitOptions, LinkOptions,
+    ScopeSelector, StatusOptions, TargetOverride,
 };
+
+let init_report = init_repo(".", InitOptions::default())?;
 
 let add_report = add_source(
     ".",
@@ -203,6 +222,7 @@ let status = status_repo(".", StatusOptions::default())?;
 
 Key exported flows:
 
+- `init_repo` for creating the repo-local layout and `.gitignore` entries
 - `link_repo` / `unlink_repo` for reconciling generated skills
 - `status_repo` for linked state inspection
 - `hook_script` for shell hook generation

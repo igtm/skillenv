@@ -31,6 +31,7 @@ pub use remote::{
 #[serde(default)]
 pub struct Config {
     pub targets: TargetsConfig,
+    // Legacy no-op field retained for backward-compatible config parsing.
     pub gitignore: GitignoreConfig,
     pub defaults: DefaultsConfig,
     pub external_sources: Vec<ExternalSourceConfig>,
@@ -54,6 +55,7 @@ impl Default for TargetsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+// Legacy no-op config retained for backward-compatible parsing.
 pub struct GitignoreConfig {
     pub auto_update: bool,
 }
@@ -145,6 +147,11 @@ pub struct StatusOptions {
     pub claude: TargetOverride,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct InitOptions {
+    pub claude: TargetOverride,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
     Zsh,
@@ -175,6 +182,13 @@ pub struct StatusReport {
     pub repo_root: Option<PathBuf>,
     pub repo_slug: Option<String>,
     pub target_statuses: Vec<TargetStatus>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InitReport {
+    pub repo_root: PathBuf,
+    pub created_dirs: Vec<PathBuf>,
+    pub gitignore_updated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +258,10 @@ pub enum SkillenvError {
     },
     #[error("repo root not detected; this command requires a git repository")]
     RepoRequired,
+    #[error(
+        "repo is not initialized for skillenv outputs; run `skillenv init` with the desired target flags first"
+    )]
+    RepoNotInitialized,
     #[error("invalid source '{input}': {message}")]
     InvalidSource { input: String, message: String },
     #[error("refusing to overwrite unmanaged target {path}")]
@@ -372,6 +390,10 @@ pub fn status_repo(cwd: impl AsRef<Path>, options: StatusOptions) -> Result<Stat
     status_repo_with_config(cwd.as_ref(), &options, None)
 }
 
+pub fn init_repo(cwd: impl AsRef<Path>, options: InitOptions) -> Result<InitReport> {
+    init_repo_with_config(cwd.as_ref(), &options, None)
+}
+
 pub fn hook_script(shell: Shell) -> String {
     match shell {
         Shell::Zsh => r#"autoload -Uz add-zsh-hook
@@ -463,6 +485,58 @@ pub fn format_status_report(report: &StatusReport) -> String {
     lines.join("\n")
 }
 
+pub fn format_init_report(report: &InitReport) -> String {
+    let mut lines = vec![format!("repo root: {}", report.repo_root.display())];
+
+    if report.created_dirs.is_empty() {
+        lines.push("skillenv layout already present".to_string());
+    } else {
+        for dir in &report.created_dirs {
+            let display = dir
+                .strip_prefix(&report.repo_root)
+                .unwrap_or(dir)
+                .display()
+                .to_string();
+            lines.push(format!("created {display}"));
+        }
+    }
+
+    if report.gitignore_updated {
+        lines.push(".gitignore updated".to_string());
+    } else {
+        lines.push(".gitignore already up to date".to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn init_repo_with_config(
+    cwd: &Path,
+    options: &InitOptions,
+    config_override: Option<&Path>,
+) -> Result<InitReport> {
+    let loaded = load_config(config_override)?;
+    let config = &loaded.config;
+    let repo_root = detect_repo_root(cwd).ok_or(SkillenvError::RepoRequired)?;
+
+    let layout_root = repo_root.join(REPO_LAYOUT_DIR);
+    ensure_dir(&layout_root)?;
+
+    let mut created_dirs = Vec::new();
+    for scope_dir in [DEFAULT_SCOPE_DIR, LOCAL_SCOPE_DIR, PROFILES_SCOPE_DIR] {
+        ensure_layout_dir(&layout_root.join(scope_dir), &mut created_dirs)?;
+    }
+
+    let gitignore_updated =
+        update_gitignore(&repo_root, include_claude_target(config, options.claude))?;
+
+    Ok(InitReport {
+        repo_root,
+        created_dirs,
+        gitignore_updated,
+    })
+}
+
 fn link_repo_with_config(
     cwd: &Path,
     options: &LinkOptions,
@@ -523,24 +597,13 @@ fn link_repo_with_config(
         });
     }
 
-    let gitignore_updated = if config.gitignore.auto_update {
-        update_gitignore(
-            &repo_root,
-            targets
-                .iter()
-                .any(|target| target.kind == TargetKind::Claude),
-        )?
-    } else {
-        false
-    };
-
     Ok(Report {
         repo_root: Some(repo_root),
         repo_slug: Some(repo_slug),
         strategy: Some(config.defaults.strategy),
         touched_scopes,
         target_reports,
-        gitignore_updated,
+        gitignore_updated: false,
         message: None,
     })
 }
@@ -722,9 +785,9 @@ fn default_config_path() -> Option<PathBuf> {
 
 fn detect_repo_root(cwd: &Path) -> Option<PathBuf> {
     let start = if cwd.is_absolute() {
-        cwd.to_path_buf()
+        normalize_path(cwd)
     } else {
-        env::current_dir().ok()?.join(cwd)
+        normalize_path(&env::current_dir().ok()?.join(cwd))
     };
 
     for candidate in start.ancestors() {
@@ -765,6 +828,10 @@ fn resolve_target_kinds(config: &Config, override_value: TargetOverride) -> Vec<
         targets.push(TargetKind::Claude);
     }
     targets
+}
+
+fn include_claude_target(config: &Config, override_value: TargetOverride) -> bool {
+    resolve_target_kinds(config, override_value).contains(&TargetKind::Claude)
 }
 
 fn discover_sources(
@@ -1270,16 +1337,51 @@ fn copy_source_tree(source_dir: &Path, target_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn update_gitignore(repo_root: &Path, include_claude: bool) -> Result<bool> {
-    let gitignore_path = repo_root.join(".gitignore");
-    let mut patterns = vec![
-        ".agents/skills/skillenv-*".to_string(),
-        "skillenv/local/".to_string(),
-    ];
+fn gitignore_patterns(include_claude: bool) -> Vec<&'static str> {
+    let mut patterns = vec![".agents/skills/skillenv-*", "skillenv/local/"];
     if include_claude {
-        patterns.push(".claude/skills/skillenv-*".to_string());
+        patterns.push(".claude/skills/skillenv-*");
+    }
+    patterns
+}
+
+fn repo_is_initialized(repo_root: &Path, include_claude: bool) -> Result<bool> {
+    for scope_dir in [DEFAULT_SCOPE_DIR, LOCAL_SCOPE_DIR, PROFILES_SCOPE_DIR] {
+        if !repo_root.join(REPO_LAYOUT_DIR).join(scope_dir).is_dir() {
+            return Ok(false);
+        }
     }
 
+    let gitignore_path = repo_root.join(".gitignore");
+    if !gitignore_path.is_file() {
+        return Ok(false);
+    }
+
+    let contents =
+        fs::read_to_string(&gitignore_path).map_err(|source| SkillenvError::ReadFile {
+            path: gitignore_path,
+            source,
+        })?;
+    let existing: BTreeSet<String> = contents
+        .lines()
+        .map(|line| line.trim().to_string())
+        .collect();
+
+    Ok(gitignore_patterns(include_claude)
+        .into_iter()
+        .all(|pattern| existing.contains(pattern)))
+}
+
+fn require_repo_initialized(repo_root: &Path, include_claude: bool) -> Result<()> {
+    if repo_is_initialized(repo_root, include_claude)? {
+        Ok(())
+    } else {
+        Err(SkillenvError::RepoNotInitialized)
+    }
+}
+
+fn update_gitignore(repo_root: &Path, include_claude: bool) -> Result<bool> {
+    let gitignore_path = repo_root.join(".gitignore");
     let mut contents = if gitignore_path.exists() {
         fs::read_to_string(&gitignore_path).map_err(|source| SkillenvError::ReadFile {
             path: gitignore_path.clone(),
@@ -1294,14 +1396,14 @@ fn update_gitignore(repo_root: &Path, include_claude: bool) -> Result<bool> {
         .map(|line| line.trim().to_string())
         .collect();
     let mut changed = false;
-    for pattern in patterns {
-        if existing.contains(pattern.as_str()) {
+    for pattern in gitignore_patterns(include_claude) {
+        if existing.contains(pattern) {
             continue;
         }
         if !contents.is_empty() && !contents.ends_with('\n') {
             contents.push('\n');
         }
-        contents.push_str(&pattern);
+        contents.push_str(pattern);
         contents.push('\n');
         changed = true;
     }
@@ -1424,6 +1526,15 @@ fn ensure_dir(path: &Path) -> Result<()> {
     })
 }
 
+fn ensure_layout_dir(path: &Path, created_dirs: &mut Vec<PathBuf>) -> Result<()> {
+    let existed = path.is_dir();
+    ensure_dir(path)?;
+    if !existed {
+        created_dirs.push(path.to_path_buf());
+    }
+    Ok(())
+}
+
 fn ensure_unmanaged_target_absent(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(SkillenvError::TargetCollision {
@@ -1543,7 +1654,6 @@ mod tests {
         let loaded = load_config(Some(&root.path().join("missing.toml")))?;
         assert!(loaded.config.targets.agents);
         assert!(!loaded.config.targets.claude);
-        assert!(loaded.config.gitignore.auto_update);
         assert_eq!(loaded.config.defaults.strategy, Strategy::Render);
         Ok(())
     }
@@ -1594,6 +1704,14 @@ mod tests {
             resolve_target_kinds(&config, TargetOverride::ForceDisabled),
             vec![TargetKind::Agents]
         );
+    }
+
+    #[test]
+    fn detect_repo_root_normalizes_dot_segments() -> Result<()> {
+        let repo = repo_fixture()?;
+        let detected = detect_repo_root(&repo.path().join(".")).unwrap();
+        assert_eq!(detected, repo.path());
+        Ok(())
     }
 
     #[test]
@@ -2160,7 +2278,27 @@ strategy = "render"
     }
 
     #[test]
-    fn gitignore_updates_idempotently() -> Result<()> {
+    fn init_creates_layout_and_updates_gitignore() -> Result<()> {
+        let repo = repo_fixture()?;
+        let config_path = write_config(repo.path(), "")?;
+
+        let report =
+            init_repo_with_config(repo.path(), &InitOptions::default(), Some(&config_path))?;
+        let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+
+        assert_eq!(report.created_dirs.len(), 3);
+        assert!(repo.path().join("skillenv/default").is_dir());
+        assert!(repo.path().join("skillenv/local").is_dir());
+        assert!(repo.path().join("skillenv/profiles").is_dir());
+        assert!(report.gitignore_updated);
+        assert!(gitignore.contains(".agents/skills/skillenv-*"));
+        assert!(gitignore.contains("skillenv/local/"));
+        assert!(!gitignore.contains(".claude/skills/skillenv-*"));
+        Ok(())
+    }
+
+    #[test]
+    fn init_is_idempotent_and_uses_claude_target_config() -> Result<()> {
         let repo = repo_fixture()?;
         let config_path = write_config(
             repo.path(),
@@ -2169,16 +2307,36 @@ strategy = "render"
 claude = true
 "#,
         )?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
 
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+        let first =
+            init_repo_with_config(repo.path(), &InitOptions::default(), Some(&config_path))?;
         let once = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+        let second =
+            init_repo_with_config(repo.path(), &InitOptions::default(), Some(&config_path))?;
         let twice = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+
         assert_eq!(once, twice);
+        assert_eq!(first.created_dirs.len(), 3);
+        assert!(second.created_dirs.is_empty());
+        assert!(first.gitignore_updated);
+        assert!(!second.gitignore_updated);
         assert!(twice.contains(".agents/skills/skillenv-*"));
         assert!(twice.contains(".claude/skills/skillenv-*"));
         assert!(twice.contains("skillenv/local/"));
+        Ok(())
+    }
+
+    #[test]
+    fn link_does_not_update_gitignore() -> Result<()> {
+        let repo = repo_fixture()?;
+        let config_path = write_config(repo.path(), "")?;
+        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let report =
+            link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+
+        assert!(!report.gitignore_updated);
+        assert!(!repo.path().join(".gitignore").exists());
         Ok(())
     }
 

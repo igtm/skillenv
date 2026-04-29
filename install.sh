@@ -12,11 +12,11 @@ executable_folder="/usr/local/bin"
 
 usage() {
     cat <<EOF
-Usage: sh install.sh [-b=/install/dir] [-v=v0.1.0]
+Usage: sh install.sh [-b=/install/dir] [-v=v0.1.1]
 
 Options:
   -b=DIR   Install into DIR instead of /usr/local/bin
-  -v=TAG   Install a specific release tag such as v0.1.0
+  -v=TAG   Install a specific release tag such as v0.1.1
 
 Environment:
   SKILLENV_INSTALL_OWNER   Override GitHub owner (default: ${owner})
@@ -121,6 +121,7 @@ echo "${exe_name} was installed successfully to ${executable_folder}/${exe_name}
 echo
 echo "Next steps:"
 echo "  1. Ensure ${executable_folder} is in PATH."
-echo "  2. Enable automatic linking on directory change:"
+echo "  2. Run 'skillenv init' once inside each repo you want to manage."
+echo "  3. Enable automatic linking on directory change:"
 echo "     zsh : echo 'eval \"\$(skillenv hook zsh)\"' >> ~/.zshrc"
 echo "     bash: echo 'eval \"\$(skillenv hook bash)\"' >> ~/.bashrc"
