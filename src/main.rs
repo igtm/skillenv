@@ -5,7 +5,8 @@ use skillenv::{
     AddSourceOptions, InitOptions, LinkOptions, ScopeSelector, Shell, StatusOptions,
     TargetOverride, UnlinkOptions, UpdateSourcesOptions, add_source, format_add_source_report,
     format_init_report, format_link_report, format_status_report, format_update_sources_report,
-    hook_script, init_repo, link_repo, status_repo, unlink_repo, update_sources,
+    hook_script, init_repo, link_global, link_repo, status_global, status_repo, unlink_global,
+    unlink_repo, update_sources,
 };
 
 #[derive(Debug, Parser)]
@@ -23,6 +24,10 @@ enum Command {
     Link(ScopeArgs),
     Unlink(ScopeArgs),
     Status(TargetArgs),
+    Global {
+        #[command(subcommand)]
+        command: GlobalCommand,
+    },
     Update(UpdateArgs),
     Hook {
         #[command(subcommand)]
@@ -82,6 +87,13 @@ struct UpdateArgs {
 enum HookCommand {
     Zsh,
     Bash,
+}
+
+#[derive(Debug, Subcommand)]
+enum GlobalCommand {
+    Link(ScopeArgs),
+    Unlink(ScopeArgs),
+    Status(TargetArgs),
 }
 
 fn main() -> ExitCode {
@@ -157,6 +169,51 @@ fn run(cli: Cli) -> skillenv::Result<String> {
         }
         Command::Status(args) => {
             let report = status_repo(
+                ".",
+                StatusOptions {
+                    claude: target_override(args.claude, args.no_claude),
+                },
+            )?;
+            Ok(format_status_report(&report))
+        }
+        Command::Global {
+            command: GlobalCommand::Link(args),
+        } => {
+            let report = link_global(
+                ".",
+                LinkOptions {
+                    selector: scope_selector(&args),
+                    claude: target_override(args.claude, args.no_claude),
+                    quiet: args.quiet,
+                },
+            )?;
+            Ok(if args.quiet {
+                String::new()
+            } else {
+                format_link_report(&report, "linked")
+            })
+        }
+        Command::Global {
+            command: GlobalCommand::Unlink(args),
+        } => {
+            let report = unlink_global(
+                ".",
+                UnlinkOptions {
+                    selector: scope_selector(&args),
+                    claude: target_override(args.claude, args.no_claude),
+                    quiet: args.quiet,
+                },
+            )?;
+            Ok(if args.quiet {
+                String::new()
+            } else {
+                format_link_report(&report, "unlinked")
+            })
+        }
+        Command::Global {
+            command: GlobalCommand::Status(args),
+        } => {
+            let report = status_global(
                 ".",
                 StatusOptions {
                     claude: target_override(args.claude, args.no_claude),

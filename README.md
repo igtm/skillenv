@@ -6,10 +6,11 @@ It provides:
 
 - a one-time repo initializer for scaffolding `skillenv/` and safe `.gitignore` entries
 - a CLI for linking repo skills, installing remote skill packs, and updating them with a lock file
+- manual global linking into `$HOME/.agents/skills` and `$HOME/.claude/skills`
 - a reusable Rust library for embedding the same workflows in other tools
 - shell hooks for automatic relinking when you move between repositories
 
-The current version is `0.1.1`.
+The current version is `0.1.2`.
 
 ## Install
 
@@ -28,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.1.1
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.1.2
 ```
 
 Install from GitHub with Cargo:
@@ -47,13 +48,15 @@ cargo install --path . --locked
 
 `skillenv` can relink skills automatically when you change directories.
 
-Initialize each repo once before you run `link`, `add`, `update`, or any shell hook:
+Initialize each repo once before you run repo-local `link`, `add`, `update`, or any shell hook:
 
 ```bash
 skillenv init
 ```
 
 This creates `skillenv/default/`, `skillenv/local/`, and `skillenv/profiles/`, then adds managed `skillenv` entries to `.gitignore`. The hook only runs `skillenv link --quiet`; it does not edit `.gitignore`.
+
+`skillenv init` is only for repo-local outputs. Global targets use fixed paths under `$HOME` and do not require `init`.
 
 For `zsh`, add this to `~/.zshrc`:
 
@@ -100,6 +103,8 @@ skillenv init --claude
 
 ### Link repo-local skills
 
+Run `skillenv init` first for repo-local `link` and shell hooks.
+
 ```bash
 skillenv link
 skillenv link --all
@@ -107,6 +112,22 @@ skillenv link --profile review --profile migration
 skillenv unlink --profile review
 skillenv status
 ```
+
+### Link skills into global targets manually
+
+```bash
+skillenv global link
+skillenv global link --claude
+skillenv global unlink --all
+skillenv global status
+```
+
+Global targets are fixed:
+
+- `$HOME/.agents/skills`
+- `$HOME/.claude/skills`
+
+These commands are manual-only. They do not require `skillenv init`, do not edit `.gitignore`, and do not create the repo-local `skillenv/default`, `skillenv/local`, or `skillenv/profiles` layout for you.
 
 ### Install remote skill packs
 
@@ -190,8 +211,8 @@ Older `[gitignore].auto_update` settings are ignored as of `0.1.1`. Use `skillen
 
 ```rust
 use skillenv::{
-    add_source, init_repo, link_repo, status_repo, AddSourceOptions, InitOptions, LinkOptions,
-    ScopeSelector, StatusOptions, TargetOverride,
+    add_source, init_repo, link_global, link_repo, status_global, status_repo,
+    AddSourceOptions, InitOptions, LinkOptions, ScopeSelector, StatusOptions, TargetOverride,
 };
 
 let init_report = init_repo(".", InitOptions::default())?;
@@ -218,6 +239,9 @@ let link_report = link_repo(
 )?;
 
 let status = status_repo(".", StatusOptions::default())?;
+
+let global_link_report = link_global(".", LinkOptions::default())?;
+let global_status = status_global(".", StatusOptions::default())?;
 ```
 
 Key exported flows:
@@ -225,6 +249,7 @@ Key exported flows:
 - `init_repo` for creating the repo-local layout and `.gitignore` entries
 - `link_repo` / `unlink_repo` for reconciling generated skills
 - `status_repo` for linked state inspection
+- `link_global` / `unlink_global` / `status_global` for manual global targets under `$HOME`
 - `hook_script` for shell hook generation
 - `add_source` for installing and locking managed sources
 - `update_sources` for refreshing locked sources

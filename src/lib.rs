@@ -258,6 +258,8 @@ pub enum SkillenvError {
     },
     #[error("repo root not detected; this command requires a git repository")]
     RepoRequired,
+    #[error("HOME is not set; global skill targets require a home directory")]
+    HomeNotSet,
     #[error(
         "repo is not initialized for skillenv outputs; run `skillenv init` with the desired target flags first"
     )]
@@ -356,6 +358,49 @@ struct TargetSpec {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetRootMode {
+    RepoLocal,
+    Global,
+}
+
+#[derive(Debug, Clone)]
+struct GeneratedNameLayout {
+    repo_slug: String,
+    prefix: String,
+}
+
+impl GeneratedNameLayout {
+    fn for_mode(repo_root: &Path, mode: TargetRootMode) -> Self {
+        match mode {
+            TargetRootMode::RepoLocal => {
+                let repo_slug = repo_slug(repo_root);
+                let prefix = format!("skillenv-{repo_slug}-");
+                Self { repo_slug, prefix }
+            }
+            TargetRootMode::Global => {
+                let stable_root = stable_global_repo_root(repo_root);
+                let repo_slug = repo_slug(&stable_root);
+                let hash = short_path_digest(&stable_root);
+                let prefix = format!("skillenv-{repo_slug}-g{hash}-");
+                Self { repo_slug, prefix }
+            }
+        }
+    }
+
+    fn generated_name(&self, scope: &ScopeKey, skill_slug: &str) -> String {
+        format!("{}{}-{skill_slug}", self.prefix, scope.generated_segment())
+    }
+
+    fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    fn scope_prefix(&self, scope: &str) -> String {
+        format!("{}{}-", self.prefix, scope_segment_from_display(scope))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LoadedConfig {
     config: Config,
@@ -379,15 +424,27 @@ enum ScopeFilter {
 }
 
 pub fn link_repo(cwd: impl AsRef<Path>, options: LinkOptions) -> Result<Report> {
-    link_repo_with_config(cwd.as_ref(), &options, None)
+    link_with_config(cwd.as_ref(), &options, None, TargetRootMode::RepoLocal)
+}
+
+pub fn link_global(cwd: impl AsRef<Path>, options: LinkOptions) -> Result<Report> {
+    link_with_config(cwd.as_ref(), &options, None, TargetRootMode::Global)
 }
 
 pub fn unlink_repo(cwd: impl AsRef<Path>, options: UnlinkOptions) -> Result<Report> {
-    unlink_repo_with_config(cwd.as_ref(), &options, None)
+    unlink_with_config(cwd.as_ref(), &options, None, TargetRootMode::RepoLocal)
+}
+
+pub fn unlink_global(cwd: impl AsRef<Path>, options: UnlinkOptions) -> Result<Report> {
+    unlink_with_config(cwd.as_ref(), &options, None, TargetRootMode::Global)
 }
 
 pub fn status_repo(cwd: impl AsRef<Path>, options: StatusOptions) -> Result<StatusReport> {
-    status_repo_with_config(cwd.as_ref(), &options, None)
+    status_with_config(cwd.as_ref(), &options, None, TargetRootMode::RepoLocal)
+}
+
+pub fn status_global(cwd: impl AsRef<Path>, options: StatusOptions) -> Result<StatusReport> {
+    status_with_config(cwd.as_ref(), &options, None, TargetRootMode::Global)
 }
 
 pub fn init_repo(cwd: impl AsRef<Path>, options: InitOptions) -> Result<InitReport> {
@@ -466,7 +523,11 @@ pub fn format_status_report(report: &StatusReport) -> String {
     }
 
     for status in &report.target_statuses {
-        let label = status.kind.label();
+        let label = status
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| status.kind.label().to_string());
         let state = match status.state {
             LinkState::Linked => "linked",
             LinkState::NotLinked => "not linked",
@@ -537,40 +598,71 @@ fn init_repo_with_config(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn link_repo_with_config(
     cwd: &Path,
     options: &LinkOptions,
     config_override: Option<&Path>,
 ) -> Result<Report> {
+    link_with_config(cwd, options, config_override, TargetRootMode::RepoLocal)
+}
+
+fn link_with_config(
+    cwd: &Path,
+    options: &LinkOptions,
+    config_override: Option<&Path>,
+    mode: TargetRootMode,
+) -> Result<Report> {
     let loaded = load_config(config_override)?;
     let config = &loaded.config;
     let repo_root = detect_repo_root(cwd);
     let Some(repo_root) = repo_root else {
-        return Ok(Report {
-            repo_root: None,
-            repo_slug: None,
-            strategy: None,
-            touched_scopes: Vec::new(),
-            target_reports: Vec::new(),
-            gitignore_updated: false,
-            message: if options.quiet {
-                None
-            } else {
-                Some("repo root not detected; nothing linked".to_string())
-            },
-        });
+        return match mode {
+            TargetRootMode::RepoLocal => Ok(Report {
+                repo_root: None,
+                repo_slug: None,
+                strategy: None,
+                touched_scopes: Vec::new(),
+                target_reports: Vec::new(),
+                gitignore_updated: false,
+                message: if options.quiet {
+                    None
+                } else {
+                    Some("repo root not detected; nothing linked".to_string())
+                },
+            }),
+            TargetRootMode::Global => Err(SkillenvError::RepoRequired),
+        };
     };
 
-    let repo_slug = slugify_or(
-        repo_root
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("repo"),
-        "repo",
-    );
-    let discovery = discover_sources(&repo_root, &repo_slug, config, loaded.base_dir.as_deref())?;
+    let generated_names = GeneratedNameLayout::for_mode(&repo_root, mode);
+    let discovery_root = source_repo_root(mode, &repo_root);
+    if matches!(mode, TargetRootMode::RepoLocal) {
+        match require_repo_initialized(&repo_root, include_claude_target(config, options.claude)) {
+            Ok(()) => {}
+            Err(SkillenvError::RepoNotInitialized) if options.quiet => {
+                return Ok(Report {
+                    repo_root: Some(repo_root),
+                    repo_slug: Some(generated_names.repo_slug.clone()),
+                    strategy: Some(config.defaults.strategy),
+                    touched_scopes: Vec::new(),
+                    target_reports: Vec::new(),
+                    gitignore_updated: false,
+                    message: None,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let discovery = discover_sources(
+        &discovery_root,
+        &generated_names.repo_slug,
+        config,
+        loaded.base_dir.as_deref(),
+    )?;
     let desired_sources = desired_sources(&discovery, &options.selector);
-    let targets = resolve_targets(&repo_root, config, options.claude);
+    let targets = resolve_targets(mode, &repo_root, config, options.claude)?;
     let filter = removal_filter(&options.selector);
     let touched_scopes = touched_scope_names(&options.selector, &desired_sources);
 
@@ -579,13 +671,13 @@ fn link_repo_with_config(
         ensure_dir(&target.path)?;
         let removed = remove_managed_entries(
             &target.path,
-            &repo_slug,
+            &generated_names,
             &filter,
             &discovery.known_source_roots,
         )?;
         let linked = reconcile_target(
             &target.path,
-            &repo_slug,
+            &generated_names,
             config.defaults.strategy,
             &desired_sources,
         )?;
@@ -599,7 +691,7 @@ fn link_repo_with_config(
 
     Ok(Report {
         repo_root: Some(repo_root),
-        repo_slug: Some(repo_slug),
+        repo_slug: Some(generated_names.repo_slug),
         strategy: Some(config.defaults.strategy),
         touched_scopes,
         target_reports,
@@ -608,47 +700,59 @@ fn link_repo_with_config(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn unlink_repo_with_config(
     cwd: &Path,
     options: &UnlinkOptions,
     config_override: Option<&Path>,
 ) -> Result<Report> {
+    unlink_with_config(cwd, options, config_override, TargetRootMode::RepoLocal)
+}
+
+fn unlink_with_config(
+    cwd: &Path,
+    options: &UnlinkOptions,
+    config_override: Option<&Path>,
+    mode: TargetRootMode,
+) -> Result<Report> {
     let loaded = load_config(config_override)?;
     let config = &loaded.config;
     let repo_root = detect_repo_root(cwd);
     let Some(repo_root) = repo_root else {
-        return Ok(Report {
-            repo_root: None,
-            repo_slug: None,
-            strategy: None,
-            touched_scopes: Vec::new(),
-            target_reports: Vec::new(),
-            gitignore_updated: false,
-            message: if options.quiet {
-                None
-            } else {
-                Some("repo root not detected; nothing unlinked".to_string())
-            },
-        });
+        return match mode {
+            TargetRootMode::RepoLocal => Ok(Report {
+                repo_root: None,
+                repo_slug: None,
+                strategy: None,
+                touched_scopes: Vec::new(),
+                target_reports: Vec::new(),
+                gitignore_updated: false,
+                message: if options.quiet {
+                    None
+                } else {
+                    Some("repo root not detected; nothing unlinked".to_string())
+                },
+            }),
+            TargetRootMode::Global => Err(SkillenvError::RepoRequired),
+        };
     };
 
-    let repo_slug = slugify_or(
-        repo_root
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("repo"),
-        "repo",
-    );
-    let targets = resolve_targets(&repo_root, config, options.claude);
+    let generated_names = GeneratedNameLayout::for_mode(&repo_root, mode);
+    let discovery_root = source_repo_root(mode, &repo_root);
+    let targets = resolve_targets(mode, &repo_root, config, options.claude)?;
     let filter = removal_filter(&options.selector);
     let touched_scopes = touched_scope_names(&options.selector, &BTreeMap::new());
-    let known_source_roots =
-        known_source_roots(&repo_root, &repo_slug, config, loaded.base_dir.as_deref())?;
+    let known_source_roots = known_source_roots(
+        &discovery_root,
+        &generated_names.repo_slug,
+        config,
+        loaded.base_dir.as_deref(),
+    )?;
 
     let mut target_reports = Vec::new();
     for target in &targets {
         let removed = if target.path.exists() {
-            remove_managed_entries(&target.path, &repo_slug, &filter, &known_source_roots)?
+            remove_managed_entries(&target.path, &generated_names, &filter, &known_source_roots)?
         } else {
             0
         };
@@ -662,7 +766,7 @@ fn unlink_repo_with_config(
 
     Ok(Report {
         repo_root: Some(repo_root),
-        repo_slug: Some(repo_slug),
+        repo_slug: Some(generated_names.repo_slug),
         strategy: Some(config.defaults.strategy),
         touched_scopes,
         target_reports,
@@ -671,40 +775,54 @@ fn unlink_repo_with_config(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn status_repo_with_config(
     cwd: &Path,
     options: &StatusOptions,
     config_override: Option<&Path>,
+) -> Result<StatusReport> {
+    status_with_config(cwd, options, config_override, TargetRootMode::RepoLocal)
+}
+
+fn status_with_config(
+    cwd: &Path,
+    options: &StatusOptions,
+    config_override: Option<&Path>,
+    mode: TargetRootMode,
 ) -> Result<StatusReport> {
     let loaded = load_config(config_override)?;
     let config = &loaded.config;
     let enabled = resolve_target_kinds(config, options.claude);
     let repo_root = detect_repo_root(cwd);
     let Some(repo_root) = repo_root else {
-        return Ok(StatusReport {
-            repo_root: None,
-            repo_slug: None,
-            target_statuses: all_target_statuses(None, &enabled),
-        });
+        return match mode {
+            TargetRootMode::RepoLocal => Ok(StatusReport {
+                repo_root: None,
+                repo_slug: None,
+                target_statuses: all_target_statuses(None, &enabled),
+            }),
+            TargetRootMode::Global => Err(SkillenvError::RepoRequired),
+        };
     };
 
-    let repo_slug = slugify_or(
-        repo_root
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("repo"),
-        "repo",
-    );
-    let discovery = discover_sources(&repo_root, &repo_slug, config, loaded.base_dir.as_deref())?;
+    let generated_names = GeneratedNameLayout::for_mode(&repo_root, mode);
+    let discovery_root = source_repo_root(mode, &repo_root);
+    let discovery = discover_sources(
+        &discovery_root,
+        &generated_names.repo_slug,
+        config,
+        loaded.base_dir.as_deref(),
+    )?;
+    let target_root = target_root(mode, &repo_root)?;
     let mut statuses = Vec::new();
     for kind in [TargetKind::Agents, TargetKind::Claude] {
+        let path = target_root.join(kind.label());
         if enabled.contains(&kind) {
-            let path = repo_root.join(kind.label());
             let managed_count =
-                count_managed_entries(&path, &repo_slug, &discovery.known_source_roots)?;
+                count_managed_entries(&path, &generated_names, &discovery.known_source_roots)?;
             statuses.push(TargetStatus {
                 kind,
-                path: Some(path),
+                path: Some(path.clone()),
                 state: if managed_count > 0 {
                     LinkState::Linked
                 } else {
@@ -715,7 +833,7 @@ fn status_repo_with_config(
         } else {
             statuses.push(TargetStatus {
                 kind,
-                path: Some(repo_root.join(kind.label())),
+                path: Some(path),
                 state: LinkState::Disabled,
                 managed_count: 0,
             });
@@ -724,7 +842,7 @@ fn status_repo_with_config(
 
     Ok(StatusReport {
         repo_root: Some(repo_root),
-        repo_slug: Some(repo_slug),
+        repo_slug: Some(generated_names.repo_slug),
         target_statuses: statuses,
     })
 }
@@ -783,6 +901,12 @@ fn default_config_path() -> Option<PathBuf> {
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/skillenv/config.toml"))
 }
 
+fn home_dir() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or(SkillenvError::HomeNotSet)
+}
+
 fn detect_repo_root(cwd: &Path) -> Option<PathBuf> {
     let start = if cwd.is_absolute() {
         normalize_path(cwd)
@@ -800,15 +924,39 @@ fn detect_repo_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn resolve_targets(
+    mode: TargetRootMode,
     repo_root: &Path,
     config: &Config,
     override_value: TargetOverride,
-) -> Vec<TargetSpec> {
-    resolve_target_kinds(config, override_value)
-        .into_iter()
+) -> Result<Vec<TargetSpec>> {
+    let target_root = target_root(mode, repo_root)?;
+    Ok(build_target_specs(
+        &target_root,
+        &resolve_target_kinds(config, override_value),
+    ))
+}
+
+fn target_root(mode: TargetRootMode, repo_root: &Path) -> Result<PathBuf> {
+    match mode {
+        TargetRootMode::RepoLocal => Ok(repo_root.to_path_buf()),
+        TargetRootMode::Global => home_dir(),
+    }
+}
+
+fn source_repo_root(mode: TargetRootMode, repo_root: &Path) -> PathBuf {
+    match mode {
+        TargetRootMode::RepoLocal => repo_root.to_path_buf(),
+        TargetRootMode::Global => stable_global_repo_root(repo_root),
+    }
+}
+
+fn build_target_specs(target_root: &Path, kinds: &[TargetKind]) -> Vec<TargetSpec> {
+    kinds
+        .iter()
+        .copied()
         .map(|kind| TargetSpec {
             kind,
-            path: repo_root.join(kind.label()),
+            path: target_root.join(kind.label()),
         })
         .collect()
 }
@@ -1058,7 +1206,7 @@ fn removal_filter(selector: &ScopeSelector) -> ScopeFilter {
 
 fn remove_managed_entries(
     target_dir: &Path,
-    repo_slug: &str,
+    generated_names: &GeneratedNameLayout,
     filter: &ScopeFilter,
     known_source_roots: &[PathBuf],
 ) -> Result<usize> {
@@ -1067,7 +1215,7 @@ fn remove_managed_entries(
     }
 
     let mut removed = 0usize;
-    let prefix = format!("skillenv-{repo_slug}-");
+    let prefix = generated_names.prefix();
     for entry in fs::read_dir(target_dir).map_err(|source| SkillenvError::ReadFile {
         path: target_dir.to_path_buf(),
         source,
@@ -1078,7 +1226,7 @@ fn remove_managed_entries(
         })?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) {
+        if !name.starts_with(prefix) {
             continue;
         }
 
@@ -1088,7 +1236,7 @@ fn remove_managed_entries(
         })?;
 
         if metadata.file_type().is_symlink() {
-            if symlink_matches_scope(&name, repo_slug, filter)
+            if generated_name_matches_scope(&name, generated_names, filter)
                 && symlink_targets_known_root(&path, known_source_roots)?
             {
                 fs::remove_file(&path).map_err(|source| SkillenvError::WriteFile {
@@ -1118,7 +1266,7 @@ fn remove_managed_entries(
                 }
             })?;
 
-            if marker.repo == repo_slug
+            if marker.generated_name.starts_with(generated_names.prefix())
                 && filter.matches_scope(&marker.scope)
                 && marker_source_matches_known_root(&marker.source, known_source_roots)
             {
@@ -1136,20 +1284,24 @@ fn remove_managed_entries(
 
 fn reconcile_target(
     target_dir: &Path,
-    repo_slug: &str,
+    generated_names: &GeneratedNameLayout,
     strategy: Strategy,
     desired_sources: &BTreeMap<ScopeKey, Vec<SkillSource>>,
 ) -> Result<usize> {
     let mut linked = 0usize;
     for (scope, sources) in desired_sources {
         for source in sources {
-            let generated_name = generated_name(repo_slug, scope, &source.skill_slug);
+            let generated_name = generated_names.generated_name(scope, &source.skill_slug);
             let generated_path = target_dir.join(&generated_name);
             ensure_unmanaged_target_absent(&generated_path)?;
             match strategy {
-                Strategy::Render => {
-                    render_source(repo_slug, scope, source, &generated_name, &generated_path)?
-                }
+                Strategy::Render => render_source(
+                    &generated_names.repo_slug,
+                    scope,
+                    source,
+                    &generated_name,
+                    &generated_path,
+                )?,
                 Strategy::Symlink => symlink_source(source, &generated_path)?,
             }
             linked += 1;
@@ -1420,7 +1572,7 @@ fn update_gitignore(repo_root: &Path, include_claude: bool) -> Result<bool> {
 
 fn count_managed_entries(
     target_dir: &Path,
-    repo_slug: &str,
+    generated_names: &GeneratedNameLayout,
     known_source_roots: &[PathBuf],
 ) -> Result<usize> {
     if !target_dir.is_dir() {
@@ -1428,7 +1580,7 @@ fn count_managed_entries(
     }
 
     let mut count = 0usize;
-    let prefix = format!("skillenv-{repo_slug}-");
+    let prefix = generated_names.prefix();
     for entry in fs::read_dir(target_dir).map_err(|source| SkillenvError::ReadFile {
         path: target_dir.to_path_buf(),
         source,
@@ -1439,7 +1591,7 @@ fn count_managed_entries(
         })?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(&prefix) {
+        if !name.starts_with(prefix) {
             continue;
         }
 
@@ -1470,7 +1622,7 @@ fn count_managed_entries(
                     source,
                 }
             })?;
-            if marker.repo == repo_slug
+            if marker.generated_name.starts_with(generated_names.prefix())
                 && marker_source_matches_known_root(&marker.source, known_source_roots)
             {
                 count += 1;
@@ -1481,11 +1633,31 @@ fn count_managed_entries(
     Ok(count)
 }
 
-fn generated_name(repo_slug: &str, scope: &ScopeKey, skill_slug: &str) -> String {
-    format!(
-        "skillenv-{repo_slug}-{}-{skill_slug}",
-        scope.generated_segment()
+fn repo_slug(repo_root: &Path) -> String {
+    slugify_or(
+        repo_root
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("repo"),
+        "repo",
     )
+}
+
+fn stable_global_repo_root(repo_root: &Path) -> PathBuf {
+    fs::canonicalize(repo_root)
+        .map(|path| normalize_path(&path))
+        .unwrap_or_else(|_| normalize_path(repo_root))
+}
+
+fn short_path_digest(path: &Path) -> String {
+    let normalized = normalize_path(path);
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in normalized.display().to_string().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let digest = format!("{hash:016x}");
+    digest[..12].to_string()
 }
 
 fn slugify_or(input: &str, fallback: &str) -> String {
@@ -1548,13 +1720,16 @@ fn ensure_unmanaged_target_absent(path: &Path) -> Result<()> {
     }
 }
 
-fn symlink_matches_scope(name: &str, repo_slug: &str, filter: &ScopeFilter) -> bool {
+fn generated_name_matches_scope(
+    name: &str,
+    generated_names: &GeneratedNameLayout,
+    filter: &ScopeFilter,
+) -> bool {
     match filter {
-        ScopeFilter::AllCurrentRepo => name.starts_with(&format!("skillenv-{repo_slug}-")),
-        ScopeFilter::Exact(scopes) => scopes.iter().any(|scope| {
-            let scope_segment = scope_segment_from_display(scope);
-            name.starts_with(&format!("skillenv-{repo_slug}-{scope_segment}-"))
-        }),
+        ScopeFilter::AllCurrentRepo => name.starts_with(generated_names.prefix()),
+        ScopeFilter::Exact(scopes) => scopes
+            .iter()
+            .any(|scope| name.starts_with(&generated_names.scope_prefix(scope))),
     }
 }
 
@@ -1638,6 +1813,8 @@ impl fmt::Display for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     #[test]
@@ -1850,6 +2027,7 @@ Body text
             .join("skillenv/default/research/assets/info.txt");
         ensure_dir(extra_file.parent().unwrap())?;
         fs::write(&extra_file, "extra").unwrap();
+        init_test_repo(repo.path(), &config_path)?;
 
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
@@ -1887,6 +2065,7 @@ strategy = "render"
             Some("Body only\n"),
             "Body only",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
 
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
@@ -1922,6 +2101,7 @@ strategy = "symlink"
             Some("plain body\n"),
             "plain body",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
 
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
@@ -1959,6 +2139,7 @@ strategy = "symlink"
             Some("plain body\n"),
             "plain body",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
 
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
@@ -1999,6 +2180,7 @@ strategy = "render"
             None,
             "primary source",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
         write_skill(
@@ -2037,6 +2219,7 @@ strategy = "symlink"
             Some("plain body\n"),
             "plain body",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
         fs::remove_dir_all(repo.path().join("skillenv")).unwrap();
@@ -2063,6 +2246,7 @@ strategy = "symlink"
             None,
             "primary source",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
 
         let collision = repo
             .path()
@@ -2104,6 +2288,7 @@ strategy = "render"
             None,
             "profile",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
         link_repo_with_config(
             repo.path(),
             &LinkOptions {
@@ -2151,6 +2336,7 @@ strategy = "render"
             None,
             "migration",
         )?;
+        init_test_repo(repo.path(), &config_path)?;
 
         link_repo_with_config(
             repo.path(),
@@ -2190,6 +2376,7 @@ strategy = "render"
 "#,
         )?;
         write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+        init_test_repo(repo.path(), &config_path)?;
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
         let target_dir = repo.path().join(".agents/skills");
@@ -2253,6 +2440,7 @@ strategy = "render"
         let repo_slug = test_repo_slug(repo.path());
         let config_path = write_config(repo.path(), "")?;
         write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+        init_test_repo(repo.path(), &config_path)?;
 
         let target_dir = repo.path().join(".agents/skills");
         let copied = target_dir.join(format!("skillenv-{repo_slug}-default-copied"));
@@ -2327,16 +2515,19 @@ claude = true
     }
 
     #[test]
-    fn link_does_not_update_gitignore() -> Result<()> {
+    fn link_does_not_change_gitignore_after_init() -> Result<()> {
         let repo = repo_fixture()?;
         let config_path = write_config(repo.path(), "")?;
         write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+        init_test_repo(repo.path(), &config_path)?;
+        let before = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
 
         let report =
             link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+        let after = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
 
         assert!(!report.gitignore_updated);
-        assert!(!repo.path().join(".gitignore").exists());
+        assert_eq!(before, after);
         Ok(())
     }
 
@@ -2351,11 +2542,212 @@ claude = true
         let before_text = format_status_report(&before);
         assert!(before_text.contains(".agents/skills: not linked"));
 
+        init_test_repo(repo.path(), &config_path)?;
         link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
         let after =
             status_repo_with_config(repo.path(), &StatusOptions::default(), Some(&config_path))?;
         let after_text = format_status_report(&after);
         assert!(after_text.contains(".agents/skills: linked"));
+        Ok(())
+    }
+
+    #[test]
+    fn repo_local_link_requires_init_but_quiet_is_noop() -> Result<()> {
+        let repo = repo_fixture()?;
+        let config_path = write_config(repo.path(), "")?;
+        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let error = link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))
+            .unwrap_err();
+        assert!(matches!(error, SkillenvError::RepoNotInitialized));
+        assert!(!repo.path().join(".agents/skills").exists());
+
+        let report = link_repo_with_config(
+            repo.path(),
+            &LinkOptions {
+                quiet: true,
+                ..LinkOptions::default()
+            },
+            Some(&config_path),
+        )?;
+        assert!(report.message.is_none());
+        assert!(report.target_reports.is_empty());
+        assert!(!repo.path().join(".agents/skills").exists());
+        assert!(!repo.path().join(".gitignore").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn repo_local_unlink_still_works_before_init() -> Result<()> {
+        let repo = repo_fixture()?;
+        let config_path = write_config(repo.path(), "")?;
+        let source_dir = write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::RepoLocal)
+            .generated_name(&ScopeKey::Default, "research");
+        let generated_dir = repo.path().join(".agents/skills").join(generated_name);
+        ensure_dir(&generated_dir)?;
+        fs::write(
+            generated_dir.join(GENERATED_MARKER_FILE),
+            serde_json::to_string_pretty(&GeneratedMarker {
+                repo: test_repo_slug(repo.path()),
+                scope: "default".to_string(),
+                skill: "research".to_string(),
+                generated_name: generated_dir
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("generated")
+                    .to_string(),
+                source: source_dir.display().to_string(),
+                strategy: Strategy::Render,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report =
+            unlink_repo_with_config(repo.path(), &UnlinkOptions::default(), Some(&config_path))?;
+        assert_eq!(report.target_reports[0].removed, 1);
+        assert!(!generated_dir.exists());
+        assert!(!repo.path().join(".gitignore").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn global_link_uses_home_targets_without_repo_init() -> Result<()> {
+        let repo = repo_fixture()?;
+        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        let report = link_global(repo.path(), LinkOptions::default())?;
+
+        let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::Global)
+            .generated_name(&ScopeKey::Default, "research");
+        let target_dir = home.path().join(".agents/skills");
+        assert_eq!(report.target_reports.len(), 1);
+        assert_eq!(report.target_reports[0].path, Some(target_dir.clone()));
+        assert!(target_dir.join(generated_name).exists());
+        assert!(!repo.path().join(".gitignore").exists());
+        assert!(!repo.path().join("skillenv/local").exists());
+        assert!(!repo.path().join("skillenv/profiles").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn global_link_supports_claude_target() -> Result<()> {
+        let repo = repo_fixture()?;
+        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        let report = link_global(
+            repo.path(),
+            LinkOptions {
+                claude: TargetOverride::ForceEnabled,
+                ..LinkOptions::default()
+            },
+        )?;
+
+        assert_eq!(report.target_reports.len(), 2);
+        assert!(home.path().join(".agents/skills").is_dir());
+        assert!(home.path().join(".claude/skills").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn global_unlink_and_status_use_home_targets() -> Result<()> {
+        let repo = repo_fixture()?;
+        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        link_global(repo.path(), LinkOptions::default())?;
+
+        let target_dir = home.path().join(".agents/skills");
+        ensure_dir(&target_dir.join("manual-skill"))?;
+
+        let before = status_global(repo.path(), StatusOptions::default())?;
+        assert_eq!(before.target_statuses[0].path, Some(target_dir.clone()));
+        assert_eq!(before.target_statuses[0].state, LinkState::Linked);
+        assert_eq!(before.target_statuses[0].managed_count, 1);
+        assert!(format_status_report(&before).contains(&target_dir.display().to_string()));
+
+        unlink_global(repo.path(), UnlinkOptions::default())?;
+
+        assert!(
+            !target_dir
+                .join(
+                    GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::Global)
+                        .generated_name(&ScopeKey::Default, "research")
+                )
+                .exists()
+        );
+        assert!(target_dir.join("manual-skill").exists());
+
+        let after = status_global(repo.path(), StatusOptions::default())?;
+        assert_eq!(after.target_statuses[0].state, LinkState::NotLinked);
+        assert_eq!(after.target_statuses[0].managed_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn global_names_include_repo_path_hash_to_avoid_collisions() -> Result<()> {
+        let parent_one = TempDir::new().unwrap();
+        let parent_two = TempDir::new().unwrap();
+        let repo_one = repo_root_fixture(parent_one.path(), "demo")?;
+        let repo_two = repo_root_fixture(parent_two.path(), "demo")?;
+        write_skill(&repo_one, "skillenv/default/research", None, "default")?;
+        write_skill(&repo_two, "skillenv/default/research", None, "default")?;
+
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        link_global(&repo_one, LinkOptions::default())?;
+        link_global(&repo_two, LinkOptions::default())?;
+
+        let name_one = GeneratedNameLayout::for_mode(&repo_one, TargetRootMode::Global)
+            .generated_name(&ScopeKey::Default, "research");
+        let name_two = GeneratedNameLayout::for_mode(&repo_two, TargetRootMode::Global)
+            .generated_name(&ScopeKey::Default, "research");
+
+        assert_ne!(name_one, name_two);
+        assert!(home.path().join(".agents/skills").join(name_one).exists());
+        assert!(home.path().join(".agents/skills").join(name_two).exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_alias_path_reuses_same_managed_entries() -> Result<()> {
+        let repo = repo_fixture()?;
+        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let alias_parent = TempDir::new().unwrap();
+        let alias_path = alias_parent.path().join("repo-alias");
+        create_symlink(repo.path(), &alias_path).unwrap();
+
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        link_global(repo.path(), LinkOptions::default())?;
+
+        let status_via_alias = status_global(&alias_path, StatusOptions::default())?;
+        assert_eq!(status_via_alias.target_statuses[0].managed_count, 1);
+
+        unlink_global(&alias_path, UnlinkOptions::default())?;
+
+        let status_after_unlink = status_global(repo.path(), StatusOptions::default())?;
+        assert_eq!(status_after_unlink.target_statuses[0].managed_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn global_link_fails_without_home() -> Result<()> {
+        let repo = repo_fixture()?;
+        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
+
+        let _home = set_home_for_test(None);
+        let error = link_global(repo.path(), LinkOptions::default()).unwrap_err();
+        assert!(matches!(error, SkillenvError::HomeNotSet));
         Ok(())
     }
 
@@ -2369,6 +2761,17 @@ claude = true
         let dir = TempDir::new().unwrap();
         ensure_dir(&dir.path().join(".git"))?;
         Ok(dir)
+    }
+
+    fn repo_root_fixture(parent: &Path, name: &str) -> Result<PathBuf> {
+        let repo_root = parent.join(name);
+        ensure_dir(&repo_root)?;
+        ensure_dir(&repo_root.join(".git"))?;
+        Ok(repo_root)
+    }
+
+    fn init_test_repo(repo_root: &Path, config_path: &Path) -> Result<()> {
+        init_repo_with_config(repo_root, &InitOptions::default(), Some(config_path)).map(|_| ())
     }
 
     fn write_config(repo_root: &Path, body: &str) -> Result<PathBuf> {
@@ -2407,5 +2810,44 @@ claude = true
                 .unwrap_or("repo"),
             "repo",
         )
+    }
+
+    fn set_home_for_test(home: Option<&Path>) -> HomeEnvGuard {
+        let _lock = home_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = env::var_os("HOME");
+        match home {
+            Some(path) => unsafe {
+                env::set_var("HOME", path);
+            },
+            None => unsafe {
+                env::remove_var("HOME");
+            },
+        }
+        HomeEnvGuard { previous, _lock }
+    }
+
+    fn home_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct HomeEnvGuard {
+        previous: Option<OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => unsafe {
+                    env::set_var("HOME", value);
+                },
+                None => unsafe {
+                    env::remove_var("HOME");
+                },
+            }
+        }
     }
 }

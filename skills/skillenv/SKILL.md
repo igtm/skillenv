@@ -24,6 +24,9 @@ skillenv init
 # 2. repo-local skill を link
 skillenv link
 
+# repo-local 初期化なしで global target へ手動 link
+skillenv global link
+
 # 3. remote skill pack を追加
 skillenv add vercel-labs/agent-skills --skill frontend-design
 
@@ -41,11 +44,19 @@ skillenv update
   - 管理対象の `skillenv` エントリだけを `.gitignore` に追記します。
 - `skillenv link [--all] [--profile <name>...] [--claude|--no-claude] [--quiet]`
   - repo-local source と managed source を target dir に reconcile します。
+  - 実行前に `skillenv init` が必要です。
   - 既定では `default` と `local` だけを対象にします。
 - `skillenv unlink [--all] [--profile <name>...] [--claude|--no-claude] [--quiet]`
   - 対象 scope の generated skill だけを安全に削除します。
 - `skillenv status [--claude|--no-claude]`
   - `.agents/skills` / `.claude/skills` の linked 状態を表示します。
+- `skillenv global link [--all] [--profile <name>...] [--claude|--no-claude] [--quiet]`
+  - 現在の repo の skill を `$HOME/.agents/skills` / `$HOME/.claude/skills` に手動 link します。
+  - `skillenv init` は不要で、`.gitignore` も更新しません。
+- `skillenv global unlink [--all] [--profile <name>...] [--claude|--no-claude] [--quiet]`
+  - global target 上の現在 repo 由来の generated skill だけを安全に削除します。
+- `skillenv global status [--claude|--no-claude]`
+  - global target 上の現在 repo の linked 状態を表示します。
 - `skillenv add <source> [--skill <slug>...] [--ref <git-ref>] [--into <dir>] [--name <logical-name>]`
   - GitHub shorthand、GitHub URL、local path を managed source として導入します。
   - 実行前に `skillenv init` が必要です。
@@ -90,6 +101,17 @@ skillenv link
 skillenv link --profile review
 ```
 
+### 2b. 現在の repo を global target に手動反映する
+
+```bash
+skillenv global link
+skillenv global status
+```
+
+- global target は固定で `$HOME/.agents/skills` と `$HOME/.claude/skills` です。
+- `init` は不要です。
+- repo basename が同じ別 repo と衝突しない generated 名になります。
+
 ### 3. GitHub の skill pack を 1 つだけ導入する
 
 ```bash
@@ -120,6 +142,7 @@ eval "$(skillenv hook bash)"
 ```
 
 - hook は `skillenv link --quiet` だけを実行し、`.gitignore` は更新しません。
+- hook は repo-local target だけを扱い、global target には一切触れません。
 - 旧 `gitignore.auto_update` 設定に頼らず、repo ごとに `skillenv init` を実行します。
 
 ## Rust library API
@@ -147,6 +170,15 @@ let report = link_repo(
         quiet: false,
     },
 )?;
+```
+
+### global target への手動反映
+
+```rust
+use skillenv::{link_global, status_global, LinkOptions, StatusOptions};
+
+let report = link_global(".", LinkOptions::default())?;
+let status = status_global(".", StatusOptions::default())?;
 ```
 
 ### managed remote source の導入
@@ -207,6 +239,7 @@ let report = update_sources(
 ## 判断基準
 
 - repo-local skill を反映したいだけなら `link_repo` / `skillenv link`
+- global target に手動で反映したいなら `link_global` / `skillenv global link`
 - repo の layout と `.gitignore` を整えたいなら `init_repo` / `skillenv init`
 - GitHub や local git repo を lock 付きで扱いたいなら `add_source` / `update_sources`
-- shell integration が必要なら `hook_script` / `skillenv hook <shell>`
+- shell integration が必要なら `hook_script` / `skillenv hook <shell>` ただし hook は repo-local only
