@@ -33,6 +33,12 @@ skillenv add vercel-labs/agent-skills --skill frontend-design
 # 4. 現在の linked 状態を確認
 skillenv status
 
+# 4b. 各 tool から見える custom skill を確認
+skillenv skills --tool codex
+
+# 4c. config と source の診断を確認
+skillenv doctor
+
 # 5. 管理中の remote source を更新
 skillenv update
 ```
@@ -50,6 +56,13 @@ skillenv update
   - 対象 scope の generated skill だけを安全に削除します。
 - `skillenv status [--claude|--no-claude]`
   - `.agents/skills` / `.claude/skills` の linked 状態を表示します。
+- `skillenv skills [--tool <claude|codex|opencode|antigravity>...] [--repo-tree] [--json]`
+  - 現在の CWD から各 tool が見える custom skill を列挙します。
+  - `--repo-tree` で nested tool dir の repo inventory も追加します。
+  - `--json` で機械可読な report を出します。
+- `skillenv doctor [--json]`
+  - config file path、resolved external source、managed source metadata、repo/global target 状態を表示します。
+  - `status` より詳細な診断用です。
 - `skillenv global link [--all] [--profile <name>...] [--claude|--no-claude] [--quiet]`
   - 現在の repo の skill を `$HOME/.agents/skills` / `$HOME/.claude/skills` に手動 link します。
   - `skillenv init` は不要で、`.gitignore` も更新しません。
@@ -100,6 +113,29 @@ skillenv link
 ```bash
 skillenv link --profile review
 ```
+
+### 2c. tool から見える custom skill を棚卸しする
+
+```bash
+skillenv skills
+skillenv skills --tool claude --repo-tree
+skillenv skills --json
+```
+
+- `status` は link 状態を見るコマンドです。
+- `skills` は tool 側の custom skill discovery 結果を見るコマンドです。
+- `--repo-tree` を付けると、Claude Code の nested `.claude/skills` は `nested-on-demand`、それ以外の追加 entry は `repo-tree-only` として出ます。
+
+### 2d. config / external source / managed source を診断する
+
+```bash
+skillenv doctor
+skillenv doctor --json
+```
+
+- config file path と存在有無を確認できます。
+- config の `external_sources` がどの directory に解決されるか確認できます。
+- `skillenv.lock.json` に入っている managed source の source 名、transport URL、install root、revision を確認できます。
 
 ### 2b. 現在の repo を global target に手動反映する
 

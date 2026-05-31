@@ -12,11 +12,11 @@ executable_folder="/usr/local/bin"
 
 usage() {
     cat <<EOF
-Usage: sh install.sh [-b=/install/dir] [-v=v0.1.3]
+Usage: sh install.sh [-b=/install/dir] [-v=v0.3.0]
 
 Options:
   -b=DIR   Install into DIR instead of /usr/local/bin
-  -v=TAG   Install a specific release tag such as v0.1.3
+  -v=TAG   Install a specific release tag such as v0.3.0
 
 Environment:
   SKILLENV_INSTALL_OWNER   Override GitHub owner (default: ${owner})

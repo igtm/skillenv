@@ -66,6 +66,19 @@ pub(crate) struct InstalledSourceRoot {
     pub(crate) root: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedSourceDetails {
+    pub(crate) name: String,
+    pub(crate) source: String,
+    pub(crate) transport: String,
+    pub(crate) kind: String,
+    pub(crate) requested_ref: Option<String>,
+    pub(crate) subdir: Option<String>,
+    pub(crate) install_root: PathBuf,
+    pub(crate) selected_skills: Vec<String>,
+    pub(crate) resolved_revision: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LockFile {
     version: u32,
@@ -339,6 +352,28 @@ pub(crate) fn installed_source_roots(repo_root: &Path) -> Result<Vec<InstalledSo
         .map(|entry| InstalledSourceRoot {
             name: format!("managed:{}", entry.name),
             root: resolve_stored_path(repo_root, &entry.install_root),
+        })
+        .collect())
+}
+
+pub(crate) fn managed_source_details(repo_root: &Path) -> Result<Vec<ManagedSourceDetails>> {
+    let lock_file = load_lock_file(repo_root)?;
+    Ok(lock_file
+        .sources
+        .into_iter()
+        .map(|entry| ManagedSourceDetails {
+            name: entry.name,
+            source: entry.source,
+            transport: entry.transport,
+            kind: match entry.kind {
+                LockedSourceKind::Git => "git".to_string(),
+                LockedSourceKind::Local => "local".to_string(),
+            },
+            requested_ref: entry.requested_ref,
+            subdir: entry.subdir,
+            install_root: resolve_stored_path(repo_root, &entry.install_root),
+            selected_skills: entry.selected_skills,
+            resolved_revision: entry.resolved_revision,
         })
         .collect())
 }

@@ -1,16 +1,19 @@
 # skillenv
 
-`skillenv` manages repo-local and remote-installed AI skills, then links them into agent-facing skill directories like `.agents/skills` and `.claude/skills`.
+[日本語版 README](./README_ja.md)
+
+`skillenv` manages repo-local and remote-installed AI skills, then links them into agent-facing skill directories such as `.agents/skills` and `.claude/skills`.
 
 It provides:
 
-- a one-time repo initializer for scaffolding `skillenv/` and safe `.gitignore` entries
-- a CLI for linking repo skills, installing remote skill packs, and updating them with a lock file
+- a repo initializer that scaffolds `skillenv/` and updates managed `.gitignore` entries
+- repo-local linking and unlinking for default, local, and profile scopes
+- managed remote or local source installs tracked in `skillenv.lock.json`
 - manual global linking into `$HOME/.agents/skills` and `$HOME/.claude/skills`
+- shell hooks for automatic relinking when you change repositories
 - a reusable Rust library for embedding the same workflows in other tools
-- shell hooks for automatic relinking when you move between repositories
 
-The current version is `0.1.3`.
+The current version is `0.3.0`.
 
 ## Install
 
@@ -29,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.1.3
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.3.0
 ```
 
 Install from GitHub with Cargo:
@@ -44,35 +47,118 @@ Install from a local checkout:
 cargo install --path . --locked
 ```
 
-## Shell Setup
+## Quickstart
 
-`skillenv` can relink skills automatically when you change directories.
-
-Initialize each repo once before you run repo-local `link`, `add`, `update`, or any shell hook:
+Initialize each repository once:
 
 ```bash
+cd my-repo
 skillenv init
 ```
 
-This creates `skillenv/default/`, `skillenv/local/`, and `skillenv/profiles/`, then adds managed `skillenv` entries to `.gitignore`. The hook only runs `skillenv link --quiet`; it does not edit `.gitignore`.
+Add repo-local skills:
 
-`skillenv init` is only for repo-local outputs. Global targets use fixed paths under `$HOME` and do not require `init`.
-
-For `zsh`, add this to `~/.zshrc`:
-
-```bash
-eval "$(skillenv hook zsh)"
+```text
+skillenv/
+  default/
+    review/SKILL.md
+  local/
+    private-helper/SKILL.md
+  profiles/
+    migration/
+      schema-audit/SKILL.md
 ```
 
-For `bash`, add this to `~/.bashrc` or `~/.bash_profile`:
+Link the default and local scopes:
 
 ```bash
-eval "$(skillenv hook bash)"
+skillenv link
 ```
 
-If you installed into a custom directory such as `$HOME/.local/bin`, make sure that directory is in your `PATH` before you add the hook.
+Link a profile when you need it:
 
-## Repo Layout
+```bash
+skillenv link --profile migration
+```
+
+Add a managed source and relink:
+
+```bash
+skillenv add vercel-labs/agent-skills --skill frontend-design
+```
+
+Check the installed CLI version:
+
+```bash
+skillenv version
+skillenv --version
+```
+
+## Usage
+
+The CLI binary is `skillenv`:
+
+```bash
+skillenv init [--claude|--no-claude]
+skillenv link [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
+skillenv unlink [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
+skillenv status [--claude|--no-claude]
+skillenv skills [--tool <claude|codex|opencode|antigravity>...] [--repo-tree] [--json]
+skillenv doctor [--json]
+skillenv add <source> [--skill <slug>...] [--into <dir>] [--ref <ref>] [--name <source-name>] [--claude|--no-claude]
+skillenv update [<managed-source>...] [--claude|--no-claude]
+skillenv global link [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
+skillenv global unlink [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
+skillenv global status [--claude|--no-claude]
+skillenv hook <zsh|bash>
+skillenv version
+```
+
+## Command Groups
+
+### Repo-local setup and linking
+
+- `skillenv init`: create the repo-local `skillenv/` layout and managed `.gitignore` entries
+- `skillenv link`: generate links for `default/` and `local/` by default
+- `skillenv link --profile <name>`: link only selected profile scopes
+- `skillenv link --all`: link every discovered scope, including all profiles
+- `skillenv unlink`: remove generated links for the selected scopes
+- `skillenv status`: inspect whether repo-local targets are linked
+
+### Skill inventory
+
+- `skillenv skills`: list the custom skills currently visible to Codex, Claude Code, OpenCode, and Antigravity
+- `skillenv skills --tool codex --tool opencode`: limit output to selected tools
+- `skillenv skills --repo-tree`: add nested repo inventory that is not currently visible from the working directory
+- `skillenv skills --json`: emit the stable machine-readable report shape
+
+### Diagnostics
+
+- `skillenv doctor`: show detailed diagnostics for config paths, resolved source roots, managed source metadata, and repo/global target state
+- `skillenv doctor --json`: emit the same diagnostics as JSON
+
+### Managed sources
+
+- `skillenv add`: install a managed source from GitHub shorthand, a Git URL, or a local checkout path
+- `skillenv update`: refresh one or more managed sources recorded in `skillenv.lock.json`
+
+### Global targets
+
+- `skillenv global link`: manually link the current repository into `$HOME/.agents/skills` and optional `$HOME/.claude/skills`
+- `skillenv global unlink`: remove only this repository's managed entries from the global targets
+- `skillenv global status`: inspect global target state
+
+### Shell hooks
+
+- `skillenv hook zsh`: print a `zsh` hook using `add-zsh-hook`
+- `skillenv hook bash`: print a `bash` hook using `PROMPT_COMMAND`
+
+### Version output
+
+- `skillenv version`: print the installed `skillenv` CLI version
+- `skillenv --version`: standard short form
+
+## Repository Layout
 
 Repo-local sources use this layout:
 
@@ -85,6 +171,9 @@ skillenv/
   profiles/
     <profile-name>/
       <skill-name>/SKILL.md
+  remote/
+    <source-name>/
+      ...
 ```
 
 Generated skills are linked into:
@@ -92,46 +181,101 @@ Generated skills are linked into:
 - `.agents/skills` by default
 - `.claude/skills` when enabled by config or CLI flags
 
-## CLI Usage
+`skillenv init` creates `default/`, `local/`, and `profiles/`. The `remote/` tree is created on demand by `skillenv add`.
 
-### Initialize a repo
+## Naming Rules
+
+`skillenv` normalizes repository, profile, skill, and managed source names to kebab-case:
+
+- letters are lowercased
+- ASCII letters and digits are kept
+- runs of other characters are converted to `-`
+- leading and trailing `-` are removed
+
+Examples:
+
+- `My Repo` -> `my-repo`
+- `Review Helpers` -> `review-helpers`
+- `frontend_design` -> `frontend-design`
+
+Generated output names follow these patterns:
+
+- repo-local targets: `skillenv-<repo-slug>-<scope>-<skill-slug>`
+- global targets: `skillenv-<repo-slug>-g<path-hash>-<scope>-<skill-slug>`
+- profile scopes render as `profile:<name>` in status output and `profile-<name>` in generated names
+
+Examples:
+
+- `skillenv-my-repo-default-review`
+- `skillenv-my-repo-local-private-helper`
+- `skillenv-my-repo-profile-migration-schema-audit`
+- `skillenv-my-repo-g2f9d13e4c1ab-default-review`
+
+## `init` in Detail
+
+Run `skillenv init` once inside each repository where you want repo-local outputs:
 
 ```bash
 skillenv init
 skillenv init --claude
 ```
 
-### Link repo-local skills
+This command:
 
-Run `skillenv init` first for repo-local `link` and shell hooks.
+- creates `skillenv/default/`, `skillenv/local/`, and `skillenv/profiles/` when missing
+- updates `.gitignore` with the managed `skillenv` entries needed for generated targets
+- does not link skills by itself
+
+This command does not:
+
+- create global `$HOME/.agents/skills` or `$HOME/.claude/skills`
+- install remote sources by itself
+- modify shell startup files
+
+Run `skillenv init` before repo-local `link`, `add`, `update`, or any shell hook. Global targets use fixed paths under `$HOME` and do not require `init`.
+
+## Skill Inventory
+
+Use `skillenv skills` when you need to answer "which custom skills does this tool actually see from here?" rather than "what did `skillenv` link?".
 
 ```bash
-skillenv link
-skillenv link --all
-skillenv link --profile review --profile migration
-skillenv unlink --profile review
-skillenv status
+skillenv skills
+skillenv skills --tool codex
+skillenv skills --tool claude --repo-tree
+skillenv skills --json
 ```
 
-### Link skills into global targets manually
+The report includes:
+
+- the tool and scope being inspected
+- the visible skill name and directory path
+- whether the entry looks `skillenv`-managed
+- the detected origin such as `repo:default`, `repo:profile:review`, `external:shared`, or `managed:vercel`
+- warnings for duplicate-visible, shadowed, legacy, invalid frontmatter, or missing `SKILL.md`
+
+`--repo-tree` keeps the normal "currently visible" entries and adds repo-wide inventory for nested tool directories. For Claude Code, nested `.claude/skills` paths are labeled `nested-on-demand`; other extra repo entries are labeled `repo-tree-only`.
+
+## Doctor
+
+Use `skillenv doctor` when `status` is too short and you need to inspect the underlying configuration and source wiring.
 
 ```bash
-skillenv global link
-skillenv global link --claude
-skillenv global unlink --all
-skillenv global status
+skillenv doctor
+skillenv doctor --json
 ```
 
-Global targets are fixed:
+The report includes:
 
-- `$HOME/.agents/skills`
-- `$HOME/.claude/skills`
+- repo root and `HOME`
+- config file path and whether it exists
+- enabled targets and default strategy
+- resolved external source directories from config
+- managed source metadata from `skillenv.lock.json`, including the original source and transport URL
+- repo-local and global target status
 
-These commands are manual-only. They do not require `skillenv init`, do not edit `.gitignore`, and do not create the repo-local `skillenv/default`, `skillenv/local`, or `skillenv/profiles` layout for you.
+## Managed Sources
 
-### Install remote skill packs
-
-Run `skillenv init` first so generated links and `skillenv/local/` stay ignored.
+Run `skillenv init` first so generated links and managed install roots stay ignored.
 
 Add a GitHub repo shorthand:
 
@@ -139,7 +283,7 @@ Add a GitHub repo shorthand:
 skillenv add vercel-labs/agent-skills
 ```
 
-Add a specific skill from a remote source:
+Add a specific skill from a managed source:
 
 ```bash
 skillenv add vercel-labs/agent-skills --skill frontend-design
@@ -169,6 +313,44 @@ Update only selected managed sources:
 ```bash
 skillenv update vercel local-pack
 ```
+
+## Global Targets
+
+Global targets are fixed:
+
+- `$HOME/.agents/skills`
+- `$HOME/.claude/skills`
+
+These commands are manual-only. They do not require `skillenv init`, do not edit `.gitignore`, and do not create the repo-local `skillenv/default`, `skillenv/local`, or `skillenv/profiles` layout for you.
+
+```bash
+skillenv global link
+skillenv global link --claude
+skillenv global unlink --all
+skillenv global status
+```
+
+Global generated names include a stable hash of the repository path so multiple repositories with the same basename do not collide.
+
+## Shell Setup
+
+`skillenv` can relink skills automatically when you change directories.
+
+For `zsh`, add this to `~/.zshrc`:
+
+```bash
+eval "$(skillenv hook zsh)"
+```
+
+For `bash`, add this to `~/.bashrc` or `~/.bash_profile`:
+
+```bash
+eval "$(skillenv hook bash)"
+```
+
+If you installed into a custom directory such as `$HOME/.local/bin`, make sure that directory is in your `PATH` before you add the hook.
+
+The shell hook only runs `skillenv link --quiet`. It does not edit `.gitignore`.
 
 ## Lock File
 
@@ -204,6 +386,14 @@ path = "/path/to/skills"
 ```
 
 Older `[gitignore].auto_update` settings are ignored as of `0.1.1`. Use `skillenv init` to manage repo-local ignore entries instead.
+
+## Versioning
+
+`skillenv` uses the crate version from `Cargo.toml` as the CLI version and release version.
+
+- `skillenv version` prints the installed version
+- `skillenv --version` prints the same value
+- GitHub Releases are tagged as `vX.Y.Z`
 
 ## Library Usage
 
@@ -263,6 +453,8 @@ cargo build
 cargo test --locked
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo package --locked
+sh -n install.sh
 ```
 
 ## Release Automation
