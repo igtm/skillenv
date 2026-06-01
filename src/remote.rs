@@ -39,6 +39,26 @@ pub struct AddSourceReport {
 }
 
 #[derive(Debug, Clone)]
+pub struct FetchSourcesOptions {
+    pub names: Vec<String>,
+    pub claude: TargetOverride,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchSourcesReport {
+    pub fetched: Vec<FetchedLockedSource>,
+    pub link_report: Option<Report>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchedLockedSource {
+    pub name: String,
+    pub install_root: PathBuf,
+    pub resolved_revision: String,
+    pub selected_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct UpdateSourcesOptions {
     pub names: Vec<String>,
     pub claude: TargetOverride,
@@ -308,6 +328,66 @@ pub fn update_sources(
     })
 }
 
+pub fn fetch_sources(
+    cwd: impl AsRef<Path>,
+    options: FetchSourcesOptions,
+) -> Result<FetchSourcesReport> {
+    let cwd = cwd.as_ref();
+    let repo_root = detect_repo_root(cwd).ok_or(SkillenvError::RepoRequired)?;
+    let loaded = load_config(None)?;
+    require_repo_initialized(
+        &repo_root,
+        include_claude_target(&loaded.config, options.claude),
+    )?;
+    let lock_file = load_lock_file(&repo_root)?;
+    let requested_names = normalize_selected_skills(&options.names);
+    validate_requested_names(&lock_file, &requested_names)?;
+
+    let occupied_install_roots = occupied_install_roots(&repo_root, &lock_file);
+    let mut fetched_sources = Vec::new();
+
+    for entry in &lock_file.sources {
+        if !requested_names.is_empty() && !requested_names.contains(&entry.name) {
+            continue;
+        }
+
+        let fetched = fetch_locked_source(entry)?;
+        let install_root = resolve_stored_path(&repo_root, &entry.install_root);
+        ensure_install_root_available(&occupied_install_roots, &entry.name, &install_root)?;
+        let prepared = install_fetched_source(
+            &repo_root,
+            &entry.name,
+            &install_root,
+            &fetched,
+            &entry.selected_skills,
+        )?;
+        fetched_sources.push(FetchedLockedSource {
+            name: entry.name.clone(),
+            install_root,
+            resolved_revision: prepared.resolved_revision,
+            selected_skills: prepared.selected_skills,
+        });
+    }
+
+    let link_report = if fetched_sources.is_empty() {
+        None
+    } else {
+        Some(link_repo(
+            &repo_root,
+            LinkOptions {
+                selector: ScopeSelector::DefaultLocal,
+                claude: options.claude,
+                quiet: true,
+            },
+        )?)
+    };
+
+    Ok(FetchSourcesReport {
+        fetched: fetched_sources,
+        link_report,
+    })
+}
+
 pub fn format_add_source_report(report: &AddSourceReport) -> String {
     let mut lines = vec![
         format!("added source {}", report.name),
@@ -318,6 +398,23 @@ pub fn format_add_source_report(report: &AddSourceReport) -> String {
         lines.push(format!("skills: {}", report.selected_skills.join(", ")));
     }
     lines.push(crate::format_link_report(&report.link_report, "linked"));
+    lines.join("\n")
+}
+
+pub fn format_fetch_sources_report(report: &FetchSourcesReport) -> String {
+    let mut lines = Vec::new();
+    for source in &report.fetched {
+        lines.push(format!(
+            "fetched {} ({})",
+            source.name, source.resolved_revision
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("no managed sources found".to_string());
+    }
+    if let Some(link_report) = &report.link_report {
+        lines.push(crate::format_link_report(link_report, "linked"));
+    }
     lines.join("\n")
 }
 
@@ -524,6 +621,47 @@ fn normalize_local_source(path: &Path) -> String {
         .to_string()
 }
 
+fn git_source_root_and_subdir(path: &Path) -> Option<(PathBuf, Option<PathBuf>)> {
+    let repo_root = run_git(
+        &[
+            "-C".to_string(),
+            path.display().to_string(),
+            "rev-parse".to_string(),
+            "--show-toplevel".to_string(),
+        ],
+        None,
+    )
+    .ok()?;
+    let prefix = run_git(
+        &[
+            "-C".to_string(),
+            path.display().to_string(),
+            "rev-parse".to_string(),
+            "--show-prefix".to_string(),
+        ],
+        None,
+    )
+    .ok()?;
+
+    let repo_root = PathBuf::from(repo_root.trim());
+    let prefix = prefix.trim().trim_end_matches('/');
+    let subdir = if prefix.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(prefix))
+    };
+    Some((repo_root, subdir))
+}
+
+fn combine_subdirs(left: Option<&Path>, right: Option<&Path>) -> Option<PathBuf> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.join(right)),
+        (Some(left), None) => Some(left.to_path_buf()),
+        (None, Some(right)) => Some(right.to_path_buf()),
+        (None, None) => None,
+    }
+}
+
 fn fetch_source(parsed: &ParsedSource) -> Result<FetchedSource> {
     match parsed.kind {
         LockedSourceKind::Git => fetch_git_source(
@@ -537,6 +675,41 @@ fn fetch_source(parsed: &ParsedSource) -> Result<FetchedSource> {
             parsed.requested_ref.as_deref(),
         ),
     }
+}
+
+fn fetch_locked_source(entry: &LockedSource) -> Result<FetchedSource> {
+    match entry.kind {
+        LockedSourceKind::Git => fetch_git_source(
+            &entry.transport,
+            Some(&entry.resolved_revision),
+            entry.subdir.as_deref().map(Path::new),
+        ),
+        LockedSourceKind::Local => fetch_locked_local_source(entry),
+    }
+}
+
+fn fetch_locked_local_source(entry: &LockedSource) -> Result<FetchedSource> {
+    let transport_path = Path::new(&entry.transport);
+    if entry.resolved_revision != "unversioned"
+        && transport_path.exists()
+        && let Some((repo_root, repo_subdir)) = git_source_root_and_subdir(transport_path)
+    {
+        let subdir = combine_subdirs(
+            repo_subdir.as_deref(),
+            entry.subdir.as_deref().map(Path::new),
+        );
+        return fetch_git_source(
+            repo_root.to_string_lossy().as_ref(),
+            Some(&entry.resolved_revision),
+            subdir.as_deref(),
+        );
+    }
+
+    fetch_local_source(
+        &entry.transport,
+        entry.subdir.as_deref().map(Path::new),
+        entry.requested_ref.as_deref(),
+    )
 }
 
 fn fetch_git_source(
@@ -1242,6 +1415,112 @@ mod tests {
             )
             .unwrap()
             .contains("v2")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_sources_restores_missing_install_root_at_locked_revision() -> Result<()> {
+        let repo = repo_fixture()?;
+        let upstream = git_fixture("agent-skills")?;
+        write_skill(upstream.path(), "skills/frontend-design", "v1")?;
+        commit_all(upstream.path(), "initial")?;
+        init_repo(repo.path(), InitOptions::default())?;
+
+        let first = add_source(
+            repo.path(),
+            AddSourceOptions {
+                source: upstream.path().display().to_string(),
+                into: None,
+                skills: Vec::new(),
+                ref_name: None,
+                name: Some("shared".to_string()),
+                claude: TargetOverride::UseConfig,
+            },
+        )?;
+        let lock_before = fs::read_to_string(repo.path().join(LOCK_FILE_NAME)).unwrap();
+
+        fs::write(
+            upstream.path().join("skills/frontend-design/SKILL.md"),
+            "v2\n",
+        )
+        .unwrap();
+        commit_all(upstream.path(), "update")?;
+        remove_managed_install_root(&repo.path().join("skillenv/remote/shared"), "shared")?;
+
+        let fetched = fetch_sources(
+            repo.path(),
+            FetchSourcesOptions {
+                names: vec!["shared".to_string()],
+                claude: TargetOverride::UseConfig,
+            },
+        )?;
+
+        assert_eq!(fetched.fetched.len(), 1);
+        assert_eq!(
+            fetched.fetched[0].resolved_revision,
+            first.resolved_revision
+        );
+        assert!(
+            fs::read_to_string(
+                repo.path()
+                    .join("skillenv/remote/shared/default/frontend-design/SKILL.md")
+            )
+            .unwrap()
+            .contains("v1")
+        );
+        assert_eq!(
+            fs::read_to_string(repo.path().join(LOCK_FILE_NAME)).unwrap(),
+            lock_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_sources_restores_direct_skill_directory_from_git_subdir() -> Result<()> {
+        let repo = repo_fixture()?;
+        let upstream = git_fixture("single-skill")?;
+        write_skill(upstream.path(), "web-design-guidelines", "v1")?;
+        commit_all(upstream.path(), "initial")?;
+        init_repo(repo.path(), InitOptions::default())?;
+
+        let skill_dir = upstream.path().join("web-design-guidelines");
+        let first = add_source(
+            repo.path(),
+            AddSourceOptions {
+                source: skill_dir.display().to_string(),
+                into: Some(PathBuf::from("vendor/ui")),
+                skills: Vec::new(),
+                ref_name: None,
+                name: None,
+                claude: TargetOverride::UseConfig,
+            },
+        )?;
+
+        fs::write(skill_dir.join("SKILL.md"), "v2\n").unwrap();
+        commit_all(upstream.path(), "update")?;
+        remove_managed_install_root(&repo.path().join("vendor/ui"), "web-design-guidelines")?;
+
+        let fetched = fetch_sources(
+            repo.path(),
+            FetchSourcesOptions {
+                names: vec!["web-design-guidelines".to_string()],
+                claude: TargetOverride::UseConfig,
+            },
+        )?;
+
+        assert_eq!(fetched.fetched.len(), 1);
+        assert_eq!(
+            fetched.fetched[0].resolved_revision,
+            first.resolved_revision
+        );
+        assert!(
+            fs::read_to_string(
+                repo.path()
+                    .join("vendor/ui/default/web-design-guidelines/SKILL.md")
+            )
+            .unwrap()
+            .contains("v1")
         );
         Ok(())
     }

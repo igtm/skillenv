@@ -13,7 +13,7 @@
 - リポジトリ移動時に自動で relink する shell hook
 - 同じ操作を埋め込める Rust ライブラリ
 
-現在のバージョンは `0.3.0` です。
+現在のバージョンは `0.3.1` です。
 
 ## インストール
 
@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 バージョンを指定する場合:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.3.0
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.3.1
 ```
 
 Cargo で GitHub からインストールする場合:
@@ -87,6 +87,12 @@ managed source を追加して relink する場合:
 skillenv add vercel-labs/agent-skills --skill frontend-design
 ```
 
+別マシンで `skillenv.lock.json` から復元する場合:
+
+```bash
+skillenv fetch
+```
+
 インストール済み CLI のバージョン確認:
 
 ```bash
@@ -106,6 +112,7 @@ skillenv status [--claude|--no-claude]
 skillenv skills [--tool <claude|codex|opencode|antigravity>...] [--repo-tree] [--json]
 skillenv doctor [--json]
 skillenv add <source> [--skill <slug>...] [--into <dir>] [--ref <ref>] [--name <source-name>] [--claude|--no-claude]
+skillenv fetch [<managed-source>...] [--claude|--no-claude]
 skillenv update [<managed-source>...] [--claude|--no-claude]
 skillenv global link [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
 skillenv global unlink [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
@@ -140,6 +147,7 @@ skillenv version
 ### Managed source
 
 - `skillenv add`: GitHub shorthand、Git URL、または local checkout path から managed source を導入
+- `skillenv fetch`: `skillenv.lock.json` の lock 内容から managed install root を復元
 - `skillenv update`: `skillenv.lock.json` に記録された managed source を更新
 
 ### Global target
@@ -232,7 +240,7 @@ skillenv init --claude
 - remote source のインストール
 - shell startup file の編集
 
-repo-local の `link`, `add`, `update`, shell hook を使う前に `skillenv init` を実行してください。`$HOME` 配下の global target は固定 path を使うため、`init` は不要です。
+repo-local の `link`, `add`, `fetch`, `update`, shell hook を使う前に `skillenv init` を実行してください。`$HOME` 配下の global target は固定 path を使うため、`init` は不要です。
 
 ## Skill Inventory
 
@@ -302,6 +310,18 @@ skillenv add https://github.com/vercel-labs/agent-skills
 skillenv add ../agent-skills-local --name local-pack
 ```
 
+`skillenv.lock.json` に記録された lock 済み revision をそのまま復元する場合:
+
+```bash
+skillenv fetch
+```
+
+指定した source だけ復元する場合:
+
+```bash
+skillenv fetch vercel local-pack
+```
+
 `skillenv.lock.json` に記録された全 source を更新する場合:
 
 ```bash
@@ -313,6 +333,8 @@ skillenv update
 ```bash
 skillenv update vercel local-pack
 ```
+
+別マシンで今の lock をそのまま再現したいときは `fetch`、最新 revision に進めて lock を書き換えたいときは `update` を使います。
 
 ## Global Target
 
@@ -365,6 +387,8 @@ remote source と managed local source は repository root の `skillenv.lock.js
 - 現在 install されている resolved revision
 
 複数マシンで同じ skill set を再現したい場合は、この file を commit してください。
+
+別マシンでは、最初に `skillenv init` を実行してから `skillenv fetch` を実行すると、lock file から managed install root を再作成できます。Git source は lock 済み revision で復元されます。local path source は、その path が対象マシンにも存在する場合だけ復元できます。
 
 ## Config
 

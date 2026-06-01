@@ -22,8 +22,10 @@ const PROFILES_SCOPE_DIR: &str = "profiles";
 pub type Result<T> = std::result::Result<T, SkillenvError>;
 
 pub use remote::{
-    AddSourceOptions, AddSourceReport, UpdateSourcesOptions, UpdateSourcesReport, add_source,
-    format_add_source_report, format_update_sources_report, update_sources,
+    AddSourceOptions, AddSourceReport, FetchSourcesOptions, FetchSourcesReport,
+    FetchedLockedSource, UpdateSourcesOptions, UpdateSourcesReport, add_source, fetch_sources,
+    format_add_source_report, format_fetch_sources_report, format_update_sources_report,
+    update_sources,
 };
 
 #[derive(Debug, Clone, Deserialize, Default)]

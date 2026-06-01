@@ -13,7 +13,7 @@ It provides:
 - shell hooks for automatic relinking when you change repositories
 - a reusable Rust library for embedding the same workflows in other tools
 
-The current version is `0.3.0`.
+The current version is `0.3.1`.
 
 ## Install
 
@@ -32,7 +32,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.3.0
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.3.1
 ```
 
 Install from GitHub with Cargo:
@@ -87,6 +87,12 @@ Add a managed source and relink:
 skillenv add vercel-labs/agent-skills --skill frontend-design
 ```
 
+Restore managed sources from `skillenv.lock.json` on another machine:
+
+```bash
+skillenv fetch
+```
+
 Check the installed CLI version:
 
 ```bash
@@ -106,6 +112,7 @@ skillenv status [--claude|--no-claude]
 skillenv skills [--tool <claude|codex|opencode|antigravity>...] [--repo-tree] [--json]
 skillenv doctor [--json]
 skillenv add <source> [--skill <slug>...] [--into <dir>] [--ref <ref>] [--name <source-name>] [--claude|--no-claude]
+skillenv fetch [<managed-source>...] [--claude|--no-claude]
 skillenv update [<managed-source>...] [--claude|--no-claude]
 skillenv global link [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
 skillenv global unlink [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
@@ -140,6 +147,7 @@ skillenv version
 ### Managed sources
 
 - `skillenv add`: install a managed source from GitHub shorthand, a Git URL, or a local checkout path
+- `skillenv fetch`: restore managed install roots from `skillenv.lock.json` without changing the lock file
 - `skillenv update`: refresh one or more managed sources recorded in `skillenv.lock.json`
 
 ### Global targets
@@ -232,7 +240,7 @@ This command does not:
 - install remote sources by itself
 - modify shell startup files
 
-Run `skillenv init` before repo-local `link`, `add`, `update`, or any shell hook. Global targets use fixed paths under `$HOME` and do not require `init`.
+Run `skillenv init` before repo-local `link`, `add`, `fetch`, `update`, or any shell hook. Global targets use fixed paths under `$HOME` and do not require `init`.
 
 ## Skill Inventory
 
@@ -302,6 +310,18 @@ skillenv add https://github.com/vercel-labs/agent-skills
 skillenv add ../agent-skills-local --name local-pack
 ```
 
+Restore the exact locked revisions from `skillenv.lock.json`:
+
+```bash
+skillenv fetch
+```
+
+Restore only selected managed sources:
+
+```bash
+skillenv fetch vercel local-pack
+```
+
 Update all managed sources recorded in `skillenv.lock.json`:
 
 ```bash
@@ -313,6 +333,8 @@ Update only selected managed sources:
 ```bash
 skillenv update vercel local-pack
 ```
+
+Use `fetch` when you want another machine to reproduce the current lock exactly. Use `update` when you want to move managed sources forward to newer revisions and rewrite the lock file.
 
 ## Global Targets
 
@@ -365,6 +387,8 @@ Each entry records:
 - the resolved revision used for the current install
 
 Commit this file if you want reproducible shared skill sets across machines.
+
+On another machine, run `skillenv init` once and then `skillenv fetch` to recreate the managed install roots from the lock file. Git-based sources are restored at the locked revision. Local path sources can only be restored when the referenced path also exists on that machine.
 
 ## Config
 

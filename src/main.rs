@@ -4,17 +4,18 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use skillenv::{
     AddSourceOptions, DoctorOptions, InitOptions, LinkOptions, ScopeSelector, Shell,
     SkillInventoryOptions, SkillInventoryTool, StatusOptions, TargetOverride, UnlinkOptions,
-    UpdateSourcesOptions, add_source, doctor, format_add_source_report, format_doctor_report,
-    format_init_report, format_link_report, format_skill_inventory_report, format_status_report,
-    format_update_sources_report, hook_script, init_repo, link_global, link_repo, skill_inventory,
-    status_global, status_repo, unlink_global, unlink_repo, update_sources,
+    UpdateSourcesOptions, add_source, doctor, fetch_sources, format_add_source_report,
+    format_doctor_report, format_fetch_sources_report, format_init_report, format_link_report,
+    format_skill_inventory_report, format_status_report, format_update_sources_report, hook_script,
+    init_repo, link_global, link_repo, skill_inventory, status_global, status_repo, unlink_global,
+    unlink_repo, update_sources,
 };
 
 const ROOT_AFTER_HELP: &str = r#"Workflow:
   1. Run `skillenv init` once in each repository.
   2. Put repo-owned skills under `skillenv/default`, `skillenv/local`, or `skillenv/profiles/<profile>`.
   3. Run `skillenv link` to refresh `.agents/skills` and optional `.claude/skills` outputs.
-  4. Use `skillenv add` and `skillenv update` for managed sources recorded in `skillenv.lock.json`.
+  4. Use `skillenv add`, `skillenv fetch`, and `skillenv update` for managed sources recorded in `skillenv.lock.json`.
 
 Repo layout:
   skillenv/
@@ -37,6 +38,7 @@ Naming rules:
 Examples:
   skillenv init
   skillenv link --profile review
+  skillenv fetch
   skillenv doctor
   skillenv add vercel-labs/agent-skills --skill frontend-design
   skillenv update vercel
@@ -81,6 +83,14 @@ Generated names include a stable path hash so multiple repositories can coexist 
 
 const UPDATE_AFTER_HELP: &str = r#"When no managed source names are passed, every entry in `skillenv.lock.json` is refreshed.
 Changed sources are reinstalled into their managed roots and default/local scopes are relinked."#;
+
+const FETCH_AFTER_HELP: &str = r#"This command restores the managed install roots recorded in `skillenv.lock.json`.
+
+It fetches Git sources at the locked `resolved_revision`, reinstalls the selected skills into
+their managed roots, and relinks default/local scopes without modifying the lock file.
+
+Use this on a new machine or after cleaning `skillenv/remote/` when only the lock file is
+checked into Git."#;
 
 const SKILLS_AFTER_HELP: &str = r#"Discovery targets:
   - codex: current repo `.agents/skills`, `$HOME/.agents/skills`, `/etc/codex/skills`
@@ -153,7 +163,12 @@ enum Command {
         about = "Refresh managed sources recorded in skillenv.lock.json and relink them.",
         after_long_help = UPDATE_AFTER_HELP
     )]
-    Update(UpdateArgs),
+    Update(ManagedSourceArgs),
+    #[command(
+        about = "Restore managed sources from skillenv.lock.json using the locked revisions.",
+        after_long_help = FETCH_AFTER_HELP
+    )]
+    Fetch(ManagedSourceArgs),
     #[command(
         about = "List tool-visible custom skills across repository and home directories.",
         after_long_help = SKILLS_AFTER_HELP
@@ -254,8 +269,8 @@ struct TargetArgs {
 }
 
 #[derive(Debug, Args)]
-struct UpdateArgs {
-    #[arg(help = "Managed source names to refresh. Defaults to every recorded source.")]
+struct ManagedSourceArgs {
+    #[arg(help = "Managed source names to operate on. Defaults to every recorded source.")]
     names: Vec<String>,
     #[arg(
         long,
@@ -455,6 +470,16 @@ fn run(cli: Cli) -> skillenv::Result<String> {
             )?;
             Ok(format_update_sources_report(&report))
         }
+        Command::Fetch(args) => {
+            let report = fetch_sources(
+                ".",
+                skillenv::FetchSourcesOptions {
+                    names: args.names,
+                    claude: target_override(args.claude, args.no_claude),
+                },
+            )?;
+            Ok(format_fetch_sources_report(&report))
+        }
         Command::Skills(args) => {
             let report = skill_inventory(
                 ".",
@@ -585,6 +610,18 @@ mod tests {
         assert!(help.contains("config file path"));
         assert!(help.contains("transport URLs"));
         assert!(help.contains("--json"));
+    }
+
+    #[test]
+    fn fetch_help_describes_locked_revision_restore() {
+        let mut command = Cli::command();
+        let fetch = command.find_subcommand_mut("fetch").unwrap();
+        let mut buffer = Vec::new();
+        fetch.write_long_help(&mut buffer).unwrap();
+        let help = String::from_utf8(buffer).unwrap();
+        assert!(help.contains("locked `resolved_revision`"));
+        assert!(help.contains("without modifying the lock file"));
+        assert!(help.contains("new machine"));
     }
 
     #[test]
