@@ -12,6 +12,8 @@ use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
 mod inventory;
+mod lock;
+mod manifest;
 mod paths;
 mod remote;
 mod render;
@@ -400,7 +402,24 @@ pub enum SkillenvError {
     #[error("invalid config at {path}: {source}")]
     ParseConfig {
         path: PathBuf,
-        source: toml::de::Error,
+        source: toml_edit::de::Error,
+    },
+    #[error("invalid manifest at {path}: {source}")]
+    ParseManifest {
+        path: PathBuf,
+        source: toml_edit::de::Error,
+    },
+    #[error("invalid manifest at {path}: {message}")]
+    InvalidManifest { path: PathBuf, message: String },
+    #[error("invalid skill id '{input}': {reason}")]
+    InvalidSkillId { input: String, reason: String },
+    #[error(
+        "lock file at {path} is version {found}, but this build understands only version {supported}; upgrade skillenv"
+    )]
+    UnsupportedLockVersion {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
     },
     #[error("invalid frontmatter in {path}: {source}")]
     ParseFrontmatter {
@@ -1458,7 +1477,7 @@ fn load_config(config_override: Option<&Path>) -> Result<LoadedConfig> {
         path: config_path.clone(),
         source,
     })?;
-    let config = toml::from_str(&raw).map_err(|source| SkillenvError::ParseConfig {
+    let config = toml_edit::de::from_str(&raw).map_err(|source| SkillenvError::ParseConfig {
         path: config_path.clone(),
         source,
     })?;
