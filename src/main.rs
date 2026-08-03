@@ -6,9 +6,9 @@ use skillenv::{
     SkillInventoryOptions, SkillInventoryTool, StatusOptions, TargetOverride, UnlinkOptions,
     UpdateSourcesOptions, add_source, doctor, fetch_sources, format_add_source_report,
     format_doctor_report, format_fetch_sources_report, format_init_report, format_link_report,
-    format_skill_inventory_report, format_status_report, format_update_sources_report, hook_script,
-    init_repo, link_global, link_repo, skill_inventory, status_global, status_repo, unlink_global,
-    unlink_repo, update_sources,
+    format_link_warnings, format_skill_inventory_report, format_status_report,
+    format_update_sources_report, hook_script, init_repo, link_global, link_repo, skill_inventory,
+    status_global, status_repo, unlink_global, unlink_repo, update_sources,
 };
 
 const ROOT_AFTER_HELP: &str = r#"Workflow:
@@ -351,6 +351,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// Report skipped skills on stderr.
+///
+/// Deliberately independent of `--quiet`: that flag exists so the shell hook can
+/// stay silent on success, not so it can hide skills that failed to link.
+fn report_link_warnings(report: &skillenv::Report) {
+    let warnings = format_link_warnings(report);
+    if !warnings.is_empty() {
+        eprintln!("{warnings}");
+    }
+}
+
 fn run(cli: Cli) -> skillenv::Result<String> {
     match cli.command {
         Command::Add(args) => {
@@ -385,6 +396,7 @@ fn run(cli: Cli) -> skillenv::Result<String> {
                     quiet: args.quiet,
                 },
             )?;
+            report_link_warnings(&report);
             Ok(if args.quiet {
                 String::new()
             } else {
@@ -426,6 +438,7 @@ fn run(cli: Cli) -> skillenv::Result<String> {
                     quiet: args.quiet,
                 },
             )?;
+            report_link_warnings(&report);
             Ok(if args.quiet {
                 String::new()
             } else {

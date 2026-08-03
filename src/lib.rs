@@ -8,12 +8,14 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
+use tempfile::TempDir;
 use thiserror::Error;
 use walkdir::WalkDir;
 
 mod remote;
 
 const GENERATED_MARKER_FILE: &str = ".skillenv-generated.json";
+const STAGING_PREFIX: &str = ".skillenv-staging-";
 const REPO_LAYOUT_DIR: &str = "skillenv";
 const DEFAULT_SCOPE_DIR: &str = "default";
 const LOCAL_SCOPE_DIR: &str = "local";
@@ -331,6 +333,18 @@ pub struct TargetReport {
     pub path: Option<PathBuf>,
     pub linked: usize,
     pub removed: usize,
+    /// Skills that could not be linked into this target. Reported instead of
+    /// failing the whole run so one broken skill cannot block the others.
+    pub skipped: Vec<SkippedSkill>,
+}
+
+/// A skill that was left unlinked, with the reason it was skipped.
+#[derive(Debug, Clone)]
+pub struct SkippedSkill {
+    pub scope: String,
+    pub skill: String,
+    pub generated_name: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -449,6 +463,28 @@ pub enum SkillenvError {
     },
     #[error("unsupported shell '{0}'")]
     UnsupportedShell(String),
+}
+
+impl SkillenvError {
+    /// Whether this failure is confined to one skill, so linking should skip
+    /// that skill and carry on.
+    ///
+    /// Only failures caused by a skill's own definition qualify: a malformed
+    /// SKILL.md, or a target directory already holding something skillenv did
+    /// not create. Both are deterministic, affect exactly one skill, and are
+    /// fixed by editing that skill or clearing that directory.
+    ///
+    /// I/O failures deliberately do not qualify. A read-only filesystem or a
+    /// full disk affects every skill, and reporting it once per skill while
+    /// exiting successfully would bury a systemic fault in a list of warnings.
+    fn is_skill_local(&self) -> bool {
+        matches!(
+            self,
+            SkillenvError::ParseFrontmatter { .. }
+                | SkillenvError::InvalidMetadataField { .. }
+                | SkillenvError::TargetCollision { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -709,6 +745,32 @@ pub fn format_link_report(report: &Report, action: &str) -> String {
 
     if report.gitignore_updated {
         lines.push(".gitignore updated".to_string());
+    }
+
+    lines.join("\n")
+}
+
+/// Warnings for every skill that was left unlinked, one per line. Empty when
+/// nothing was skipped.
+///
+/// Kept separate from [`format_link_report`] so callers can route these to
+/// stderr and still emit them when the run is otherwise silent. `skillenv link
+/// --quiet` is what the shell hook runs, and a skipped skill must not be
+/// invisible there — that silence is the failure mode this reporting exists to
+/// prevent.
+pub fn format_link_warnings(report: &Report) -> String {
+    let mut lines = Vec::new();
+    for target in &report.target_reports {
+        for skipped in &target.skipped {
+            let location = match &target.path {
+                Some(path) => path.join(&skipped.generated_name).display().to_string(),
+                None => skipped.generated_name.clone(),
+            };
+            lines.push(format!(
+                "warning: skipped {} ({}) at {}: {}",
+                skipped.skill, skipped.scope, location, skipped.reason
+            ));
+        }
     }
 
     lines.join("\n")
@@ -1789,6 +1851,16 @@ fn collect_inventory_entries(
             if !metadata.is_dir() && !metadata.file_type().is_symlink() {
                 continue;
             }
+            // Render staging is not a skill. It is normally short-lived, but a
+            // hard kill can strand one, and reporting it as an invalid skill
+            // would send the reader chasing a directory they must not touch.
+            if dir_entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STAGING_PREFIX)
+            {
+                continue;
+            }
 
             let mut candidate =
                 inspect_inventory_skill(tool, &root, &path, source_roots, warnings)?;
@@ -2303,7 +2375,7 @@ fn link_with_config(
             &filter,
             &discovery.known_source_roots,
         )?;
-        let linked = reconcile_target(
+        let (linked, skipped) = reconcile_target(
             &target.path,
             &generated_names,
             config.defaults.strategy,
@@ -2314,6 +2386,7 @@ fn link_with_config(
             path: Some(target.path.clone()),
             linked,
             removed,
+            skipped,
         });
     }
 
@@ -2389,6 +2462,7 @@ fn unlink_with_config(
             path: Some(target.path.clone()),
             linked: 0,
             removed,
+            skipped: Vec::new(),
         });
     }
 
@@ -2916,36 +2990,120 @@ fn remove_managed_entries(
     Ok(removed)
 }
 
+/// Link every desired skill into `target_dir`, reporting per-skill failures
+/// rather than aborting.
+///
+/// An invalid SKILL.md or occupied target used to abort the whole reconcile,
+/// which left every skill ordered after it unlinked across every target. Because
+/// `skillenv link` also runs unattended from the shell hook, one bad skill could
+/// silently freeze an entire setup. Such failures are collected instead so the
+/// remaining skills still land.
+///
+/// Only skill-local failures are collected; see
+/// [`SkillenvError::is_skill_local`]. Anything systemic still aborts.
 fn reconcile_target(
     target_dir: &Path,
     generated_names: &GeneratedNameLayout,
     strategy: Strategy,
     desired_sources: &BTreeMap<ScopeKey, Vec<SkillSource>>,
-) -> Result<usize> {
+) -> Result<(usize, Vec<SkippedSkill>)> {
     let mut linked = 0usize;
+    let mut skipped = Vec::new();
     for (scope, sources) in desired_sources {
         for source in sources {
             let generated_name = generated_names.generated_name(scope, &source.skill_slug);
             let generated_path = target_dir.join(&generated_name);
-            ensure_unmanaged_target_absent(&generated_path)?;
-            match strategy {
-                Strategy::Render => render_source(
-                    &generated_names.repo_slug,
-                    scope,
-                    source,
-                    &generated_name,
-                    &generated_path,
-                )?,
-                Strategy::Symlink => symlink_source(source, &generated_path)?,
+            match link_one_source(
+                &generated_names.repo_slug,
+                scope,
+                source,
+                &generated_name,
+                &generated_path,
+                strategy,
+            ) {
+                Ok(()) => linked += 1,
+                Err(error) if error.is_skill_local() => skipped.push(SkippedSkill {
+                    scope: scope.display_name(),
+                    skill: source.skill_slug.clone(),
+                    generated_name,
+                    reason: error.to_string(),
+                }),
+                Err(error) => return Err(error),
             }
-            linked += 1;
         }
     }
 
-    Ok(linked)
+    Ok((linked, skipped))
 }
 
+fn link_one_source(
+    repo_slug: &str,
+    scope: &ScopeKey,
+    source: &SkillSource,
+    generated_name: &str,
+    generated_path: &Path,
+    strategy: Strategy,
+) -> Result<()> {
+    ensure_unmanaged_target_absent(generated_path)?;
+    match strategy {
+        Strategy::Render => render_source(repo_slug, scope, source, generated_name, generated_path),
+        Strategy::Symlink => symlink_source(source, generated_path),
+    }
+}
+
+/// Render a skill atomically: build the whole tree in a staging directory and
+/// only move it into place once it is complete.
+///
+/// Rendering can fail part-way through (most commonly on invalid SKILL.md
+/// frontmatter, after the asset tree has already been copied). Writing straight
+/// into `generated_path` would leave a directory holding assets but no
+/// `SKILL.md` and no marker file, which every later run then reports as an
+/// unmanaged target and refuses to touch. Staging keeps failures invisible to
+/// the target directory, so a fixed source self-heals on the next link.
+///
+/// Staging sits in the same target directory so the final move is a
+/// same-filesystem rename. The name is uniquely generated per run, so two
+/// concurrent links (plausible: the shell hook fires on every directory change)
+/// cannot stage over each other, and it is removed when the `TempDir` drops,
+/// including on the error paths and on unwind.
 fn render_source(
+    repo_slug: &str,
+    scope: &ScopeKey,
+    source: &SkillSource,
+    generated_name: &str,
+    generated_path: &Path,
+) -> Result<()> {
+    let parent = generated_path
+        .parent()
+        .ok_or_else(|| SkillenvError::WriteFile {
+            path: generated_path.to_path_buf(),
+            source: io::Error::other("generated path has no parent directory"),
+        })?;
+    let staging = TempDir::with_prefix_in(STAGING_PREFIX, parent).map_err(|source| {
+        SkillenvError::CreateDir {
+            path: parent.to_path_buf(),
+            source,
+        }
+    })?;
+
+    render_source_into(repo_slug, scope, source, generated_name, staging.path())?;
+
+    // Re-check right before the move. `rename` silently replaces an empty
+    // directory, so a target that appeared while we were rendering would be
+    // clobbered without this, defeating the collision check above.
+    ensure_unmanaged_target_absent(generated_path)?;
+
+    let staged = staging.keep();
+    fs::rename(&staged, generated_path).map_err(|error| {
+        let _ = remove_existing_path(&staged);
+        SkillenvError::WriteFile {
+            path: generated_path.to_path_buf(),
+            source: error,
+        }
+    })
+}
+
+fn render_source_into(
     repo_slug: &str,
     scope: &ScopeKey,
     source: &SkillSource,
@@ -3441,6 +3599,38 @@ fn ensure_layout_dir(path: &Path, created_dirs: &mut Vec<PathBuf>) -> Result<()>
         created_dirs.push(path.to_path_buf());
     }
     Ok(())
+}
+
+/// Remove `path` whether it is a file, directory, or symlink. A missing path is
+/// not an error.
+fn remove_existing_path(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(SkillenvError::ReadFile {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    // Only a real directory may be recursed into; a symlink to one must be
+    // unlinked instead so removal never escapes the target directory.
+    let result = if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(SkillenvError::WriteFile {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 fn ensure_unmanaged_target_absent(path: &Path) -> Result<()> {
@@ -3961,10 +4151,12 @@ Body text
         )?;
         init_test_repo(repo.path(), &config_path)?;
 
-        let error = link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))
-            .unwrap_err();
+        let report =
+            link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
 
-        assert!(matches!(error, SkillenvError::InvalidMetadataField { .. }));
+        let skipped = only_skipped(&report);
+        assert_eq!(skipped.skill, "research");
+        assert!(skipped.reason.contains("invalid metadata field"));
         Ok(())
     }
 
@@ -4120,7 +4312,7 @@ strategy = "symlink"
     }
 
     #[test]
-    fn link_refuses_to_overwrite_unmanaged_target() -> Result<()> {
+    fn link_skips_unmanaged_target_without_touching_it() -> Result<()> {
         let repo = repo_fixture()?;
         let repo_slug = test_repo_slug(repo.path());
         let config_path = write_config(repo.path(), "")?;
@@ -4139,13 +4331,191 @@ strategy = "symlink"
         ensure_dir(&collision)?;
         fs::write(collision.join("README.md"), "manual content").unwrap();
 
-        let error = link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))
-            .unwrap_err();
-        assert!(matches!(error, SkillenvError::TargetCollision { .. }));
+        let report =
+            link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+
+        let skipped = only_skipped(&report);
+        assert_eq!(skipped.skill, "research");
+        assert!(skipped.reason.contains("refusing to overwrite"));
         assert_eq!(
             fs::read_to_string(collision.join("README.md")).unwrap(),
             "manual content"
         );
+        Ok(())
+    }
+
+    /// Only a skill's own definition may downgrade to a skip. I/O failures are
+    /// systemic — they hit every skill — so they must still abort the run rather
+    /// than be reported once per skill alongside a success exit code.
+    #[test]
+    fn only_skill_local_errors_are_skippable() {
+        let path = PathBuf::from("/tmp/skill/SKILL.md");
+        assert!(
+            SkillenvError::InvalidMetadataField { path: path.clone() }.is_skill_local(),
+            "malformed metadata is one skill's problem"
+        );
+        assert!(
+            SkillenvError::TargetCollision { path: path.clone() }.is_skill_local(),
+            "an occupied target is one skill's problem"
+        );
+        assert!(
+            !SkillenvError::WriteFile {
+                path: path.clone(),
+                source: io::Error::other("disk full"),
+            }
+            .is_skill_local(),
+            "a write failure is systemic and must stay fatal"
+        );
+        assert!(
+            !SkillenvError::CreateDir {
+                path: path.clone(),
+                source: io::Error::other("read-only filesystem"),
+            }
+            .is_skill_local(),
+            "a directory failure is systemic and must stay fatal"
+        );
+        assert!(
+            !SkillenvError::ReadFile {
+                path,
+                source: io::Error::other("permission denied"),
+            }
+            .is_skill_local(),
+            "a read failure is systemic and must stay fatal"
+        );
+    }
+
+    /// A failed render must not leave a partial directory behind. Such a
+    /// directory has assets but no marker file, so every later run would report
+    /// it as an unmanaged target and refuse to link the skill ever again.
+    #[test]
+    fn failed_render_leaves_no_residue_and_self_heals_after_fix() -> Result<()> {
+        let repo = repo_fixture()?;
+        let repo_slug = test_repo_slug(repo.path());
+        let config_path = write_config(repo.path(), "")?;
+        // Unquoted `: ` in a scalar makes the frontmatter invalid YAML.
+        let broken = r#"---
+name: research
+description: Agent Skill: research helper
+---
+
+Body text
+"#;
+        let source_dir = write_skill(repo.path(), "skillenv/default/research", Some(broken), "")?;
+        // An asset guarantees the copy step succeeds before the render fails.
+        ensure_dir(&source_dir.join("assets"))?;
+        fs::write(source_dir.join("assets/template.md"), "asset body").unwrap();
+        init_test_repo(repo.path(), &config_path)?;
+
+        let target_dir = repo.path().join(".agents/skills");
+        let generated = target_dir.join(format!("skillenv-{repo_slug}-default-research"));
+
+        let report =
+            link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+        assert!(!only_skipped(&report).reason.is_empty());
+        assert!(
+            !generated.exists(),
+            "a failed render must not leave a partial skill directory"
+        );
+        assert_eq!(
+            staging_entries(&target_dir),
+            Vec::<String>::new(),
+            "staging directories must be cleaned up on failure"
+        );
+
+        // Repairing the source must be enough; no manual cleanup required.
+        fs::write(
+            source_dir.join("SKILL.md"),
+            r#"---
+name: research
+description: "Agent Skill: research helper"
+---
+
+Body text
+"#,
+        )
+        .unwrap();
+
+        let report =
+            link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+        for target in &report.target_reports {
+            assert_eq!(target.linked, 1, "expected the fixed skill to link");
+            assert!(target.skipped.is_empty(), "expected no skips in {target:?}");
+        }
+        assert!(generated.join("SKILL.md").is_file());
+        assert!(generated.join(GENERATED_MARKER_FILE).is_file());
+        assert!(generated.join("assets/template.md").is_file());
+        assert_eq!(staging_entries(&target_dir), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// One unlinkable skill must not strand the others. `skillenv link` also runs
+    /// unattended from the shell hook, where an abort silently freezes the setup.
+    #[test]
+    fn broken_skill_does_not_block_other_skills() -> Result<()> {
+        let repo = repo_fixture()?;
+        let repo_slug = test_repo_slug(repo.path());
+        let config_path = write_config(repo.path(), "")?;
+        // Scope sources follow `read_dir` order, which is not sorted, so which
+        // healthy skill the failure lands between is unspecified. Both must link
+        // regardless.
+        write_skill(repo.path(), "skillenv/default/alpha", None, "alpha body")?;
+        write_skill(
+            repo.path(),
+            "skillenv/default/broken",
+            Some(
+                r#"---
+name: broken
+description: Agent Skill: broken
+---
+
+Body text
+"#,
+            ),
+            "",
+        )?;
+        write_skill(repo.path(), "skillenv/default/zeta", None, "zeta body")?;
+        init_test_repo(repo.path(), &config_path)?;
+
+        let report =
+            link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
+
+        for target in &report.target_reports {
+            assert_eq!(
+                target.linked, 2,
+                "expected both healthy skills in {target:?}"
+            );
+            assert_eq!(target.skipped.len(), 1);
+            assert_eq!(target.skipped[0].skill, "broken");
+            let target_dir = target.path.as_ref().unwrap();
+            assert!(
+                target_dir
+                    .join(format!("skillenv-{repo_slug}-default-alpha/SKILL.md"))
+                    .is_file()
+            );
+            assert!(
+                target_dir
+                    .join(format!("skillenv-{repo_slug}-default-zeta/SKILL.md"))
+                    .is_file()
+            );
+            assert!(
+                !target_dir
+                    .join(format!("skillenv-{repo_slug}-default-broken"))
+                    .exists()
+            );
+        }
+
+        // Warnings must be available separately from the stdout summary, because
+        // `--quiet` (what the shell hook runs) suppresses the summary entirely.
+        let warnings = format_link_warnings(&report);
+        assert!(
+            warnings.contains("warning: skipped broken (default)"),
+            "unexpected warnings: {warnings}"
+        );
+        assert!(
+            warnings.contains(&format!("skillenv-{repo_slug}-default-broken")),
+            "warning should name the target directory: {warnings}"
+        );
+        assert!(!format_link_report(&report, "linked").contains("warning"));
         Ok(())
     }
 
@@ -5444,6 +5814,53 @@ path = "../shared/{repo}"
             source,
         })?;
         Ok(path)
+    }
+
+    /// Assert every target skipped exactly one skill, and return that skip.
+    ///
+    /// Also asserts nothing was linked, since these fixtures define a single
+    /// skill and skipping it must leave the target empty.
+    fn only_skipped(report: &Report) -> SkippedSkill {
+        assert!(
+            !report.target_reports.is_empty(),
+            "expected at least one target report"
+        );
+        let mut found: Option<SkippedSkill> = None;
+        for target in &report.target_reports {
+            assert_eq!(target.linked, 0, "expected nothing linked in {target:?}");
+            assert_eq!(
+                target.skipped.len(),
+                1,
+                "expected exactly one skip in {target:?}"
+            );
+            let skipped = target.skipped[0].clone();
+            if let Some(previous) = &found {
+                assert_eq!(
+                    previous.skill, skipped.skill,
+                    "targets disagreed on which skill was skipped"
+                );
+                assert_eq!(
+                    previous.reason, skipped.reason,
+                    "targets disagreed on the skip reason"
+                );
+            }
+            found = Some(skipped);
+        }
+        found.expect("expected a skipped skill")
+    }
+
+    /// Names of any leftover staging directories in a target directory.
+    fn staging_entries(target_dir: &Path) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(target_dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(STAGING_PREFIX))
+            .collect();
+        names.sort();
+        names
     }
 
     fn write_skill(
