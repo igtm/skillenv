@@ -10,24 +10,16 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use serde_yaml::Value;
 use walkdir::WalkDir;
 
 use crate::{
-    Config, DEFAULT_SCOPE_DIR, GENERATED_MARKER_FILE, GeneratedMarker, LOCAL_SCOPE_DIR,
-    PROFILES_SCOPE_DIR, REPO_LAYOUT_DIR, Result, SkillDiscoveryState, SkillInventoryEntry,
+    GENERATED_MARKER_FILE, GeneratedMarker, Result, SkillDiscoveryState, SkillInventoryEntry,
     SkillInventoryMode, SkillInventoryOptions, SkillInventoryReport, SkillInventoryStatus,
-    SkillInventoryTool, SkillenvError, all_source_roots, detect_repo_root, load_config,
-    normalize_path, parse_frontmatter, repo_slug, slugify_or,
+    SkillInventoryTool, SkillenvError, detect_repo_root, normalize_path, parse_frontmatter,
 };
-
-#[derive(Debug, Clone)]
-struct InventorySourceRoot {
-    name: String,
-    root: PathBuf,
-}
 
 #[derive(Debug, Clone)]
 struct InventoryRoot {
@@ -150,12 +142,14 @@ pub fn format_skill_inventory_report(report: &SkillInventoryReport) -> String {
     lines.join("\n")
 }
 
-pub(crate) fn skill_inventory_with_config(
+/// Report what each requested tool can see from `cwd`.
+///
+/// Takes no configuration. Inventory used to load it in order to resolve source
+/// roots for origin inference, and origin now comes from the marker instead.
+pub(crate) fn take_inventory(
     cwd: &Path,
     options: &SkillInventoryOptions,
-    config_override: Option<&Path>,
 ) -> Result<SkillInventoryReport> {
-    let loaded = load_config(config_override)?;
     let repo_root = detect_repo_root(cwd);
     let cwd_path = resolve_cwd_path(cwd);
     let tools = normalized_inventory_tools(&options.tools);
@@ -167,12 +161,6 @@ pub(crate) fn skill_inventory_with_config(
 
     let mut notes = Vec::new();
     let mut warnings = Vec::new();
-    let source_roots = inventory_source_roots(
-        repo_root.as_deref(),
-        &loaded.config,
-        loaded.base_dir.as_deref(),
-    )?;
-
     let mut entries = Vec::new();
     for tool in &tools {
         notes.extend(tool_inventory_notes(
@@ -190,7 +178,6 @@ pub(crate) fn skill_inventory_with_config(
         let mut tool_entries = collect_inventory_entries(
             *tool,
             current_roots.into_iter().chain(repo_tree_roots).collect(),
-            &source_roots,
             &mut warnings,
         )?;
         annotate_tool_conflicts(*tool, &mut tool_entries, &mut warnings);
@@ -633,34 +620,9 @@ fn sort_dedup_paths(paths: &mut Vec<PathBuf>) {
     paths.dedup();
 }
 
-fn inventory_source_roots(
-    repo_root: Option<&Path>,
-    config: &Config,
-    config_base_dir: Option<&Path>,
-) -> Result<Vec<InventorySourceRoot>> {
-    let Some(repo_root) = repo_root else {
-        return Ok(Vec::new());
-    };
-    let repo_slug = repo_slug(repo_root);
-    let mut roots: Vec<_> = all_source_roots(repo_root, &repo_slug, config, config_base_dir)?
-        .into_iter()
-        .map(|(name, root)| InventorySourceRoot { name, root })
-        .collect();
-    roots.sort_by(|left, right| {
-        right
-            .root
-            .components()
-            .count()
-            .cmp(&left.root.components().count())
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(roots)
-}
-
 fn collect_inventory_entries(
     tool: SkillInventoryTool,
     roots: Vec<InventoryRoot>,
-    source_roots: &[InventorySourceRoot],
     warnings: &mut Vec<String>,
 ) -> Result<Vec<InventoryEntryCandidate>> {
     let mut entries = Vec::new();
@@ -687,8 +649,7 @@ fn collect_inventory_entries(
                 continue;
             }
 
-            let mut candidate =
-                inspect_inventory_skill(tool, &root, &path, source_roots, warnings)?;
+            let mut candidate = inspect_inventory_skill(tool, &root, &path, warnings)?;
             candidate.precedence = root.precedence;
             entries.push(candidate);
         }
@@ -700,7 +661,6 @@ fn inspect_inventory_skill(
     tool: SkillInventoryTool,
     root: &InventoryRoot,
     skill_dir: &Path,
-    source_roots: &[InventorySourceRoot],
     warnings: &mut Vec<String>,
 ) -> Result<InventoryEntryCandidate> {
     let skill_md_path = skill_dir.join("SKILL.md");
@@ -714,7 +674,7 @@ fn inspect_inventory_skill(
         push_inventory_status(&mut status, SkillInventoryStatus::Invalid);
     }
 
-    let managed_source = detect_skillenv_managed_source(skill_dir, source_roots)?;
+    let managed_source = detect_skillenv_managed_source(skill_dir)?;
     let (skillenv_managed, skillenv_origin) = match managed_source {
         Some(origin) => (true, origin),
         None => (false, "manual".to_string()),
@@ -827,18 +787,22 @@ fn resolve_inventory_skill_metadata(
     })
 }
 
-fn detect_skillenv_managed_source(
-    skill_dir: &Path,
-    source_roots: &[InventorySourceRoot],
-) -> Result<Option<String>> {
+/// Who deployed this directory, as far as it will say.
+///
+/// The marker is the answer. v0 instead inferred an origin by matching the marker's
+/// recorded source path against the scope directories it expected to find
+/// (`skillenv/default`, `skillenv/local`, `skillenv/profiles/<name>`), which meant
+/// the answer went wrong the moment those directories moved — and made this module
+/// depend on the whole v0 layout. A v1 marker names its manifest outright.
+///
+/// A symlinked entry has no marker, so the link target is reported instead. That is
+/// all that can honestly be said about it.
+fn detect_skillenv_managed_source(skill_dir: &Path) -> Result<Option<String>> {
     match rendered_marker_origin(skill_dir) {
-        // v1 says which manifest owns it directly, so no path inference is needed.
-        Some(MarkerOrigin::Manifest(manifest)) => {
-            return Ok(Some(format!("manifest:{manifest}")));
-        }
-        Some(MarkerOrigin::SourcePath(path)) => {
-            return Ok(resolve_skillenv_origin(Path::new(&path), source_roots));
-        }
+        Some(MarkerOrigin::Manifest(manifest)) => return Ok(Some(format!("manifest:{manifest}"))),
+        // A v0 deployment: the path is stale by definition after a migration, so it
+        // is reported as-is rather than resolved against roots that may be gone.
+        Some(MarkerOrigin::SourcePath(path)) => return Ok(Some(format!("legacy:{path}"))),
         None => {}
     }
 
@@ -857,7 +821,7 @@ fn detect_skillenv_managed_source(
             let base = skill_dir.parent().unwrap_or_else(|| Path::new("."));
             normalize_path(&base.join(target))
         };
-        return Ok(resolve_skillenv_origin(&resolved, source_roots));
+        return Ok(Some(format!("symlink:{}", resolved.display())));
     }
 
     Ok(None)
@@ -890,87 +854,6 @@ fn rendered_marker_origin(skill_dir: &Path) -> Option<MarkerOrigin> {
     }
     if let Ok(marker) = serde_json::from_value::<GeneratedMarker>(value) {
         return Some(MarkerOrigin::SourcePath(marker.source));
-    }
-    None
-}
-
-fn resolve_skillenv_origin(
-    source_path: &Path,
-    source_roots: &[InventorySourceRoot],
-) -> Option<String> {
-    let normalized = normalize_path(source_path);
-    for source_root in source_roots {
-        let root = normalize_path(&source_root.root);
-        if !normalized.starts_with(&root) {
-            continue;
-        }
-        if let Some(origin) = origin_from_source_root(&source_root.name, &root, &normalized) {
-            return Some(origin);
-        }
-    }
-    infer_skillenv_origin_from_path(&normalized)
-}
-
-fn origin_from_source_root(name: &str, root: &Path, source_path: &Path) -> Option<String> {
-    let relative = source_path.strip_prefix(root).ok()?;
-    if name == "repo" {
-        repo_origin_from_relative_path(relative)
-    } else if let Some(managed) = name.strip_prefix("managed:") {
-        Some(format!("managed:{managed}"))
-    } else {
-        Some(format!("external:{}", slugify_or(name, "source")))
-    }
-}
-
-fn repo_origin_from_relative_path(relative: &Path) -> Option<String> {
-    let mut components = relative.components();
-    match components.next()? {
-        Component::Normal(part) if part == OsStr::new(DEFAULT_SCOPE_DIR) => {
-            Some("repo:default".to_string())
-        }
-        Component::Normal(part) if part == OsStr::new(LOCAL_SCOPE_DIR) => {
-            Some("repo:local".to_string())
-        }
-        Component::Normal(part) if part == OsStr::new(PROFILES_SCOPE_DIR) => {
-            let profile = components
-                .next()
-                .and_then(|component| match component {
-                    Component::Normal(name) => name.to_str(),
-                    _ => None,
-                })
-                .map(|name| slugify_or(name, "profile"))?;
-            Some(format!("repo:profile:{profile}"))
-        }
-        _ => None,
-    }
-}
-
-fn infer_skillenv_origin_from_path(path: &Path) -> Option<String> {
-    let components: Vec<String> = path
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => part.to_str().map(str::to_string),
-            _ => None,
-        })
-        .collect();
-
-    for (index, component) in components.iter().enumerate() {
-        if component != REPO_LAYOUT_DIR {
-            continue;
-        }
-        match components.get(index + 1).map(String::as_str) {
-            Some(DEFAULT_SCOPE_DIR) => return Some("repo:default".to_string()),
-            Some(LOCAL_SCOPE_DIR) => return Some("repo:local".to_string()),
-            Some(PROFILES_SCOPE_DIR) => {
-                let profile = components.get(index + 2)?;
-                return Some(format!("repo:profile:{}", slugify_or(profile, "profile")));
-            }
-            Some("remote") => {
-                let managed_name = components.get(index + 2)?;
-                return Some(format!("managed:{}", slugify_or(managed_name, "source")));
-            }
-            _ => {}
-        }
     }
     None
 }

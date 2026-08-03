@@ -261,7 +261,7 @@ pub fn remove_legacy(report: &SweepReport) -> Result<usize> {
 pub fn scan_skill_text(text: &str) -> Vec<Finding> {
     safeguard::scan_text(text)
 }
-use inventory::skill_inventory_with_config;
+use inventory::take_inventory;
 use paths::{
     create_symlink, ensure_dir, ensure_layout_dir, ensure_unmanaged_target_absent,
     marker_source_matches_known_root, normalize_path, repo_slug, short_path_digest, slugify_or,
@@ -924,7 +924,7 @@ pub fn skill_inventory(
     cwd: impl AsRef<Path>,
     options: SkillInventoryOptions,
 ) -> Result<SkillInventoryReport> {
-    skill_inventory_with_config(cwd.as_ref(), &options, None)
+    take_inventory(cwd.as_ref(), &options)
 }
 
 pub fn doctor(cwd: impl AsRef<Path>, options: DoctorOptions) -> Result<DoctorReport> {
@@ -3507,7 +3507,6 @@ claude = true
     #[test]
     fn skill_inventory_lists_repo_local_tool_directories() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         write_skill(
@@ -3535,7 +3534,7 @@ description: repo claude
             "repo claude",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![
@@ -3546,7 +3545,6 @@ description: repo claude
                 ],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
 
         assert!(report.entries.iter().any(|entry| {
@@ -3575,7 +3573,6 @@ description: repo claude
     #[test]
     fn skill_inventory_lists_user_and_global_roots() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         write_skill(
@@ -3623,7 +3620,7 @@ name: gravity
             "gravity",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![
@@ -3634,7 +3631,6 @@ name: gravity
                 ],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
 
         assert!(report.entries.iter().any(|entry| {
@@ -3688,13 +3684,12 @@ description: rendered
 
         let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::RepoLocal)
             .generated_name(&ScopeKey::Default, "research");
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
         let entry = report
             .entries
@@ -3702,7 +3697,16 @@ description: rendered
             .find(|entry| entry.tool == SkillInventoryTool::Codex && entry.name == generated_name)
             .unwrap();
         assert!(entry.skillenv_managed);
-        assert_eq!(entry.skillenv_origin, "repo:default");
+        // A v0 marker records where it was rendered from; that path is reported
+        // as-is rather than being matched back against the scope directories it
+        // used to live under. Inferring "repo:default" required inventory to know
+        // the whole v0 layout, and went wrong the moment those directories moved.
+        assert!(
+            entry.skillenv_origin.starts_with("legacy:"),
+            "unexpected origin: {}",
+            entry.skillenv_origin
+        );
+        assert!(entry.skillenv_origin.contains("skillenv/default/research"));
         Ok(())
     }
 
@@ -3729,13 +3733,12 @@ strategy = "symlink"
 
         let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::RepoLocal)
             .generated_name(&ScopeKey::Default, "research");
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
         let entry = report
             .entries
@@ -3743,14 +3746,20 @@ strategy = "symlink"
             .find(|entry| entry.tool == SkillInventoryTool::Codex && entry.name == generated_name)
             .unwrap();
         assert!(entry.skillenv_managed);
-        assert_eq!(entry.skillenv_origin, "repo:default");
+        // A symlinked entry has no marker, so the link target is all that can
+        // honestly be reported about it.
+        assert!(
+            entry.skillenv_origin.starts_with("symlink:"),
+            "unexpected origin: {}",
+            entry.skillenv_origin
+        );
+        assert!(entry.skillenv_origin.contains("skillenv/default/research"));
         Ok(())
     }
 
     #[test]
     fn skill_inventory_marks_codex_duplicates_as_visible() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         let shared_skill = r#"---
@@ -3771,13 +3780,12 @@ description: duplicate
             "user shared",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
 
         let duplicate_entries: Vec<_> = report
@@ -3803,7 +3811,6 @@ description: duplicate
     #[test]
     fn skill_inventory_marks_shadowed_claude_project_skills() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         let shared_skill = r#"---
@@ -3824,13 +3831,12 @@ description: duplicate
             "user review",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Claude],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
 
         let project_entry = report
@@ -3869,7 +3875,6 @@ description: duplicate
     #[test]
     fn skill_inventory_reports_invalid_skills_without_panicking() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         write_skill(
@@ -3885,13 +3890,12 @@ name: [broken
         )?;
         ensure_dir(&repo.path().join(".agents/skills/missing-skill-md"))?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
 
         assert!(report.entries.iter().any(|entry| {
@@ -3919,7 +3923,6 @@ name: [broken
     #[test]
     fn skill_inventory_repo_tree_marks_nested_skill_dirs() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         write_skill(
@@ -3945,13 +3948,12 @@ name: nested-agent
             "nested agent",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Claude, SkillInventoryTool::Codex],
                 repo_tree: true,
             },
-            Some(&config_path),
         )?;
 
         assert!(report.entries.iter().any(|entry| {
@@ -3970,7 +3972,6 @@ name: nested-agent
     #[test]
     fn skill_inventory_repo_tree_marks_duplicates_outside_current_scope() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         let shared_skill = r#"---
@@ -3990,13 +3991,12 @@ name: shared
             "nested",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: true,
             },
-            Some(&config_path),
         )?;
 
         let duplicate_entries: Vec<_> = report
@@ -4022,7 +4022,6 @@ name: shared
     #[test]
     fn skill_inventory_repo_tree_discovers_symlinked_skill_roots() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         let shared_root = repo.path().join("skill-roots/shared-root");
@@ -4040,13 +4039,12 @@ name: symlinked-agent
         ensure_dir(&repo.path().join("apps/demo/.agents"))?;
         create_symlink(&shared_root, &repo.path().join("apps/demo/.agents/skills")).unwrap();
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: true,
             },
-            Some(&config_path),
         )?;
 
         assert!(report.entries.iter().any(|entry| {
@@ -4060,7 +4058,6 @@ name: symlinked-agent
     #[test]
     fn skill_inventory_outside_repo_still_lists_user_skills() -> Result<()> {
         let outside = Path::new("/");
-        let config_path = PathBuf::from("/tmp/skillenv-missing.toml");
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         write_skill(
@@ -4075,13 +4072,12 @@ name: user-only
             "user only",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             outside,
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
 
         assert!(report.repo_root.is_none());
@@ -4102,7 +4098,6 @@ name: user-only
     #[test]
     fn skill_inventory_report_serializes_stable_shape() -> Result<()> {
         let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
         write_skill(
@@ -4118,13 +4113,12 @@ description: repo agent
             "repo agent",
         )?;
 
-        let report = skill_inventory_with_config(
+        let report = take_inventory(
             repo.path(),
             &SkillInventoryOptions {
                 tools: vec![SkillInventoryTool::Codex],
                 repo_tree: false,
             },
-            Some(&config_path),
         )?;
         let json = serde_json::to_value(&report).unwrap();
 
