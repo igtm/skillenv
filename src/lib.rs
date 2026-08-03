@@ -20,6 +20,7 @@ mod provider;
 mod remote;
 mod render;
 mod safeguard;
+mod source;
 
 pub use inventory::format_skill_inventory_report;
 pub use safeguard::{Finding, Severity};
@@ -428,6 +429,19 @@ pub enum SkillenvError {
     InvalidSkillId { input: String, reason: String },
     #[error("unknown provider '{name}'; known providers are {known}")]
     UnknownProvider { name: String, known: String },
+    #[error("{program} did not finish within {seconds}s and was stopped")]
+    CommandTimedOut { program: String, seconds: u64 },
+    #[error("remote {transport} has no ref '{reference}'")]
+    UnknownRemoteRef {
+        transport: String,
+        reference: String,
+    },
+    #[error("no SKILL.md at {path}")]
+    MissingSkillFile { path: PathBuf },
+    #[error("refusing {path}: it is {reason}")]
+    UnsafeSourceEntry { path: PathBuf, reason: String },
+    #[error("{path} exceeds the limit of {limit}")]
+    SourceTooLarge { path: PathBuf, limit: String },
     #[error(
         "skill id '{id}' is declared twice, by {first} and {second}; ids are unique across every source"
     )]

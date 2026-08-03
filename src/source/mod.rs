@@ -1,0 +1,505 @@
+//! Acquiring a skill's bytes, and refusing the ones we should not accept.
+//!
+//! v0 copied a fetched tree verbatim: no exclusions, no size limits, no symlink
+//! handling, no traversal check on the requested subdirectory. Whatever was in
+//! someone else's repository landed in the deploy path unexamined.
+//!
+//! The cache is keyed by resolved revision, so a fetch is idempotent and a
+//! revision already on disk is simply reused. That is what lets `fetch` restore a
+//! machine from the lock file alone, and what makes `diff` cheap.
+//!
+//! Nothing calls this yet — the CLI is the first consumer, and this allow goes
+//! away with it.
+#![allow(dead_code)]
+
+mod git;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use walkdir::WalkDir;
+
+use crate::lock::digest_tree;
+use crate::manifest::SourceSpec;
+use crate::paths::{ensure_dir, normalize_path};
+use crate::{Result, SkillenvError};
+
+/// Where fetched content lives, relative to the manifest root.
+pub(crate) const CACHE_DIR: &str = ".skillenv/cache";
+
+/// Names never copied out of a fetched tree.
+///
+/// `.git` because a shallow checkout carries one and it is not part of the skill;
+/// `.DS_Store` because macOS creates it wherever a user looks and it would
+/// otherwise perturb the content digest.
+const NEVER_COPIED: &[&str] = &[".git", ".DS_Store"];
+
+/// Caps on what a single skill may contain.
+///
+/// These exist so a hostile or accidentally-huge source cannot fill the disk or
+/// stall a shell hook. The numbers are far above any real skill: the largest one
+/// installed here is a few tens of kilobytes.
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_TREE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_FILE_COUNT: usize = 500;
+
+/// A skill's bytes, ready to be rendered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedSkill {
+    /// Directory holding `SKILL.md` and any assets.
+    pub dir: PathBuf,
+    /// Resolved commit for a git source; `None` for an unversioned local path.
+    pub revision: Option<String>,
+    pub content_digest: String,
+    /// Things accepted but worth reporting, e.g. an executable asset.
+    pub notes: Vec<String>,
+}
+
+/// Resolve the current revision of a source without fetching or writing.
+///
+/// Used by `outdated`, which must be able to answer "is this stale?" without
+/// touching the cache or the lock.
+pub fn peek_revision(spec: &SourceSpec, git_ref: Option<&str>) -> Result<Option<String>> {
+    match git::transport_for(spec) {
+        Some(transport) => git::remote_revision(&transport, git_ref).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Directory a revision of a source caches into.
+///
+/// Keyed by revision so two revisions coexist and a re-fetch of one already
+/// present is a no-op.
+pub fn cache_dir(manifest_root: &Path, source_name: &str, revision: &str) -> PathBuf {
+    manifest_root
+        .join(CACHE_DIR)
+        .join(sanitize_component(source_name))
+        .join(sanitize_component(revision))
+}
+
+/// Fetch a git-backed source into the cache and return where it landed.
+///
+/// `subdir` is validated before any git command runs.
+pub fn fetch_git(
+    manifest_root: &Path,
+    source_name: &str,
+    spec: &SourceSpec,
+    git_ref: Option<&str>,
+    subdir: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(subdir) = subdir {
+        git::validate_subdir(subdir)?;
+    }
+    let transport = git::transport_for(spec).ok_or_else(|| SkillenvError::InvalidSource {
+        input: format!("{spec:?}"),
+        message: "not a git-backed source".to_string(),
+    })?;
+
+    // Resolve first so the cache key is known before anything is written, which
+    // is what makes an already-cached revision free.
+    let revision = git::remote_revision(&transport, git_ref)?;
+    let destination = cache_dir(manifest_root, source_name, &revision);
+    if destination.join(".git").is_dir() {
+        return git::resolve_subdir(&destination, subdir);
+    }
+
+    ensure_dir(&destination)?;
+    let fetched = git::fetch_into(&transport, Some(&revision), &destination)?;
+    debug_assert_eq!(fetched, revision, "fetched revision should match ls-remote");
+    git::resolve_subdir(&destination, subdir)
+}
+
+/// Copy one skill directory out of a source tree, checking what it contains.
+///
+/// This is the boundary where someone else's repository becomes our deploy input,
+/// so it is where the checks belong.
+pub fn accept_skill(
+    source_dir: &Path,
+    destination: &Path,
+    revision: Option<String>,
+) -> Result<FetchedSkill> {
+    if !source_dir.join("SKILL.md").is_file() {
+        return Err(SkillenvError::MissingSkillFile {
+            path: source_dir.join("SKILL.md"),
+        });
+    }
+
+    let mut notes = Vec::new();
+    let mut total_bytes = 0u64;
+    let mut file_count = 0usize;
+
+    ensure_dir(destination)?;
+    // Not following symlinks: a link is inspected, never traversed, so a link to
+    // a directory cannot pull an unrelated tree into the copy.
+    for entry in WalkDir::new(source_dir)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry.map_err(|error| SkillenvError::ReadFile {
+            path: source_dir.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
+        let relative =
+            entry
+                .path()
+                .strip_prefix(source_dir)
+                .map_err(|error| SkillenvError::ReadFile {
+                    path: source_dir.to_path_buf(),
+                    source: std::io::Error::other(error),
+                })?;
+        if relative.as_os_str().is_empty() || is_excluded(relative) {
+            continue;
+        }
+
+        let metadata =
+            entry
+                .path()
+                .symlink_metadata()
+                .map_err(|source| SkillenvError::ReadFile {
+                    path: entry.path().to_path_buf(),
+                    source,
+                })?;
+
+        // A symlink inside a skill has no legitimate use and is the obvious way
+        // to smuggle a reference to /etc/passwd or out of the tree entirely.
+        if metadata.file_type().is_symlink() {
+            return Err(SkillenvError::UnsafeSourceEntry {
+                path: entry.path().to_path_buf(),
+                reason: "a symlink; skills must contain only regular files".to_string(),
+            });
+        }
+
+        let target = destination.join(relative);
+        if metadata.is_dir() {
+            ensure_dir(&target)?;
+            continue;
+        }
+
+        file_count += 1;
+        if file_count > MAX_FILE_COUNT {
+            return Err(SkillenvError::SourceTooLarge {
+                path: source_dir.to_path_buf(),
+                limit: format!("{MAX_FILE_COUNT} files"),
+            });
+        }
+        let size = metadata.len();
+        if size > MAX_FILE_BYTES {
+            return Err(SkillenvError::SourceTooLarge {
+                path: entry.path().to_path_buf(),
+                limit: format!("{MAX_FILE_BYTES} bytes per file"),
+            });
+        }
+        total_bytes += size;
+        if total_bytes > MAX_TREE_BYTES {
+            return Err(SkillenvError::SourceTooLarge {
+                path: source_dir.to_path_buf(),
+                limit: format!("{MAX_TREE_BYTES} bytes in total"),
+            });
+        }
+
+        if is_executable(&metadata) {
+            notes.push(format!(
+                "{} is executable; confirm that is intended",
+                relative.display()
+            ));
+        }
+
+        if let Some(parent) = target.parent() {
+            ensure_dir(parent)?;
+        }
+        fs::copy(entry.path(), &target).map_err(|source| SkillenvError::WriteFile {
+            path: target.clone(),
+            source,
+        })?;
+    }
+
+    Ok(FetchedSkill {
+        content_digest: digest_tree(destination)?,
+        dir: destination.to_path_buf(),
+        revision,
+        notes,
+    })
+}
+
+/// Locate a skill inside a fetched source tree.
+///
+/// Accepts the layouts that occur in practice: the tree is itself one skill, or
+/// it holds a `skills/` directory, or the skill sits directly at the top level.
+/// Unlike v0 this never assumes a `default/`, `local/`, and `profiles/` trio —
+/// v0's reader unconditionally read `default/` whenever any of the three existed,
+/// so a source holding only `local/` failed with a read error.
+pub fn locate_skill(root: &Path, id: &str) -> Option<PathBuf> {
+    let candidates = [
+        root.to_path_buf(),
+        root.join(id),
+        root.join("skills").join(id),
+        root.join(".agents").join("skills").join(id),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("SKILL.md").is_file())
+}
+
+fn is_excluded(relative: &Path) -> bool {
+    relative.components().any(|part| {
+        part.as_os_str()
+            .to_str()
+            .is_some_and(|name| NEVER_COPIED.contains(&name))
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+/// Make a string safe to use as one path component.
+///
+/// Source names and revisions reach us from a manifest and from git, so neither
+/// is trusted to be a well-behaved filename.
+fn sanitize_component(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // `.` and `..` would name the parent or self rather than a new directory.
+    let trimmed = cleaned.trim_matches('.');
+    if trimmed.is_empty() {
+        "unnamed".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Whether `path` stays inside `root` once both are normalized.
+///
+/// Used before writing, so a crafted relative path cannot place a file outside
+/// the cache.
+fn contains(root: &Path, path: &Path) -> bool {
+    normalize_path(path).starts_with(normalize_path(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(dir: &Path, relative: &str, body: &str) {
+        let path = dir.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    fn skill_dir() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "SKILL.md", "---\nname: x\n---\n\nBody\n");
+        write(dir.path(), "assets/template.md", "asset\n");
+        dir
+    }
+
+    #[test]
+    fn accepting_a_skill_copies_it_and_records_a_digest() -> Result<()> {
+        let source = skill_dir();
+        let target = TempDir::new().unwrap();
+        let accepted = accept_skill(
+            source.path(),
+            &target.path().join("out"),
+            Some("abc123".to_string()),
+        )?;
+
+        assert!(accepted.dir.join("SKILL.md").is_file());
+        assert!(accepted.dir.join("assets/template.md").is_file());
+        assert!(accepted.content_digest.starts_with("sha256:"));
+        assert_eq!(accepted.revision.as_deref(), Some("abc123"));
+        assert!(accepted.notes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_without_a_skill_file_is_refused_by_name() {
+        let dir = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let error = accept_skill(dir.path(), target.path(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SKILL.md"), "unexpected: {error}");
+    }
+
+    /// A `.git` directory is not part of the skill, and copying it would also
+    /// perturb the content digest.
+    #[test]
+    fn git_and_ds_store_are_not_copied() -> Result<()> {
+        let source = skill_dir();
+        write(source.path(), ".git/config", "[core]\n");
+        write(source.path(), ".DS_Store", "junk");
+        write(source.path(), "assets/.DS_Store", "junk");
+
+        let target = TempDir::new().unwrap();
+        let accepted = accept_skill(source.path(), &target.path().join("out"), None)?;
+        assert!(!accepted.dir.join(".git").exists());
+        assert!(!accepted.dir.join(".DS_Store").exists());
+        assert!(!accepted.dir.join("assets/.DS_Store").exists());
+        Ok(())
+    }
+
+    /// The obvious way to smuggle a reference out of the tree.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_a_skill_is_refused() {
+        let source = skill_dir();
+        std::os::unix::fs::symlink("/etc/passwd", source.path().join("secrets")).unwrap();
+
+        let target = TempDir::new().unwrap();
+        let error = accept_skill(source.path(), &target.path().join("out"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "unexpected: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_directory_is_refused_rather_than_followed() {
+        let source = skill_dir();
+        let elsewhere = TempDir::new().unwrap();
+        write(elsewhere.path(), "leaked.md", "secret\n");
+        std::os::unix::fs::symlink(elsewhere.path(), source.path().join("linked")).unwrap();
+
+        let target = TempDir::new().unwrap();
+        assert!(accept_skill(source.path(), &target.path().join("out"), None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_executable_asset_is_accepted_but_reported() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let source = skill_dir();
+        let script = source.path().join("run.sh");
+        fs::write(&script, "echo hi\n").unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let target = TempDir::new().unwrap();
+        let accepted = accept_skill(source.path(), &target.path().join("out"), None)?;
+        assert!(
+            accepted.notes.iter().any(|note| note.contains("run.sh")),
+            "expected a note about the executable: {:?}",
+            accepted.notes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_oversized_file_is_refused_and_the_error_names_the_limit() {
+        let source = skill_dir();
+        fs::write(
+            source.path().join("big.bin"),
+            vec![0u8; (MAX_FILE_BYTES + 1) as usize],
+        )
+        .unwrap();
+
+        let target = TempDir::new().unwrap();
+        let error = accept_skill(source.path(), &target.path().join("out"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("per file"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn too_many_files_is_refused() {
+        let source = skill_dir();
+        for index in 0..=MAX_FILE_COUNT {
+            write(source.path(), &format!("many/f{index}.md"), "x");
+        }
+        let target = TempDir::new().unwrap();
+        let error = accept_skill(source.path(), &target.path().join("out"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("files"), "unexpected: {error}");
+    }
+
+    #[test]
+    fn the_cache_path_is_keyed_by_revision() {
+        let root = Path::new("/work/dotfiles");
+        assert_eq!(
+            cache_dir(root, "igtm-skills", "abc123"),
+            root.join(".skillenv/cache/igtm-skills/abc123")
+        );
+    }
+
+    /// A source name or revision reaching us from a manifest or from git is not
+    /// trusted to be a usable filename.
+    #[test]
+    fn cache_components_are_sanitized() {
+        let root = Path::new("/work");
+        // The separator becomes a hyphen and the leading dots are stripped, so
+        // this can only ever name a child of the cache.
+        assert_eq!(
+            cache_dir(root, "../escape", "rev"),
+            root.join(".skillenv/cache/-escape/rev")
+        );
+        assert_eq!(
+            cache_dir(root, "..", "..").to_string_lossy(),
+            "/work/.skillenv/cache/unnamed/unnamed"
+        );
+        assert_eq!(
+            cache_dir(root, "a/b", "c:d"),
+            root.join(".skillenv/cache/a-b/c-d")
+        );
+    }
+
+    #[test]
+    fn locating_a_skill_accepts_the_layouts_that_occur_in_practice() {
+        // The tree is itself one skill, which is what a gist looks like.
+        let one = TempDir::new().unwrap();
+        write(one.path(), "SKILL.md", "body\n");
+        assert_eq!(
+            locate_skill(one.path(), "anything"),
+            Some(one.path().to_path_buf())
+        );
+
+        // A repository holding several under skills/.
+        let many = TempDir::new().unwrap();
+        write(many.path(), "skills/kinko/SKILL.md", "body\n");
+        assert_eq!(
+            locate_skill(many.path(), "kinko"),
+            Some(many.path().join("skills/kinko"))
+        );
+
+        // Or directly at the top level.
+        let flat = TempDir::new().unwrap();
+        write(flat.path(), "kinko/SKILL.md", "body\n");
+        assert_eq!(
+            locate_skill(flat.path(), "kinko"),
+            Some(flat.path().join("kinko"))
+        );
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(locate_skill(empty.path(), "kinko"), None);
+    }
+
+    #[test]
+    fn containment_is_judged_lexically() {
+        assert!(contains(Path::new("/a/b"), Path::new("/a/b/c")));
+        assert!(!contains(Path::new("/a/b"), Path::new("/a/c")));
+        assert!(!contains(Path::new("/a/b"), Path::new("/a/b/../c")));
+    }
+
+    #[test]
+    fn peeking_a_local_source_has_no_revision() -> Result<()> {
+        assert_eq!(peek_revision(&SourceSpec::Local, None)?, None);
+        Ok(())
+    }
+}
