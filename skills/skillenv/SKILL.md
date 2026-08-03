@@ -230,6 +230,7 @@ note: up took 9cb236b3c034 rather than f3aa484bf5fc: nothing newer is 7d old yet
 
 - **pin された revision には適用されません。** `fetch`（`--update` なし）は lock の revision を復元するので、そこで年齢を再判定すると「書いた時点では問題なかった lock からの復元」を拒否してしまいます
 - **該当する revision が無ければエラーです。** tip に黙って落とすと、設定が効いているように見えて何もしていない状態になります
+- **lock は後退しません。** すでに新しい revision を指している lock は維持され、`note:` で報告されます。これが無いと、設定を有効にした瞬間に案内 skill が 1.0 前の版に巻き戻ります
 - **`outdated` は日付を見ません。** `ls-remote` は sha しか返さないので、「tip は動いたが `fetch --update` はそれを取らないかもしれない」と明示します
 
 `path:` と `local` には revision が無いので対象外です。ローカルの git repo を history 込みで参照したい場合は `file://` で書けます。

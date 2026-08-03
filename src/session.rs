@@ -467,6 +467,9 @@ impl Session {
                 self.locked_revision_for_source(&source.name)
             };
 
+            // Before the fetch, because accepting its result rewrites this.
+            let locked_before = self.locked_revision_for_source(&source.name);
+
             let fetched = match crate::source::fetch_git(
                 &self.root,
                 &source.name,
@@ -483,6 +486,33 @@ impl Session {
                     continue;
                 }
             };
+
+            // An age limit says "nothing newer than this", not "go backwards". Taking the
+            // newest eligible revision unconditionally regresses a lock that already
+            // points at something newer — which is how enabling the setting would have
+            // replaced this repository's own guide skill with a pre-1.0 one describing
+            // commands that no longer exist. Checked before anything is accepted, since
+            // accepting writes the new revision into the lock and the comparison would
+            // then be against itself.
+            if cutoff.is_some()
+                && let Some(previous) = locked_before.filter(|rev| rev != &fetched.revision)
+                && let Some(taken) =
+                    crate::source::cached_commit_time(&self.root, &source.name, &fetched.revision)
+                && let Some(held) =
+                    crate::source::cached_commit_time(&self.root, &source.name, &previous)
+                && held > taken
+            {
+                report.kept.push((
+                    source.name.clone(),
+                    format!(
+                        "stayed on {}: the newest revision old enough is {}, which is \
+                         older than what the lock already has",
+                        &previous[..12.min(previous.len())],
+                        &fetched.revision[..12.min(fetched.revision.len())]
+                    ),
+                ));
+                continue;
+            }
 
             let wanted = match &source.skills {
                 Some(ids) => ids.clone(),
@@ -1119,6 +1149,8 @@ pub struct FetchReport {
     pub dropped: Vec<SkillId>,
     /// Sources where the age limit declined the tip, with what was taken instead.
     pub held_back: Vec<(String, String)>,
+    /// Sources left on their locked revision because the eligible one was older.
+    pub kept: Vec<(String, String)>,
     /// Sources whose revision was already cached, so nothing was downloaded.
     pub reused: Vec<String>,
     /// Skills the source no longer contains, named with the source.
@@ -1148,6 +1180,9 @@ impl FetchReport {
         // A note, not a warning: declining a too-new revision is the setting working,
         // not a problem. It still has to be said, or the run looks like a no-op.
         for (source, detail) in &self.held_back {
+            lines.push(format!("note: {source} {detail}"));
+        }
+        for (source, detail) in &self.kept {
             lines.push(format!("note: {source} {detail}"));
         }
         lines
@@ -1959,6 +1994,105 @@ mod tests {
     fn an_absurd_age_clamps_instead_of_wrapping() {
         let stamp = git_timestamp_before_now(std::time::Duration::from_secs(u64::MAX));
         assert_eq!(stamp, "1970-01-01T00:00:00Z");
+    }
+
+    /// An age limit means "nothing newer than this", not "go backwards". A lock already
+    /// pointing at something newer must stay — enabling the setting otherwise replaced
+    /// this repository's own guide skill with a pre-1.0 revision describing commands
+    /// that no longer exist.
+    #[test]
+    fn an_age_limit_does_not_regress_a_newer_lock() -> Result<()> {
+        let upstream = TempDir::new().unwrap();
+        let path = upstream.path().to_string_lossy().to_string();
+        let dir = upstream.path().join("skills/kinko");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Two commits: one old enough for the limit, one from today.
+        let mut revisions = Vec::new();
+        for (days, body) in [(30u64, "old"), (0, "new")] {
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("{}\n{body}\n", valid("kinko")),
+            )
+            .unwrap();
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - days * 86_400;
+            let stamp = std::ffi::OsString::from(format!("{seconds} +0000"));
+            let _env = crate::test_support::set_env_for_test(&[
+                ("GIT_AUTHOR_DATE", Some(stamp.clone())),
+                ("GIT_COMMITTER_DATE", Some(stamp)),
+            ]);
+            if revisions.is_empty() {
+                crate::source::run_git_for_test(&[
+                    "init",
+                    "--quiet",
+                    "--initial-branch",
+                    "main",
+                    &path,
+                ])?;
+            }
+            crate::source::run_git_for_test(&["-C", &path, "add", "-A"])?;
+            crate::source::run_git_for_test(&[
+                "-C",
+                &path,
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--quiet",
+                "-m",
+                body,
+            ])?;
+            revisions.push(
+                crate::source::run_git_for_test(&["-C", &path, "rev-parse", "HEAD"])?
+                    .trim()
+                    .to_string(),
+            );
+        }
+        let (old, newest) = (revisions[0].clone(), revisions[1].clone());
+
+        let root = workspace(
+            &format!(
+                "[[source]]\nname = \"up\"\nfrom = \"file://{path}\"\nref = \"main\"\n\
+                 skills = [\"kinko\"]\n"
+            ),
+            &[],
+        );
+        let home = TempDir::new().unwrap();
+
+        // Without a limit the lock lands on today's commit.
+        let mut session = open_session(root.path(), home.path())?;
+        session.fetch(true)?;
+        assert_eq!(
+            session.locked_revision_for_source("up").as_deref(),
+            Some(newest.as_str())
+        );
+
+        // Turning the limit on must not walk it back to the old commit.
+        let manifest = root.path().join(MANIFEST_FILE);
+        let with_limit = format!(
+            "{}\n[fetch]\nminimum_revision_age = \"7d\"\n",
+            fs::read_to_string(&manifest).unwrap()
+        );
+        fs::write(&manifest, with_limit).unwrap();
+
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.fetch(true)?;
+        assert_eq!(
+            session.locked_revision_for_source("up").as_deref(),
+            Some(newest.as_str()),
+            "the lock regressed to {old}"
+        );
+        assert!(
+            report.kept.iter().any(|(name, _)| name == "up"),
+            "staying put has to be reported: {:?}",
+            report.kept
+        );
+        Ok(())
     }
 
     /// A `fetch` that downloads nothing must not discard the recorded scan. Clearing it

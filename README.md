@@ -447,6 +447,10 @@ Judged on committer date. Three things worth knowing:
   was fine when it was written.
 - **No eligible revision is an error.** Falling back to the tip would make the setting
   look effective while doing nothing.
+- **The lock never goes backwards.** "Nothing newer than this" is not "go backwards": a
+  lock already pointing at something newer stays, and says so. Without that, switching
+  the setting on rolled this repository's own guide skill back to a pre-1.0 revision
+  describing commands that no longer exist.
 - **`outdated` cannot see dates.** `ls-remote` returns a sha and nothing else, so it
   reports that the tip moved and notes that `fetch --update` may not take it.
 
