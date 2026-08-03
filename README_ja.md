@@ -18,7 +18,7 @@
 - リポジトリ移動時に relink する shell hook
 - 同じ操作を呼び出せる Rust ライブラリ
 
-現在のバージョンは `1.0.0` です。
+現在のバージョンは `1.1.0` です。
 
 ## 1.0 は破壊的リリースです
 
@@ -50,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 バージョンを指定する場合:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v1.0.0
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v1.1.0
 ```
 
 Cargo で GitHub からインストールする場合:
@@ -232,6 +232,30 @@ manifest が宣言する skill 数と deploy ルール数に対する lock の�
 
 ## skillenv.toml
 
+### 短い書き方
+
+source に skill のリストを渡すだけなら、`[skills]` が 1 行ずつで済みます。キーが
+source、値がそこから取る skill です。
+
+```toml
+[skills]
+local = ["draft-pr", "japanese-tech-writing"]
+"github:igtm/skills" = ["visual-explainer", "user-context"]
+"gist:fd287c31" = ["jp-writing"]
+"github:igtm/kinko" = ["*"]        # その source が持つ全 skill
+```
+
+source の**名前はキーから導出されます**（repository 名または gist id）。この表には名前を
+書く場所がないためです。導出された名前は `via=` の表示と cache ディレクトリ名になるので、
+既存の lock と揃うか確認してください。`https://github.com/openclaw/agent-skills` は
+`agent-skills` になります。名前を固定したい、`ref` や label が必要、といった source は
+従来の `[[source]]` で書き、1 つの manifest で両方を混ぜられます。
+
+`local` に `["*"]` は書けません。列挙する対象のツリーが無く、`skills/` に置いてあるもの
+全部という意味になってしまうためです。ディレクトリに追従したい場合は `path:` を使います。
+
+### 詳しい書き方
+
 ```toml
 [skillenv]
 version = 1
@@ -386,6 +410,37 @@ skill の label と id の両方に一致するので、1 つの skill を指す
 id が既に使われている wildcard メンバーは、致命的にせず報告して skip します。2 つの
 上流が同じ名前を採用するのは利用者の落ち度ではありませんし、ここで manifest を
 読み込めなくすると、直す手段である `remove` まで道連れになります。
+
+## 新しすぎる revision を取らない
+
+`uv` のリリース経過時間の設定と同じ考え方です。上流が乗っ取られても数時間から数日で
+気づかれるのが普通なので、公開から agent の文脈に入るまでに待ち時間を挟みます。
+
+```toml
+[fetch]
+minimum_revision_age = "7d"   # s / m / h / d / w
+```
+
+`fetch --update` は tip ではなく、その時間以上経過した最新の revision を取ります。
+判断が変わったときは黙らず報告します。
+
+```
+note: up took 9cb236b3c034 rather than f3aa484bf5fc: nothing newer is 7d old yet
+```
+
+判定は committer 日付です。押さえておく点が 3 つあります。
+
+- **pin された revision は対象外です。** `--update` なしの `fetch` は lock の revision を
+  復元するので、そこで年齢を再判定すると、書いた時点では問題なかった lock からの復元を
+  拒否してしまいます
+- **該当する revision が無ければエラーです。** tip に落とすと、設定が効いているように
+  見えて何もしていない状態になります
+- **`outdated` は日付を見られません。** `ls-remote` は sha しか返さないので、tip が動いた
+  ことを報告した上で、`fetch --update` がそれを取らない可能性を明示します
+
+`local` と `path:` には revision が無いので適用されません。同じマシンにある repository で
+これを使いたい場合は、ツリーとして読むのではなく git remote として扱われるよう
+`file://` で書いてください。
 
 ## safeguard
 

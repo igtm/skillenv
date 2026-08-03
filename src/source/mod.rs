@@ -148,6 +148,9 @@ pub fn fetch_git(
     git_ref: Option<&str>,
     subdir: Option<&Path>,
     pin: Option<&str>,
+    // Refuse anything newer than this git-readable timestamp, taking the newest
+    // revision at or before it. `None` takes whatever the ref points at.
+    not_after: Option<&str>,
 ) -> Result<FetchedSource> {
     if let Some(subdir) = subdir {
         git::validate_subdir(subdir)?;
@@ -156,6 +159,20 @@ pub fn fetch_git(
         input: format!("{spec:?}"),
         message: "not a git-backed source".to_string(),
     })?;
+
+    // With an age limit and no pin, which revision we end up on is only knowable
+    // after fetching history — so the cache cannot be keyed on it in advance. Resolve
+    // beside the cache and move the result in once the answer is known.
+    if let (None, Some(cutoff)) = (pin, not_after) {
+        return fetch_aged(
+            manifest_root,
+            source_name,
+            &transport,
+            git_ref,
+            subdir,
+            cutoff,
+        );
+    }
 
     // The revision is settled before anything is written, so the cache key is
     // known up front and an already-present revision costs nothing.
@@ -173,10 +190,59 @@ pub fn fetch_git(
     }
 
     ensure_dir(&destination)?;
-    let fetched = git::fetch_into(&transport, Some(&revision), &destination)?;
+    // A pinned revision is fetched by sha, so the age limit does not apply: the lock
+    // already names the revision, and re-checking its age would refuse to restore a
+    // machine from a lock that was fine when it was written.
+    let fetched = git::fetch_into(&transport, Some(&revision), &destination, None)?;
     Ok(FetchedSource {
         root: git::resolve_subdir(&destination, subdir)?,
         revision: fetched,
+        reused: false,
+    })
+}
+
+/// Fetch the newest revision at least as old as `cutoff`.
+///
+/// Resolved in a scratch directory inside the cache root — same filesystem, so the
+/// move into place is a rename rather than a copy — because the revision that names
+/// the cache entry is the answer, not the question.
+fn fetch_aged(
+    manifest_root: &Path,
+    source_name: &str,
+    transport: &str,
+    git_ref: Option<&str>,
+    subdir: Option<&Path>,
+    cutoff: &str,
+) -> Result<FetchedSource> {
+    let root = cache_root(manifest_root);
+    ensure_dir(&root)?;
+    let scratch = tempfile::TempDir::new_in(&root).map_err(|source| SkillenvError::WriteFile {
+        path: root.clone(),
+        source,
+    })?;
+    let work = scratch.path().join("resolving");
+
+    let revision = git::fetch_into(transport, git_ref, &work, Some(cutoff))?;
+    let destination = cache_dir(manifest_root, source_name, &revision);
+    if destination.join(".git").is_dir() {
+        // Already have it. The scratch copy goes away with the guard.
+        return Ok(FetchedSource {
+            root: git::resolve_subdir(&destination, subdir)?,
+            revision,
+            reused: true,
+        });
+    }
+
+    if let Some(parent) = destination.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::rename(&work, &destination).map_err(|source| SkillenvError::WriteFile {
+        path: destination.clone(),
+        source,
+    })?;
+    Ok(FetchedSource {
+        root: git::resolve_subdir(&destination, subdir)?,
+        revision,
         reused: false,
     })
 }
@@ -376,6 +442,178 @@ fn contains(root: &Path, path: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Build a repository whose commits sit at known ages, so an age limit has
+    /// something unambiguous to choose between.
+    fn dated_repo(ages_in_days: &[u64]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        git::run(
+            &["init", "--quiet", "--initial-branch", "main", &path],
+            None,
+        )
+        .unwrap();
+        for days in ages_in_days {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - days * 86_400;
+            fs::write(dir.path().join("SKILL.md"), format!("body at {days}\n")).unwrap();
+            git::run(&["-C", &path, "add", "-A"], None).unwrap();
+            // The date has to be set for both author and committer: `--before` reads
+            // the committer date, and leaving it as "now" would make every commit new.
+            let stamp = std::ffi::OsString::from(format!("{seconds} +0000"));
+            // Held only for this one commit. `rev-list --before` reads the *committer*
+            // date, and the environment is the only way to set it — so without the
+            // guard, concurrent tests read each other's timestamp and a repository
+            // built to be old came out new.
+            let _env = crate::test_support::set_env_for_test(&[
+                ("GIT_AUTHOR_DATE", Some(stamp.clone())),
+                ("GIT_COMMITTER_DATE", Some(stamp)),
+            ]);
+            git::run(
+                &[
+                    "-C",
+                    &path,
+                    "-c",
+                    "user.email=t@example.com",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    &format!("{days} days old"),
+                ],
+                None,
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn cutoff_days_ago(days: u64) -> String {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - days * 86_400;
+        crate::session::format_epoch_utc_for_test(seconds)
+    }
+
+    /// The whole point of the age limit: the tip is skipped and the newest revision
+    /// that is old enough is taken instead.
+    #[test]
+    fn an_age_limit_takes_the_newest_revision_old_enough() -> Result<()> {
+        let upstream = dated_repo(&[30, 20, 10, 2, 0]);
+        let cache = TempDir::new().unwrap();
+        let transport = upstream.path().to_string_lossy().to_string();
+
+        // Ten days old is the newest at least seven days old.
+        let expected = git::run(
+            &[
+                "-C",
+                &transport,
+                "rev-list",
+                "-1",
+                "--before",
+                &cutoff_days_ago(7),
+                "main",
+            ],
+            None,
+        )?
+        .trim()
+        .to_string();
+        let tip = git::run(&["-C", &transport, "rev-parse", "main"], None)?
+            .trim()
+            .to_string();
+        assert_ne!(expected, tip, "the fixture must have a too-new tip");
+
+        let fetched = fetch_git(
+            cache.path(),
+            "up",
+            &SourceSpec::Git(transport.clone()),
+            Some("main"),
+            None,
+            None,
+            Some(&cutoff_days_ago(7)),
+        )?;
+        assert_eq!(fetched.revision, expected);
+        assert!(fetched.root.join("SKILL.md").is_file());
+        Ok(())
+    }
+
+    /// Without the limit, the tip is what you get — so the limit is doing the work
+    /// rather than some accident of the fixture.
+    #[test]
+    fn without_a_limit_the_tip_is_taken() -> Result<()> {
+        let upstream = dated_repo(&[30, 0]);
+        let cache = TempDir::new().unwrap();
+        let transport = upstream.path().to_string_lossy().to_string();
+        let tip = git::run(&["-C", &transport, "rev-parse", "main"], None)?
+            .trim()
+            .to_string();
+
+        let fetched = fetch_git(
+            cache.path(),
+            "up",
+            &SourceSpec::Git(transport),
+            Some("main"),
+            None,
+            None,
+            None,
+        )?;
+        assert_eq!(fetched.revision, tip);
+        Ok(())
+    }
+
+    /// A repository whose whole history is newer than the cutoff has no answer, and
+    /// says so rather than silently falling back to the tip — falling back would make
+    /// the setting look effective while doing nothing.
+    #[test]
+    fn a_repo_with_no_old_enough_revision_is_an_error() {
+        let upstream = dated_repo(&[1, 0]);
+        let cache = TempDir::new().unwrap();
+        let error = fetch_git(
+            cache.path(),
+            "up",
+            &SourceSpec::Git(upstream.path().to_string_lossy().to_string()),
+            Some("main"),
+            None,
+            None,
+            Some(&cutoff_days_ago(30)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SkillenvError::NoRevisionOldEnough { .. }),
+            "got: {error}"
+        );
+    }
+
+    /// A pinned revision is fetched by sha, so the limit must not apply: the lock
+    /// already named it, and re-judging its age would refuse to restore a machine
+    /// from a lock that was fine when it was written.
+    #[test]
+    fn a_pinned_revision_ignores_the_age_limit() -> Result<()> {
+        let upstream = dated_repo(&[30, 0]);
+        let cache = TempDir::new().unwrap();
+        let transport = upstream.path().to_string_lossy().to_string();
+        let tip = git::run(&["-C", &transport, "rev-parse", "main"], None)?
+            .trim()
+            .to_string();
+
+        let fetched = fetch_git(
+            cache.path(),
+            "up",
+            &SourceSpec::Git(transport),
+            Some("main"),
+            None,
+            Some(&tip),
+            Some(&cutoff_days_ago(7)),
+        )?;
+        assert_eq!(fetched.revision, tip, "the pin wins");
+        Ok(())
+    }
 
     fn write(dir: &Path, relative: &str, body: &str) {
         let path = dir.join(relative);

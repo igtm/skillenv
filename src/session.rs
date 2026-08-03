@@ -450,6 +450,16 @@ impl Session {
             ..Default::default()
         };
 
+        // Computed once for the whole run, so every source in it is judged against the
+        // same instant. Deriving it per source would let a long fetch make later
+        // sources answer to a later cutoff than earlier ones.
+        let cutoff = self
+            .manifest
+            .fetch
+            .minimum_revision_age
+            .map(git_timestamp_before_now);
+        let age_text = self.manifest.fetch.minimum_revision_age_text.clone();
+
         for source in self.remote_sources() {
             let pin = if update {
                 None
@@ -464,6 +474,7 @@ impl Session {
                 source.git_ref.as_deref(),
                 None,
                 pin.as_deref(),
+                cutoff.as_deref(),
             ) {
                 Ok(fetched) => fetched,
                 // One unreachable source must not withhold the others.
@@ -490,6 +501,27 @@ impl Session {
             if fetched.reused {
                 report.reused.push(source.name.clone());
             }
+            // Say when the age limit moved the answer. Without this a `fetch --update`
+            // that deliberately declined the tip is indistinguishable from one that
+            // found nothing new, and the setting looks like it is doing nothing.
+            if let Some(age) = &age_text
+                && !fetched.reused
+                && let Ok(tip) =
+                    crate::source::peek_revision(&source.spec, source.git_ref.as_deref())
+                && let Some(tip) = tip
+                && tip != fetched.revision
+            {
+                report.held_back.push((
+                    source.name.clone(),
+                    format!(
+                        "took {} rather than {}: nothing newer is {} old yet",
+                        &fetched.revision[..12.min(fetched.revision.len())],
+                        &tip[..12.min(tip.len())],
+                        age
+                    ),
+                ));
+            }
+
             // A wildcard source's membership *is* whatever the tree now holds, so a
             // member that is gone from it is gone, full stop. Kept, its lock entry
             // would be re-admitted to the catalog on every open while nothing ever
@@ -1074,6 +1106,8 @@ pub struct FetchReport {
     pub fetched: Vec<SkillId>,
     /// Lock entries forgotten because the manifest no longer declares them.
     pub dropped: Vec<SkillId>,
+    /// Sources where the age limit declined the tip, with what was taken instead.
+    pub held_back: Vec<(String, String)>,
     /// Sources whose revision was already cached, so nothing was downloaded.
     pub reused: Vec<String>,
     /// Skills the source no longer contains, named with the source.
@@ -1099,6 +1133,11 @@ impl FetchReport {
         }
         for (what, reason) in &self.failed {
             lines.push(format!("warning: {what} failed: {reason}"));
+        }
+        // A note, not a warning: declining a too-new revision is the setting working,
+        // not a problem. It still has to be said, or the run looks like a no-op.
+        for (source, detail) in &self.held_back {
+            lines.push(format!("note: {source} {detail}"));
         }
         lines
     }
@@ -1265,6 +1304,48 @@ fn admit_wildcard_members(catalog: &mut Catalog, lock: &LockFile, root: &Path) -
         }
     }
     conflicts
+}
+
+/// `age` ago, written the way git reads a date.
+///
+/// RFC 3339 in UTC, which git accepts for `--before`. Built from the epoch by hand
+/// rather than through a date library: this is the only place the crate needs a
+/// calendar, and pulling one in for one format string is not worth the dependency.
+fn git_timestamp_before_now(age: std::time::Duration) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    // Saturating so a limit longer than the epoch clamps to it rather than wrapping
+    // into the future, which would accept everything — the opposite of what was asked.
+    let seconds = now.as_secs().saturating_sub(age.as_secs());
+    format_epoch_utc(seconds)
+}
+
+/// Reachable from the `source` tests, which need to build a cutoff of their own.
+#[cfg(test)]
+pub(crate) fn format_epoch_utc_for_test(seconds: u64) -> String {
+    format_epoch_utc(seconds)
+}
+
+/// Seconds since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.
+fn format_epoch_utc(seconds: u64) -> String {
+    let (days, rest) = (seconds / 86_400, seconds % 86_400);
+    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+
+    // Civil-from-days, counting from 1970-01-01. Shifting the era to start in March
+    // puts the leap day at the end of the year, which is what removes the special
+    // case for February from the arithmetic.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = era * 400 + yoe + i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
 pub fn requires_fetch(source: &SourceSpec) -> bool {
@@ -1834,6 +1915,39 @@ mod tests {
                 .is_some()
         );
         Ok(())
+    }
+
+    /// The cutoff is a hand-rolled calendar conversion, so it is checked against dates
+    /// whose answers are known independently — including leap years, the century rule
+    /// that 2000 is a leap year and 1900 would not be, and the day either side of a
+    /// leap day.
+    #[test]
+    fn epoch_seconds_become_the_right_utc_date() {
+        for (seconds, expected) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (86_399, "1970-01-01T23:59:59Z"),
+            (86_400, "1970-01-02T00:00:00Z"),
+            // 1972 was a leap year; this is its leap day and the day after.
+            (68_169_600, "1972-02-29T00:00:00Z"),
+            (68_256_000, "1972-03-01T00:00:00Z"),
+            // 2000 is a leap year despite being a century.
+            (951_782_400, "2000-02-29T00:00:00Z"),
+            (951_868_800, "2000-03-01T00:00:00Z"),
+            // 2100 is not, so this must land on March 1st.
+            (4_107_542_400, "2100-03-01T00:00:00Z"),
+            (1_234_567_890, "2009-02-13T23:31:30Z"),
+            (1_700_000_000, "2023-11-14T22:13:20Z"),
+        ] {
+            assert_eq!(format_epoch_utc(seconds), expected, "for {seconds}");
+        }
+    }
+
+    /// An age longer than the epoch must clamp to it, not wrap into the future — a
+    /// cutoff in the future accepts everything, the opposite of what was asked for.
+    #[test]
+    fn an_absurd_age_clamps_instead_of_wrapping() {
+        let stamp = git_timestamp_before_now(std::time::Duration::from_secs(u64::MAX));
+        assert_eq!(stamp, "1970-01-01T00:00:00Z");
     }
 
     /// An `allow` must not erase what it suppresses. The lock caches findings so the
