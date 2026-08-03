@@ -275,8 +275,12 @@ allow = ["W012:figma-to-code:sha256:abc123…"]
 `.agents/skills/<id>/` の順に skill を探します。実際に存在するレイアウトを
 カバーするためです。
 
-source 自身が frontmatter を持たない場合、`description` は必須です。provider は
-いずれも description を要求します。典型例は gist です。
+`description` は skill 自身の frontmatter を上書きする指定で、source が frontmatter
+を持たない場合——典型的には gist——にここで与えます。provider はいずれも description
+を要求するので、manifest にも frontmatter にも無ければ、`link` は妥当にならない
+ファイルを書くのではなく `Instructions for the <id> skill.` を合成します。この一文は
+agent が skill を読み込むか判断するときに読む説明文なので、実際の説明を宣言して
+ください。
 
 ### target と provider
 
@@ -373,7 +377,10 @@ skill は他人のリポジトリから取ってきた、実行される指示�
 
 `[safeguard]` で severity ごとに `block` / `warn` / `allow` を割り当てます。既定は
 `on_critical = "block"`、残りは `warn` です。設定しなかった severity は緩くなるの
-ではなく既定のままになります。
+ではなく既定のままになります。`block` はその skill を展開せず、findings を stderr に
+名指しします。`warn` は展開したうえで findings を `skillenv.lock` に記録します。
+`lint` は policy も `allow` も適用せず、見つけた findings をすべて報告します。だから
+`link` が黙って展開するものを `lint` が挙げることがあります。
 
 判定は語彙ではなく**指示の形**で行います。ここで難しいのは検出そのものではなく、
 既に使っている正当な skill で発火しないことです。秘密管理の skill は `.env` を

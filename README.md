@@ -277,8 +277,12 @@ Inside a fetched tree, a skill is looked for at the root itself, at `<id>/`, at
 `skills/<id>/`, and at `.agents/skills/<id>/`, which covers the layouts that
 occur in practice.
 
-`description` is required when the source carries no frontmatter of its own,
-since every provider demands one. Gist-hosted skills are the common case.
+`description` overrides the skill's own frontmatter, and is what you supply when
+the source carries none — a gist, typically. Every provider demands a
+description, so when neither the manifest nor the frontmatter has one, `link`
+synthesizes `Instructions for the <id> skill.` rather than writing a file that
+will not validate. That sentence is what an agent reads when deciding whether to
+load the skill, so declare a real one.
 
 ### Targets and providers
 
@@ -379,7 +383,11 @@ highest-leverage place to hide an instruction.
 
 `[safeguard]` maps each severity to `block`, `warn`, or `allow`. The defaults are
 `on_critical = "block"` and `warn` for the rest; a policy left unset keeps its
-default rather than becoming permissive.
+default rather than becoming permissive. `block` refuses to deploy the skill and
+names the finding on stderr; `warn` deploys it and records the finding in
+`skillenv.lock`. `lint` reports every finding it sees, regardless of policy and
+regardless of `allow`, which is why it can flag something `link` deploys without
+comment.
 
 Detection is on instruction *shape*, not vocabulary, because the requirement is
 not detection — it is not firing on the legitimate skills already in use. A

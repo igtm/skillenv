@@ -150,7 +150,15 @@ impl Default for SafeguardConfig {
 pub enum Policy {
     /// Refuse to deploy the offending skill.
     Block,
-    /// Deploy, but report on stderr and exit non-zero.
+    /// Deploy, and report on stderr — including under `--quiet`.
+    ///
+    /// Deliberately not a non-zero exit. This is the default for `high`, and a
+    /// legitimate skill can carry a `high` finding for a long time (install
+    /// instructions really do pipe a download into a shell). Failing every `link`
+    /// would mean failing the shell hook on every directory change, and the hook
+    /// would be removed — losing the report as well. `lint` is the command that
+    /// exits non-zero on findings; `allow`, pinned to a digest, is how a reviewed
+    /// finding stops being mentioned.
     Warn,
     /// Say nothing.
     Allow,
