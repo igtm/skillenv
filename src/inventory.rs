@@ -150,7 +150,6 @@ pub fn format_skill_inventory_report(report: &SkillInventoryReport) -> String {
     lines.join("\n")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn skill_inventory_with_config(
     cwd: &Path,
     options: &SkillInventoryOptions,
