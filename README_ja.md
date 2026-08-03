@@ -28,9 +28,9 @@ skillenv には 2 世代あり、**`skillenv.toml` があるかどうか**でど
 1 段階目は何も書き込みません。
 
 ```bash
-skillenv migrate                   # 計画を表示するだけ。読み取り専用
-skillenv migrate --apply           # 実行する
-skillenv migrate --apply --prune   # 確認後、旧 skillenv/ を削除
+skillenv migrate           # 計画を表示するだけ。読み取り専用
+skillenv migrate --apply   # 実行する（旧 skillenv/ は残す）
+skillenv migrate --prune   # 結果を確認してから、旧 skillenv/ を削除
 ```
 
 `--apply` は `skillenv/` を残し、v0 の vendored コピーから新しい cache を種付けするので、直後にネットワーク無しで `link` が通ります。取り消したいときは `skillenv.toml` と `skillenv.lock` を削除してください。

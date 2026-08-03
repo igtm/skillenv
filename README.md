@@ -33,9 +33,9 @@ that has not migrated.
 The first step writes nothing:
 
 ```bash
-skillenv migrate                   # show the plan; read-only
-skillenv migrate --apply           # carry it out
-skillenv migrate --apply --prune   # once confirmed, remove the old skillenv/
+skillenv migrate           # show the plan; read-only
+skillenv migrate --apply   # carry it out, keeping the old skillenv/
+skillenv migrate --prune   # once the result is confirmed, remove it
 ```
 
 `--apply` leaves `skillenv/` in place, and seeds the new cache from v0's own

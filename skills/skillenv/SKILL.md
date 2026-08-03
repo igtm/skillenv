@@ -22,9 +22,9 @@ v0 は `skillenv/{default,local,profiles}/` にディレクトリで scope を�
 移行は 2 段階で、1 段階目は**何も書き込みません**。
 
 ```bash
-skillenv migrate                   # 計画を表示するだけ。読み取り専用
-skillenv migrate --apply           # 実行する
-skillenv migrate --apply --prune   # 確認後、旧 skillenv/ も削除
+skillenv migrate           # 計画を表示するだけ。読み取り専用
+skillenv migrate --apply   # 実行する（旧 skillenv/ は残す）
+skillenv migrate --prune   # 結果を確認してから、旧 skillenv/ を削除
 ```
 
 `migrate` が出力するもの:
