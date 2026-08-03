@@ -143,6 +143,15 @@ enum Command {
     )]
     Remove(RemoveArgs),
     #[command(
+        about = "Compare one skill's cache, deployments, and remote revision.",
+        long_about = "Reads only. `outdated` says a source has moved; this says what moved in \
+                      it. Reports the locked revision against what the remote points at now, \
+                      whether each deployment came from the bytes the cache currently holds, \
+                      and a diff of SKILL.md where it did not. The content comparison works \
+                      without a network; only the remote revision needs one."
+    )]
+    Diff(DiffArgs),
+    #[command(
         about = "Show what this manifest has deployed, in each of its targets.",
         after_long_help = STATUS_AFTER_HELP
     )]
@@ -205,6 +214,12 @@ struct QuietArgs {
         help = "Suppress normal output. Warnings still go to stderr. Useful from shell hooks."
     )]
     quiet: bool,
+}
+
+#[derive(Debug, Args)]
+struct DiffArgs {
+    #[arg(help = "Name of the skill to compare.")]
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -348,6 +363,11 @@ fn run(cli: Cli) -> skillenv::Result<CommandOutput> {
                 warnings: report.warnings(),
                 problems: report.has_problems(),
             })
+        }
+        // Being behind is a state to report, not a failure, so this exits 0 either way
+        // — the same reasoning as `outdated`.
+        Command::Diff(args) => {
+            skillenv::diff_manifest(".", &args.name).map(|(stdout, _)| CommandOutput::text(stdout))
         }
         Command::Remove(args) => {
             skillenv::remove_from_manifest(".", &args.name).map(|report| CommandOutput {

@@ -7,9 +7,6 @@
 //! The cache is keyed by resolved revision, so a fetch is idempotent and a
 //! revision already on disk is simply reused. That is what lets `fetch` restore a
 //! machine from the lock file alone, and what makes `diff` cheap.
-//!
-//! Nothing calls this yet — the CLI is the first consumer, and this allow goes
-//! away with it.
 
 mod git;
 
@@ -52,6 +49,53 @@ pub struct FetchedSkill {
     pub content_digest: String,
     /// Things accepted but worth reporting, e.g. an executable asset.
     pub notes: Vec<String>,
+}
+
+/// Show what changed between two texts, as unified diff text.
+///
+/// Uses `git diff --no-index`, which works outside a repository, rather than
+/// carrying a diff implementation. Goes through the same hardened runner as every
+/// other git call, so it cannot prompt or read system config either. `git diff`
+/// exits 1 when the contents differ, so it uses the runner that keeps output
+/// regardless of exit status — the erroring path would have made every diff empty.
+///
+/// The two texts are written under short directory names and compared by relative
+/// path, because git echoes whatever path it was given: passing the real locations
+/// put an absolute path in the output three times, which buried the change itself.
+pub fn diff_text(
+    before: &str,
+    after: &str,
+    before_label: &str,
+    after_label: &str,
+) -> Result<String> {
+    let scratch = tempfile::TempDir::new().map_err(|source| SkillenvError::WriteFile {
+        path: PathBuf::from("temporary directory"),
+        source,
+    })?;
+    let mut relative = Vec::new();
+    for (label, text) in [(before_label, before), (after_label, after)] {
+        let dir = scratch.path().join(label);
+        ensure_dir(&dir)?;
+        let path = dir.join("SKILL.md");
+        fs::write(&path, text).map_err(|source| SkillenvError::WriteFile {
+            path: path.clone(),
+            source,
+        })?;
+        relative.push(format!("{label}/SKILL.md"));
+    }
+
+    Ok(git::run_reporting_status(
+        &[
+            "diff",
+            "--no-index",
+            "--no-color",
+            "--",
+            &relative[0],
+            &relative[1],
+        ],
+        Some(scratch.path()),
+    )
+    .unwrap_or_default())
 }
 
 /// Resolve the current revision of a source without fetching or writing.

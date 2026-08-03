@@ -481,6 +481,19 @@ fn copy_assets(source_dir: &Path, destination: &Path) -> Result<()> {
             continue;
         }
 
+        // `follow_links(false)` stops the *walk* descending a link, but `fs::copy`
+        // opens the path normally and so copies what the link points at. A skill from
+        // a `path:` or `local` source never passes through `accept_skill`, where
+        // symlinks are refused, so this is the only gate it meets — and without it a
+        // link named `notes.md` pointing at an SSH key is deployed as that key's
+        // contents, into a directory an agent reads.
+        if entry.path_is_symlink() {
+            return Err(SkillenvError::UnsafeSourceEntry {
+                path: entry.path().to_path_buf(),
+                reason: "a symlink; skills must contain only regular files".to_string(),
+            });
+        }
+
         let target = destination.join(relative);
         if entry.file_type().is_dir() {
             ensure_dir(&target)?;

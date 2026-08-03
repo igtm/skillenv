@@ -317,6 +317,85 @@ fn count_cached_sources(cache: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Compare one skill's cache, deployments, and remote revision. Reads only.
+///
+/// `outdated` reports that a source has moved; this reports what moved in it, which
+/// is the question you actually have before running `fetch --update`.
+pub fn diff_manifest(cwd: impl AsRef<Path>, name: &str) -> Result<(String, bool)> {
+    let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let id = manifest::SkillId::parse(name)?;
+    let report = session.diff(&id)?;
+    let differs = report.is_behind()
+        || report
+            .deployments
+            .iter()
+            .any(|entry| entry.comparison != session::Comparison::Same);
+    Ok((format_skill_diff(&report), differs))
+}
+
+fn format_skill_diff(report: &session::SkillDiff) -> String {
+    let short = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(|raw| raw[..12.min(raw.len())].to_string())
+            .unwrap_or_else(|| "none".to_string())
+    };
+    let mut lines = vec![report.id.to_string()];
+
+    lines.push(match (&report.locked_revision, &report.latest_revision) {
+        (Some(_), Some(_)) if report.is_behind() => format!(
+            "  revision: locked {} -> available {}",
+            short(&report.locked_revision),
+            short(&report.latest_revision)
+        ),
+        (Some(locked), Some(_)) => {
+            format!("  revision: {} (current)", &locked[..12.min(locked.len())])
+        }
+        // Not fetched yet, so there is nothing for the remote's revision to be
+        // "current" against — saying so printed "none (current)", which is a
+        // contradiction rather than a report.
+        (None, Some(_)) => format!(
+            "  revision: not fetched; {} is available",
+            short(&report.latest_revision)
+        ),
+        // No remote to ask, or it could not be reached. Distinguishing those two
+        // would need the error, and the content comparison below does not depend on it.
+        (locked, None) => format!("  revision: {}", short(locked)),
+    });
+    lines.push(format!("  cached: {}", short(&report.cached_digest)));
+
+    if report.deployments.is_empty() {
+        lines.push("  not deployed anywhere".to_string());
+    }
+    for deployment in &report.deployments {
+        lines.push(format!(
+            "  {} [{}]: {} ({})",
+            deployment.target.display(),
+            deployment.provider,
+            match deployment.comparison {
+                session::Comparison::Same => "matches the cache",
+                session::Comparison::Differs => "differs from the cache",
+                session::Comparison::Unknown => "cannot be compared",
+            },
+            short(&deployment.deployed_digest)
+        ));
+        match &deployment.body {
+            session::BodyDiff::Changed(body) => {
+                for line in body.lines() {
+                    lines.push(format!("    {line}"));
+                }
+            }
+            // Said plainly. Showing nothing under a heading that says it differs read
+            // as "only frontmatter changed", which is a different answer entirely.
+            session::BodyDiff::Unreadable(path) => {
+                lines.push(format!("    could not read {}", path.display()));
+            }
+            session::BodyDiff::Same => {}
+        }
+    }
+    lines.join("\n")
+}
+
 /// Report what the manifest governing `cwd` has deployed. Reads only.
 pub fn status_manifest(cwd: impl AsRef<Path>) -> Result<(String, bool)> {
     let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
@@ -480,13 +559,29 @@ pub fn list_manifest(cwd: impl AsRef<Path>) -> Result<String> {
                 }
                 None => parts.push("revision=unversioned".to_string()),
             },
-            None if entry.needs_fetch() => parts.push("revision=unfetched".to_string()),
+            // A `path:` source needs no fetch, so "unfetched" would be wrong: there is
+            // simply no revision to have. `needs_fetch` is true for it only because it
+            // is not the `local` source.
+            None if entry.needs_fetch() && session::requires_fetch(&entry.source) => {
+                parts.push("revision=unfetched".to_string())
+            }
             None => {}
         }
         lines.push(format!("  {}", parts.join(" ")));
     }
 
     for source in &session.catalog.wildcard_sources {
+        // Only worth saying while it is still unresolved. Once `fetch` has run, the
+        // members are listed above like any other skill, and repeating the
+        // instruction would suggest they are not.
+        let resolved = session
+            .catalog
+            .entries
+            .values()
+            .any(|entry| entry.source_name.as_deref() == Some(source.name.as_str()));
+        if resolved {
+            continue;
+        }
         lines.push(format!(
             "  ({} tracks every skill from {}; run `skillenv fetch` to resolve them)",
             source.name,
