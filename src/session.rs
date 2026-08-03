@@ -649,6 +649,17 @@ impl Session {
             crate::source::accept_skill(&from, &destination, Some(fetched.revision.clone()))?
         };
 
+        // Carried over when the content is byte-identical to what was already
+        // recorded. Clearing it unconditionally threw away a valid scan on every
+        // fetch — including a `fetch` that downloaded nothing — so the lock churned
+        // and the recorded verdict, `quarantined` included, briefly vanished. When the
+        // digest does differ the old verdict describes different bytes and must go.
+        let safeguard = match self.lock.get(id) {
+            Some(previous) if previous.content_digest == accepted.content_digest => {
+                previous.safeguard.clone()
+            }
+            _ => SafeguardState::default(),
+        };
         self.lock.upsert(LockedSkill {
             id: id.clone(),
             source: source.display.clone(),
@@ -656,7 +667,7 @@ impl Session {
             resolved_ref: source.git_ref.clone(),
             resolved_revision: Some(fetched.revision.clone()),
             content_digest: accepted.content_digest,
-            safeguard: SafeguardState::default(),
+            safeguard,
         });
         Ok(true)
     }
@@ -1948,6 +1959,72 @@ mod tests {
     fn an_absurd_age_clamps_instead_of_wrapping() {
         let stamp = git_timestamp_before_now(std::time::Duration::from_secs(u64::MAX));
         assert_eq!(stamp, "1970-01-01T00:00:00Z");
+    }
+
+    /// A `fetch` that downloads nothing must not discard the recorded scan. Clearing it
+    /// unconditionally churned the lock on every fetch and briefly dropped the verdict,
+    /// `quarantined` included — and an `allow` entry looked revoked until the next
+    /// `link` put the findings back.
+    ///
+    /// Reached through `file://` because `fetch` skips a `path:` source entirely, so a
+    /// path source never enters the code this is about.
+    #[test]
+    fn fetching_unchanged_content_keeps_the_recorded_scan() -> Result<()> {
+        let upstream = TempDir::new().unwrap();
+        let path = upstream.path().to_string_lossy().to_string();
+        let dir = upstream.path().join("skills/kinko");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), valid("kinko")).unwrap();
+        for args in [
+            vec!["init", "--quiet", "--initial-branch", "main", &path],
+            vec!["-C", &path, "add", "-A"],
+        ] {
+            crate::source::run_git_for_test(&args)?;
+        }
+        crate::source::run_git_for_test(&[
+            "-C",
+            &path,
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "one",
+        ])?;
+
+        let root = workspace(
+            &format!(
+                "[[source]]\nname = \"up\"\nfrom = \"file://{path}\"\nref = \"main\"\n\
+                 skills = [\"kinko\"]\n\n\
+                 [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n"
+            ),
+            &[],
+        );
+        let home = TempDir::new().unwrap();
+
+        let mut session = open_session(root.path(), home.path())?;
+        session.fetch(true)?;
+        session.link()?;
+        let recorded = session
+            .lock
+            .get(&SkillId::parse("kinko")?)
+            .and_then(|locked| locked.safeguard.scanned_digest.clone());
+        assert!(recorded.is_some(), "link should have recorded a scan");
+
+        // Same bytes, so the verdict still describes them.
+        let mut session = open_session(root.path(), home.path())?;
+        session.fetch(false)?;
+        assert_eq!(
+            session
+                .lock
+                .get(&SkillId::parse("kinko")?)
+                .and_then(|locked| locked.safeguard.scanned_digest.clone()),
+            recorded,
+            "an unchanged fetch discarded the scan"
+        );
+        Ok(())
     }
 
     /// An `allow` must not erase what it suppresses. The lock caches findings so the

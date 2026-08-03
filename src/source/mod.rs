@@ -430,6 +430,12 @@ fn sanitize_component(value: &str) -> String {
     }
 }
 
+/// Run a git command, for tests in sibling modules that need to build a fixture repo.
+#[cfg(test)]
+pub(crate) fn run_git_for_test(args: &[&str]) -> Result<String> {
+    git::run(args, None)
+}
+
 /// Whether `path` stays inside `root` once both are normalized.
 ///
 /// Used before writing, so a crafted relative path cannot place a file outside
