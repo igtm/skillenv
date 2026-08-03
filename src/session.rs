@@ -320,7 +320,20 @@ impl Session {
     /// once, so a failure part-way left the installed trees and the recorded
     /// revisions disagreeing with no way back.
     pub fn fetch(&mut self, update: bool) -> Result<FetchReport> {
-        let mut report = FetchReport::default();
+        // Pruned before any pin is read. An entry the manifest no longer declares
+        // still carries a revision, and `locked_revision_for_source` would hand it
+        // back as the pin for the whole source — restoring an older tree than the
+        // lock's own current entries describe.
+        let dropped = self.prune_lock();
+        // Saved here rather than only inside the loop below: a manifest with no remote
+        // sources never enters it, and the pruned entries would survive on disk.
+        if !dropped.is_empty() {
+            self.lock.save(&self.root)?;
+        }
+        let mut report = FetchReport {
+            dropped,
+            ..Default::default()
+        };
 
         for source in self.remote_sources() {
             let pin = if update {
@@ -362,10 +375,61 @@ impl Session {
             if fetched.reused {
                 report.reused.push(source.name.clone());
             }
+            // A revision belongs to the source, not to each skill in it. A skill that
+            // went missing upstream would otherwise keep the revision it was last
+            // seen at, leaving one source with two revisions in the lock — and the
+            // pin then depends on which entry happens to sort first.
+            self.stamp_revision(&source.name, &fetched.revision);
             self.lock.save(&self.root)?;
         }
 
         Ok(report)
+    }
+
+    /// Record `revision` for every lock entry belonging to `source_name`.
+    fn stamp_revision(&mut self, source_name: &str, revision: &str) {
+        for locked in &mut self.lock.skills {
+            if locked.source_name.as_deref() == Some(source_name) {
+                locked.resolved_revision = Some(revision.to_string());
+            }
+        }
+    }
+
+    /// Forget lock entries for skills the manifest no longer declares.
+    ///
+    /// `remove` prunes what it takes out, but editing the manifest by hand does not
+    /// go through it — and an upstream rename forces exactly that edit. Without this
+    /// the lock keeps a revision for a skill nothing asks for, so its count drifts
+    /// from what is deployed and every rename leaves permanent residue.
+    ///
+    /// A wildcard source's members are not in the catalog until they are fetched, so
+    /// entries belonging to one are kept regardless.
+    fn prune_lock(&mut self) -> Vec<SkillId> {
+        let wildcard: Vec<&str> = self
+            .catalog
+            .wildcard_sources
+            .iter()
+            .map(|source| source.name.as_str())
+            .collect();
+
+        let dropped: Vec<SkillId> = self
+            .lock
+            .skills
+            .iter()
+            .filter(|locked| {
+                !self.catalog.entries.contains_key(&locked.id)
+                    && !locked
+                        .source_name
+                        .as_deref()
+                        .is_some_and(|name| wildcard.contains(&name))
+            })
+            .map(|locked| locked.id.clone())
+            .collect();
+
+        self.lock
+            .skills
+            .retain(|locked| !dropped.contains(&locked.id));
+        dropped
     }
 
     /// Copy one skill out of a fetched tree and record it.
@@ -490,12 +554,17 @@ impl Session {
     }
 
     /// The revision the lock records for a source, taken from any of its skills.
+    /// The revision this source is locked at.
+    ///
+    /// Every entry for a source carries the same revision — `stamp_revision` keeps it
+    /// that way — so any of them answers. Taking the newest by string order would be
+    /// worse than arbitrary: revisions are hashes, so it would be meaningless.
     fn locked_revision_for_source(&self, source_name: &str) -> Option<String> {
         self.lock
             .skills
             .iter()
-            .find(|locked| locked.source_name.as_deref() == Some(source_name))
-            .and_then(|locked| locked.resolved_revision.clone())
+            .filter(|locked| locked.source_name.as_deref() == Some(source_name))
+            .find_map(|locked| locked.resolved_revision.clone())
     }
 
     /// Resolve, scan, and digest every catalog entry that can be prepared.
@@ -738,6 +807,8 @@ impl StatusReport {
 #[derive(Debug, Clone, Default)]
 pub struct FetchReport {
     pub fetched: Vec<SkillId>,
+    /// Lock entries forgotten because the manifest no longer declares them.
+    pub dropped: Vec<SkillId>,
     /// Sources whose revision was already cached, so nothing was downloaded.
     pub reused: Vec<String>,
     /// Skills the source no longer contains, named with the source.
@@ -911,6 +982,161 @@ mod tests {
 
     fn open_session(root: &Path, home: &Path) -> Result<Session> {
         Session::open(root, home.to_path_buf())
+    }
+
+    /// One source must never hold two revisions in the lock.
+    ///
+    /// A skill that disappears upstream keeps the revision it was last seen at, and
+    /// `locked_revision_for_source` then hands that back as the pin for the whole
+    /// source — so the next `fetch` restores an older tree, silently rolling back the
+    /// skills that did move. Observed on a real setup: a rename left the old id
+    /// behind, and the following `fetch` took its sibling back a revision while
+    /// reporting only that the new name "no longer exists".
+    #[test]
+    fn a_source_keeps_one_revision_even_when_a_skill_disappears() -> Result<()> {
+        let root = workspace(
+            "[[source]]\nname = \"upstream\"\nfrom = \"github:me/upstream\"\n\
+             skills = [\"stayed\", \"vanished\"]\n",
+            &[],
+        );
+        // As `fetch --update` leaves it: one skill moved, the missing one did not.
+        fs::write(
+            root.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"stayed","source":"github:me/upstream","source_name":"upstream",
+                 "resolved_revision":"new0","content_digest":"sha256:aa","safeguard":{}},
+                {"id":"vanished","source":"github:me/upstream","source_name":"upstream",
+                 "resolved_revision":"old0","content_digest":"sha256:bb","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+
+        // Both are still declared, so neither is pruned; the pin must not be the
+        // stale one.
+        assert!(session.prune_lock().is_empty());
+        session.stamp_revision("upstream", "new0");
+        assert_eq!(
+            session.locked_revision_for_source("upstream").as_deref(),
+            Some("new0")
+        );
+        for locked in &session.lock.skills {
+            assert_eq!(locked.resolved_revision.as_deref(), Some("new0"));
+        }
+        Ok(())
+    }
+
+    /// An entry the manifest no longer declares must be gone before any pin is read.
+    /// Pruning afterwards still let it choose the revision for the whole source.
+    #[test]
+    fn an_undeclared_entry_cannot_choose_the_pin() -> Result<()> {
+        let root = workspace(
+            "[[source]]\nname = \"upstream\"\nfrom = \"github:me/upstream\"\n\
+             skills = [\"kept\"]\n",
+            &[],
+        );
+        // `retired` sorts before `kept`? No — insertion order is what `find` walked,
+        // so it is first here deliberately.
+        fs::write(
+            root.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"retired","source":"github:me/upstream","source_name":"upstream",
+                 "resolved_revision":"stale","content_digest":"sha256:aa","safeguard":{}},
+                {"id":"kept","source":"github:me/upstream","source_name":"upstream",
+                 "resolved_revision":"current","content_digest":"sha256:bb","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        assert_eq!(
+            session.locked_revision_for_source("upstream").as_deref(),
+            Some("stale"),
+            "before pruning the undeclared entry answers first"
+        );
+
+        let dropped = session.prune_lock();
+        assert_eq!(
+            dropped.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["retired"]
+        );
+        assert_eq!(
+            session.locked_revision_for_source("upstream").as_deref(),
+            Some("current")
+        );
+        Ok(())
+    }
+
+    /// An upstream rename forces a manifest edit, and that edit does not go through
+    /// `remove` — so `fetch` has to forget what is no longer declared. Otherwise the
+    /// lock keeps a revision nothing asks for and its count drifts from what is
+    /// deployed, permanently, once per rename.
+    #[test]
+    fn fetch_forgets_a_skill_the_manifest_no_longer_declares() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"kinko\"\nsource = \"local\"\n",
+            &[("kinko", &valid("kinko"))],
+        );
+        // `retired` is in the lock but not the manifest, as it would be right after
+        // following a rename by hand.
+        fs::write(
+            root.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"kinko","source":"local","content_digest":"sha256:aa","safeguard":{}},
+                {"id":"retired","source":"github:me/upstream","source_name":"upstream",
+                 "resolved_revision":"bbbb","content_digest":"sha256:bb","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.fetch(false)?;
+
+        assert_eq!(
+            report
+                .dropped
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["retired"]
+        );
+        let reloaded = LockFile::load(&session.root)?;
+        assert!(reloaded.get(&SkillId::parse("retired")?).is_none());
+        assert!(
+            reloaded.get(&SkillId::parse("kinko")?).is_some(),
+            "a declared skill must stay"
+        );
+        Ok(())
+    }
+
+    /// A wildcard source's members only enter the catalog once fetched, so they must
+    /// not be mistaken for undeclared and dropped.
+    #[test]
+    fn pruning_spares_a_wildcard_sources_member() -> Result<()> {
+        let root = workspace(
+            "[[source]]\nname = \"upstream\"\nfrom = \"github:me/upstream\"\n\
+             skills = \"*\"\n",
+            &[],
+        );
+        fs::write(
+            root.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"from-wildcard","source":"github:me/upstream","source_name":"upstream",
+                 "resolved_revision":"cccc","content_digest":"sha256:cc","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        assert!(session.prune_lock().is_empty());
+        assert!(
+            session
+                .lock
+                .get(&SkillId::parse("from-wildcard")?)
+                .is_some()
+        );
+        Ok(())
     }
 
     /// A `warn`-tier finding must reach stderr. It is recorded in the lock either

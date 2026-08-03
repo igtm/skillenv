@@ -65,12 +65,20 @@ pub fn fetch_manifest(cwd: impl AsRef<Path>, update: bool) -> Result<(String, Ve
     let mut session = session::Session::open(cwd.as_ref(), home_dir()?)?;
     let report = session.fetch(update)?;
     let mut lines = vec![format!(
-        "{} skill(s) cached{}",
+        "{} skill(s) cached{}{}",
         report.fetched.len(),
         if report.reused.is_empty() {
             String::new()
         } else {
             format!(", {} source(s) already current", report.reused.len())
+        },
+        if report.dropped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} no longer declared and forgotten",
+                report.dropped.len()
+            )
         }
     )];
     for id in &report.fetched {
