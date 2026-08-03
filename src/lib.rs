@@ -15,6 +15,7 @@ mod inventory;
 mod lock;
 mod manifest;
 mod paths;
+mod provider;
 mod remote;
 mod render;
 mod safeguard;
@@ -424,6 +425,8 @@ pub enum SkillenvError {
     InvalidManifest { path: PathBuf, message: String },
     #[error("invalid skill id '{input}': {reason}")]
     InvalidSkillId { input: String, reason: String },
+    #[error("unknown provider '{name}'; known providers are {known}")]
+    UnknownProvider { name: String, known: String },
     #[error(
         "lock file at {path} is version {found}, but this build understands only version {supported}; upgrade skillenv"
     )]

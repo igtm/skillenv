@@ -210,7 +210,7 @@ pub(crate) fn parse_frontmatter(path: &Path, raw: &str) -> Result<(Mapping, Stri
     Ok((Mapping::new(), raw.to_string()))
 }
 
-fn mapping_to_yaml(mapping: &Mapping) -> Result<String> {
+pub(crate) fn mapping_to_yaml(mapping: &Mapping) -> Result<String> {
     let mut yaml =
         serde_yaml::to_string(mapping).map_err(|source| SkillenvError::ParseFrontmatter {
             path: PathBuf::from("inline-frontmatter"),
