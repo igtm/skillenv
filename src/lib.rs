@@ -12,6 +12,7 @@ use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
 mod catalog;
+mod deploy;
 mod inventory;
 mod legacy_sweep;
 mod lock;
@@ -455,6 +456,14 @@ pub enum SkillenvError {
     },
     #[error("no SKILL.md at {path}")]
     MissingSkillFile { path: PathBuf },
+    #[error(
+        "generated name '{name}' is {length} characters, over the {limit} providers accept; shorten the skill id or the repository directory name"
+    )]
+    GeneratedNameTooLong {
+        name: String,
+        length: usize,
+        limit: usize,
+    },
     #[error("refusing {path}: it is {reason}")]
     UnsafeSourceEntry { path: PathBuf, reason: String },
     #[error("{path} exceeds the limit of {limit}")]

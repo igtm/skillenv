@@ -23,11 +23,16 @@ pub(crate) const MANIFEST_FILE: &str = "skillenv.toml";
 
 /// Longest skill id we accept.
 ///
-/// Providers cap the frontmatter `name` at 64 characters, and a deployed skill
-/// is named `skillenv-<repo>-g<hash>-<id>`, which spends roughly 30 characters
-/// before the id begins. Rejecting long ids here turns a confusing
-/// provider-side validation failure into an actionable error at the source.
-pub(crate) const MAX_SKILL_ID_CHARS: usize = 34;
+/// Providers cap the frontmatter `name` at 64 characters and a deployed skill is
+/// named `skillenv-<repo>-g<hash>-<id>`. For a repository slug of typical length
+/// the prefix costs 32 characters — `skillenv-` (9) + `dotfiles` (8) + `-g` (2) +
+/// twelve hex digits + `-` — so 32 is what remains.
+///
+/// This is a static budget for early, actionable feedback; it cannot be exact,
+/// because the prefix grows with the repository name. `crate::deploy` measures the
+/// real generated name and skips a skill that would still overflow, so a long
+/// repository name cannot smuggle an invalid file past us.
+pub(crate) const MAX_SKILL_ID_CHARS: usize = 32;
 
 /// Words an id may not take, because a selector or target would become ambiguous.
 const RESERVED_IDS: &[&str] = &["all", "none", "skillenv", "local", "home", "repo"];
