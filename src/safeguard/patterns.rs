@@ -213,17 +213,40 @@ fn matching<'a>(line: &str, needles: &[&'a str]) -> Option<&'a str> {
         .copied()
 }
 
+/// Verbs that make a line an instruction to go and get something.
+const FETCH_VERBS: &[&str] = &[
+    "fetch",
+    "download",
+    "retrieve",
+    "curl",
+    "wget",
+    "pull the",
+    "load the",
+    "read from",
+    "取得",
+    "読み込",
+];
+
+/// Nouns that make the thing being fetched an instruction rather than data.
+const INSTRUCTION_NOUNS: &[&str] = &["instruction", "prompt", "rule", "directive", "指示"];
+
 /// A non-loopback URL the line tells the agent to read instructions from.
+///
+/// Two things must hold, and the URL itself is excluded from the search for both.
+/// Citing a document is not fetching instructions: a bare
+/// `https://react.dev/reference/rules/...` in a list of references matched on the
+/// `rules` inside its own path, which produced four spurious findings on a real
+/// skill. A finding needs a verb telling the agent to go and get something, and a
+/// noun saying the something is an instruction.
 fn external_instruction_url(line: &str) -> Option<String> {
-    let lower = line.to_lowercase();
-    let asks_for_instructions = ["instruction", "prompt", "rule", "directive", "指示"]
-        .iter()
-        .any(|word| lower.contains(word));
-    if !asks_for_instructions {
+    let url = first_url(line)?;
+    if is_loopback(&url) {
         return None;
     }
-    let url = first_url(line)?;
-    (!is_loopback(&url)).then_some(url)
+    let prose = line.replace(&url, " ").to_lowercase();
+    let fetches = FETCH_VERBS.iter().any(|verb| prose.contains(verb));
+    let instructions = INSTRUCTION_NOUNS.iter().any(|noun| prose.contains(noun));
+    (fetches && instructions).then_some(url)
 }
 
 /// A URL whose download is piped into a shell on the same line.
@@ -408,6 +431,36 @@ touches disk, unlike a .env file or ~/.ssh material.
     #[test]
     fn a_documentation_link_is_clean() {
         let text = "See https://example.com/docs for background.\n";
+        assert!(
+            scan(text).is_empty(),
+            "unexpected findings: {:?}",
+            scan(text)
+        );
+    }
+
+    /// The real false positive this check produced. A bare citation matched on the
+    /// `rules` inside the URL's own path, so the URL is now excluded from the search
+    /// and a fetch verb is required as well.
+    #[test]
+    fn a_bare_citation_whose_url_path_says_rules_is_clean() {
+        for text in [
+            "- https://react.dev/reference/rules/components-and-hooks-must-be-pure\n",
+            "- https://react.dev/reference/rules/rules-of-hooks\n",
+            "根拠: https://react.dev/reference/rules/components-and-hooks-must-be-pure\n",
+            "See the prompt engineering guide at https://example.com/docs/prompts\n",
+        ] {
+            assert!(
+                scan(text).is_empty(),
+                "citing a document is not fetching instructions: {text:?} -> {:?}",
+                scan(text)
+            );
+        }
+    }
+
+    /// A fetch verb without an instruction noun is downloading data, not behaviour.
+    #[test]
+    fn fetching_something_that_is_not_an_instruction_is_clean() {
+        let text = "Download the sample data from https://example.com/data.csv\n";
         assert!(
             scan(text).is_empty(),
             "unexpected findings: {:?}",
