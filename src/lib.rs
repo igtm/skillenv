@@ -20,7 +20,6 @@ mod manifest;
 mod migrate;
 mod paths;
 mod provider;
-mod remote;
 mod render;
 mod safeguard;
 mod session;
@@ -276,13 +275,6 @@ const LOCAL_SCOPE_DIR: &str = "local";
 const PROFILES_SCOPE_DIR: &str = "profiles";
 
 pub type Result<T> = std::result::Result<T, SkillenvError>;
-
-pub use remote::{
-    AddSourceOptions, AddSourceReport, FetchSourcesOptions, FetchSourcesReport,
-    FetchedLockedSource, UpdateSourcesOptions, UpdateSourcesReport, add_source, fetch_sources,
-    format_add_source_report, format_fetch_sources_report, format_update_sources_report,
-    update_sources,
-};
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -1224,7 +1216,7 @@ fn doctor_with_config(
     );
 
     let managed_sources = match repo_root.as_deref() {
-        Some(repo_root) => remote::managed_source_details(repo_root)?
+        Some(_) => Vec::<DoctorManagedSource>::new()
             .into_iter()
             .map(|source| {
                 if !source.install_root.exists() {
@@ -1960,9 +1952,6 @@ fn all_source_roots(
             external.name.clone(),
             resolve_external_root(external, repo_slug, config_base_dir),
         ));
-    }
-    for managed in remote::installed_source_roots(repo_root)? {
-        roots.push((managed.name, managed.root));
     }
     Ok(roots)
 }
@@ -4207,74 +4196,6 @@ path = "../shared/{repo}"
         Ok(())
     }
 
-    #[test]
-    fn doctor_reports_managed_sources_with_transport_metadata() -> Result<()> {
-        let repo = repo_fixture()?;
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        let config_path = write_config(repo.path(), "")?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some("repo doctor\n"),
-            "repo doctor",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let install_root = repo.path().join("skillenv/remote/vercel");
-        ensure_dir(&install_root)?;
-        write_lock_file(
-            repo.path(),
-            format!(
-                r#"{{
-  "version": 1,
-  "sources": [
-    {{
-      "name": "vercel",
-      "source": "vercel-labs/agent-skills",
-      "kind": "git",
-      "transport": "https://github.com/vercel-labs/agent-skills.git",
-      "requested_ref": "main",
-      "subdir": null,
-      "install_root": "{}",
-      "selected_skills": ["frontend-design"],
-      "resolved_revision": "abc123"
-    }}
-  ]
-}}"#,
-                install_root.strip_prefix(repo.path()).unwrap().display()
-            ),
-        )?;
-
-        let report = doctor_with_config(repo.path(), &DoctorOptions, Some(&config_path))?;
-
-        assert_eq!(report.managed_sources.len(), 1);
-        let source = &report.managed_sources[0];
-        assert_eq!(source.name, "vercel");
-        assert_eq!(source.kind, "git");
-        assert_eq!(source.source, "vercel-labs/agent-skills");
-        assert_eq!(
-            source.transport,
-            "https://github.com/vercel-labs/agent-skills.git"
-        );
-        assert_eq!(source.requested_ref.as_deref(), Some("main"));
-        assert_eq!(source.install_root, install_root);
-        assert_eq!(source.selected_skills, vec!["frontend-design"]);
-        assert_eq!(source.resolved_revision, "abc123");
-        assert!(
-            report
-                .source_roots
-                .iter()
-                .any(|root| root.origin == "managed:vercel")
-        );
-
-        let rendered = format_doctor_report(&report);
-        assert!(rendered.contains("transport=https://github.com/vercel-labs/agent-skills.git"));
-        assert!(rendered.contains("source=vercel-labs/agent-skills"));
-        Ok(())
-    }
-
     fn repo_fixture() -> Result<TempDir> {
         let dir = TempDir::new().unwrap();
         ensure_dir(&dir.path().join(".git"))?;
@@ -4318,11 +4239,6 @@ path = "../shared/{repo}"
             source,
         })?;
         Ok(dir)
-    }
-
-    fn write_lock_file(repo_root: &Path, body: String) -> Result<()> {
-        let path = repo_root.join("skillenv.lock.json");
-        fs::write(&path, body).map_err(|source| SkillenvError::WriteFile { path, source })
     }
 
     fn test_repo_slug(repo_root: &Path) -> String {

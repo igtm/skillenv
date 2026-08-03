@@ -2,13 +2,11 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use skillenv::{
-    AddSourceOptions, DoctorOptions, InitOptions, LinkOptions, ScopeSelector, Shell,
-    SkillInventoryOptions, SkillInventoryTool, StatusOptions, TargetOverride, UnlinkOptions,
-    UpdateSourcesOptions, add_source, doctor, fetch_sources, format_add_source_report,
-    format_doctor_report, format_fetch_sources_report, format_init_report, format_link_report,
-    format_skill_inventory_report, format_status_report, format_update_sources_report, hook_script,
-    init_repo, link_global, link_repo, skill_inventory, status_global, status_repo, unlink_global,
-    unlink_repo, update_sources,
+    DoctorOptions, InitOptions, LinkOptions, ScopeSelector, Shell, SkillInventoryOptions,
+    SkillInventoryTool, StatusOptions, TargetOverride, UnlinkOptions, doctor, format_doctor_report,
+    format_init_report, format_link_report, format_skill_inventory_report, format_status_report,
+    hook_script, init_repo, link_global, link_repo, skill_inventory, status_global, status_repo,
+    unlink_global, unlink_repo,
 };
 
 const ROOT_AFTER_HELP: &str = r#"Workflow:
@@ -133,7 +131,7 @@ enum Command {
         about = "Install a managed skill source and record it in skillenv.lock.json.",
         after_long_help = ADD_AFTER_HELP
     )]
-    Add(AddArgs),
+    Add,
     #[command(
         about = "Create the repo-local skillenv layout and managed .gitignore entries.",
         after_long_help = INIT_AFTER_HELP
@@ -212,41 +210,6 @@ enum Command {
     },
     #[command(about = "Print the skillenv CLI version.")]
     Version,
-}
-
-#[derive(Debug, Args)]
-struct AddArgs {
-    #[arg(help = "GitHub shorthand, Git URL, or local checkout path to install.")]
-    source: String,
-    #[arg(
-        long = "skill",
-        help = "Install only the selected skill slug. Repeat to keep multiple skills."
-    )]
-    skills: Vec<String>,
-    #[arg(
-        long = "into",
-        help = "Managed install directory. Defaults to `skillenv/remote/<source-name>`."
-    )]
-    into: Option<std::path::PathBuf>,
-    #[arg(
-        long = "ref",
-        help = "Git ref, branch, or tag to fetch for versioned sources."
-    )]
-    ref_name: Option<String>,
-    #[arg(long, help = "Logical managed source name. Normalized to kebab-case.")]
-    name: Option<String>,
-    #[arg(
-        long,
-        conflicts_with = "no_claude",
-        help = "Also target `.claude/skills` for the follow-up relink."
-    )]
-    claude: bool,
-    #[arg(
-        long,
-        conflicts_with = "claude",
-        help = "Disable `.claude/skills` even if config enables it."
-    )]
-    no_claude: bool,
 }
 
 #[derive(Debug, Args)]
@@ -485,20 +448,16 @@ fn link_manifest_command(quiet: bool) -> skillenv::Result<CommandOutput> {
 
 fn run(cli: Cli) -> skillenv::Result<String> {
     match cli.command {
-        Command::Add(args) => {
-            let report = add_source(
-                ".",
-                AddSourceOptions {
-                    source: args.source,
-                    into: args.into,
-                    skills: args.skills,
-                    ref_name: args.ref_name,
-                    name: args.name,
-                    claude: target_override(args.claude, args.no_claude),
-                },
-            )?;
-            Ok(format_add_source_report(&report))
-        }
+        // v0 installed sources into skillenv/remote and recorded them in
+        // skillenv.lock.json. In v1 a source is declared in the manifest, which is
+        // a file edit rather than a command, so this points at that instead of
+        // half-doing it.
+        Command::Add => Err(skillenv::SkillenvError::InvalidSource {
+            input: "add".to_string(),
+            message: "v1 declares sources in skillenv.toml. Add a [[source]] entry \
+                      (name, from, skills) and run `skillenv fetch`"
+                .to_string(),
+        }),
         Command::Init(args) => {
             let report = init_repo(
                 ".",
@@ -602,26 +561,18 @@ fn run(cli: Cli) -> skillenv::Result<String> {
             )?;
             Ok(format_status_report(&report))
         }
-        Command::Update(args) => {
-            let report = update_sources(
-                ".",
-                UpdateSourcesOptions {
-                    names: args.names,
-                    claude: target_override(args.claude, args.no_claude),
-                },
-            )?;
-            Ok(format_update_sources_report(&report))
-        }
-        Command::Fetch(args) => {
-            let report = fetch_sources(
-                ".",
-                skillenv::FetchSourcesOptions {
-                    names: args.names,
-                    claude: target_override(args.claude, args.no_claude),
-                },
-            )?;
-            Ok(format_fetch_sources_report(&report))
-        }
+        Command::Update(_) => Err(skillenv::SkillenvError::InvalidSource {
+            input: "update".to_string(),
+            message: "use `skillenv fetch --update`, or `skillenv outdated` first to \
+                      see what would move"
+                .to_string(),
+        }),
+        // Reached only when dispatch_manifest declined, i.e. there is no manifest.
+        // v0 restored into skillenv/remote from skillenv.lock.json; there is nothing
+        // to restore without a v1 lock.
+        Command::Fetch(_) => Err(skillenv::SkillenvError::ManifestNotFound {
+            searched_from: std::path::PathBuf::from("."),
+        }),
         Command::Skills(args) => {
             let report = skill_inventory(
                 ".",
