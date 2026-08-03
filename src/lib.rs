@@ -22,6 +22,7 @@ mod provider;
 mod remote;
 mod render;
 mod safeguard;
+mod session;
 mod source;
 
 pub use inventory::format_skill_inventory_report;
@@ -456,6 +457,10 @@ pub enum SkillenvError {
     },
     #[error("no SKILL.md at {path}")]
     MissingSkillFile { path: PathBuf },
+    #[error(
+        "no skillenv.toml found from {searched_from} upwards; create one or set SKILLENV_MANIFEST"
+    )]
+    ManifestNotFound { searched_from: PathBuf },
     #[error(
         "generated name '{name}' is {length} characters, over the {limit} providers accept; shorten the skill id or the repository directory name"
     )]
