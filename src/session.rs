@@ -186,6 +186,195 @@ impl Session {
         Ok(report)
     }
 
+    /// Populate the cache for every remote skill.
+    ///
+    /// `update` decides which revision: with it, whatever each ref points at now;
+    /// without it, exactly what the lock records. The second is what a fresh clone
+    /// needs — the cache is not committed, so a new machine has a manifest and a
+    /// lock and nothing else.
+    ///
+    /// The lock is saved after each source rather than once at the end. v0 saved
+    /// once, so a failure part-way left the installed trees and the recorded
+    /// revisions disagreeing with no way back.
+    pub fn fetch(&mut self, update: bool) -> Result<FetchReport> {
+        let mut report = FetchReport::default();
+
+        for source in self.remote_sources() {
+            let pin = if update {
+                None
+            } else {
+                self.locked_revision_for_source(&source.name)
+            };
+
+            let fetched = match crate::source::fetch_git(
+                &self.root,
+                &source.name,
+                &source.spec,
+                source.git_ref.as_deref(),
+                None,
+                pin.as_deref(),
+            ) {
+                Ok(fetched) => fetched,
+                // One unreachable source must not withhold the others.
+                Err(error) => {
+                    report.failed.push((source.name.clone(), error.to_string()));
+                    continue;
+                }
+            };
+
+            let wanted = match &source.skills {
+                Some(ids) => ids.clone(),
+                // A wildcard source's membership is whatever the tree turns out to
+                // hold, which is only knowable now.
+                None => discover_skills(&fetched.root),
+            };
+
+            for id in wanted {
+                match self.accept_one(&source, &fetched, &id) {
+                    Ok(true) => report.fetched.push(id),
+                    Ok(false) => report.missing.push((id, source.name.clone())),
+                    Err(error) => report.failed.push((id.to_string(), error.to_string())),
+                }
+            }
+            if fetched.reused {
+                report.reused.push(source.name.clone());
+            }
+            self.lock.save(&self.root)?;
+        }
+
+        Ok(report)
+    }
+
+    /// Copy one skill out of a fetched tree and record it.
+    ///
+    /// `Ok(false)` means the source no longer contains it — reported per skill
+    /// rather than failing the command, which is exactly what v0 could not do: a
+    /// renamed upstream skill made the whole `update` abort.
+    fn accept_one(
+        &mut self,
+        source: &RemoteSource,
+        fetched: &crate::source::FetchedSource,
+        id: &SkillId,
+    ) -> Result<bool> {
+        let Some(from) = crate::source::locate_skill(&fetched.root, id.as_str()) else {
+            return Ok(false);
+        };
+        let destination =
+            crate::source::cache_dir(&self.root, &source.name, &fetched.revision).join(id.as_str());
+        // Nothing to copy when the skill is already where it belongs — either
+        // accepted at this revision on an earlier run, or found directly at the
+        // destination because the cache root is itself the skill. The revision is
+        // part of the path, so present means current.
+        let already_in_place = from == destination || destination.join("SKILL.md").is_file();
+        let accepted = if already_in_place {
+            crate::source::FetchedSkill {
+                content_digest: digest_tree(&destination)?,
+                dir: destination,
+                revision: Some(fetched.revision.clone()),
+                notes: Vec::new(),
+            }
+        } else {
+            crate::source::accept_skill(&from, &destination, Some(fetched.revision.clone()))?
+        };
+
+        self.lock.upsert(LockedSkill {
+            id: id.clone(),
+            source: source.display.clone(),
+            source_name: Some(source.name.clone()),
+            resolved_ref: source.git_ref.clone(),
+            resolved_revision: Some(fetched.revision.clone()),
+            content_digest: accepted.content_digest,
+            safeguard: SafeguardState::default(),
+        });
+        Ok(true)
+    }
+
+    /// Compare what the lock records against what each ref points at now.
+    ///
+    /// Reads only, and never touches the cache: the whole point is to be able to
+    /// ask "is anything stale" without committing to an update. v0 had no such
+    /// path — `update` always fetched, wiped the install root, and rewrote the lock.
+    pub fn outdated(&self) -> Result<Vec<OutdatedSkill>> {
+        let mut stale = Vec::new();
+        for source in self.remote_sources() {
+            let latest = match crate::source::peek_revision(&source.spec, source.git_ref.as_deref())
+            {
+                Ok(Some(latest)) => latest,
+                Ok(None) => continue,
+                Err(error) => {
+                    stale.push(OutdatedSkill {
+                        source_name: source.name.clone(),
+                        locked: None,
+                        latest: None,
+                        note: Some(error.to_string()),
+                    });
+                    continue;
+                }
+            };
+            let locked = self.locked_revision_for_source(&source.name);
+            if locked.as_deref() != Some(latest.as_str()) {
+                stale.push(OutdatedSkill {
+                    source_name: source.name.clone(),
+                    locked,
+                    latest: Some(latest),
+                    note: None,
+                });
+            }
+        }
+        Ok(stale)
+    }
+
+    /// The remote sources this manifest declares, one entry per source.
+    ///
+    /// Grouped by source so a repository contributing several skills is cloned
+    /// once.
+    fn remote_sources(&self) -> Vec<RemoteSource> {
+        let mut grouped: BTreeMap<String, RemoteSource> = BTreeMap::new();
+
+        for source in &self.manifest.sources {
+            grouped.insert(
+                source.name.clone(),
+                RemoteSource {
+                    name: source.name.clone(),
+                    display: describe(&source.from),
+                    spec: source.from.clone(),
+                    git_ref: source.git_ref.clone(),
+                    skills: match &source.skills {
+                        crate::manifest::SkillSelection::All => None,
+                        crate::manifest::SkillSelection::Explicit(ids) => Some(ids.clone()),
+                    },
+                },
+            );
+        }
+
+        // A [[skill]] naming a remote source directly is its own one-skill source.
+        for skill in &self.manifest.skills {
+            if !requires_fetch(&skill.source) {
+                continue;
+            }
+            grouped
+                .entry(skill.id.to_string())
+                .or_insert_with(|| RemoteSource {
+                    name: skill.id.to_string(),
+                    display: describe(&skill.source),
+                    spec: skill.source.clone(),
+                    git_ref: None,
+                    skills: Some(vec![skill.id.clone()]),
+                });
+        }
+
+        grouped.into_values().collect()
+    }
+
+    /// The revision the lock records for a source, taken from any of its skills.
+    fn locked_revision_for_source(&self, source_name: &str) -> Option<String> {
+        self.lock
+            .skills
+            .iter()
+            .find(|locked| locked.source_name.as_deref() == Some(source_name))
+            .and_then(|locked| locked.resolved_revision.clone())
+    }
+
     /// Resolve, scan, and digest every catalog entry that can be prepared.
     ///
     /// A skill that cannot be prepared is recorded and omitted rather than
@@ -327,6 +516,108 @@ impl Session {
 
     pub fn safeguard_config(&self) -> &SafeguardConfig {
         &self.manifest.safeguard
+    }
+}
+
+/// One remote source, with the skills wanted from it.
+#[derive(Debug, Clone)]
+struct RemoteSource {
+    name: String,
+    /// How to show it to a person.
+    display: String,
+    spec: SourceSpec,
+    git_ref: Option<String>,
+    /// `None` means "whatever the source holds", resolved after fetching.
+    skills: Option<Vec<SkillId>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FetchReport {
+    pub fetched: Vec<SkillId>,
+    /// Sources whose revision was already cached, so nothing was downloaded.
+    pub reused: Vec<String>,
+    /// Skills the source no longer contains, named with the source.
+    ///
+    /// A rename upstream lands here. v0 aborted the whole command instead, which
+    /// is how `update` broke on plan-visualizer becoming visual-explainer.
+    pub missing: Vec<(SkillId, String)>,
+    pub failed: Vec<(String, String)>,
+}
+
+impl FetchReport {
+    pub fn has_problems(&self) -> bool {
+        !self.missing.is_empty() || !self.failed.is_empty()
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (id, source) in &self.missing {
+            lines.push(format!(
+                "warning: source '{source}' no longer contains '{id}'; it may have been \
+                 renamed or removed upstream — update the manifest"
+            ));
+        }
+        for (what, reason) in &self.failed {
+            lines.push(format!("warning: {what} failed: {reason}"));
+        }
+        lines
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutdatedSkill {
+    pub source_name: String,
+    pub locked: Option<String>,
+    pub latest: Option<String>,
+    /// Set when the remote could not be reached.
+    pub note: Option<String>,
+}
+
+/// Every skill directory directly inside a fetched tree.
+///
+/// Used for a wildcard source, whose membership is only knowable once the tree is
+/// on disk. Names that are not usable ids are skipped rather than transliterated.
+fn discover_skills(root: &Path) -> Vec<SkillId> {
+    let mut found = Vec::new();
+
+    // The tree may itself be a single skill, which is what a gist looks like.
+    if let Some(id) = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|_| root.join("SKILL.md").is_file())
+        .and_then(|name| SkillId::parse(name).ok())
+    {
+        found.push(id);
+    }
+
+    for parent in [root.to_path_buf(), root.join("skills")] {
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        let mut entries: Vec<_> = entries.filter_map(|entry| entry.ok()).collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if !entry.path().join("SKILL.md").is_file() {
+                continue;
+            }
+            match SkillId::parse(&entry.file_name().to_string_lossy()) {
+                Ok(id) if !found.contains(&id) => found.push(id),
+                // A directory whose name is not a usable id is skipped rather than
+                // transliterated, and a duplicate is simply already recorded.
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+fn describe(spec: &SourceSpec) -> String {
+    match spec {
+        SourceSpec::Local => "local".to_string(),
+        SourceSpec::Gist(id) => format!("gist:{id}"),
+        SourceSpec::GitHub { owner, repo } => format!("github:{owner}/{repo}"),
+        SourceSpec::Git(url) => url.clone(),
+        SourceSpec::Path(path) => format!("path:{}", path.display()),
     }
 }
 

@@ -118,12 +118,18 @@ fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     // an unattended hook can hang indefinitely on a private repository.
     command
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "/bin/true")
-        .env("SSH_ASKPASS", "/bin/true")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GCM_INTERACTIVE", "never")
         // Keep messages parseable regardless of the user's locale.
         .env("LC_ALL", "C");
+
+    // An askpass helper is what a *graphical* credential prompt comes through, so
+    // pointing it at a no-op closes that path too. Only set when the binary really
+    // exists: `/bin/true` is absent on macOS, and a missing helper makes git print
+    // `cannot exec` noise that buries the real reason a fetch failed.
+    if let Some(no_op) = no_op_binary() {
+        command.env("GIT_ASKPASS", no_op).env("SSH_ASKPASS", no_op);
+    }
 
     let mut child = command
         .spawn()
@@ -178,6 +184,15 @@ fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
             stderr: stderr.trim().to_string(),
         })
     }
+}
+
+/// A binary that exits successfully and prints nothing, if one is where we expect.
+///
+/// `/usr/bin/true` exists on both macOS and Linux; `/bin/true` only on Linux.
+fn no_op_binary() -> Option<&'static str> {
+    ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
 }
 
 /// Resolve a subdirectory within a fetched tree, refusing to leave it.

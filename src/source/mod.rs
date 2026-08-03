@@ -77,16 +77,30 @@ pub fn cache_dir(manifest_root: &Path, source_name: &str, revision: &str) -> Pat
         .join(sanitize_component(revision))
 }
 
-/// Fetch a git-backed source into the cache and return where it landed.
+/// Where a fetch put a source, and which revision it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedSource {
+    /// The tree root, after any subdirectory has been applied.
+    pub root: PathBuf,
+    pub revision: String,
+    /// True when the revision was already cached and nothing was downloaded.
+    pub reused: bool,
+}
+
+/// Fetch a git-backed source into the cache.
 ///
-/// `subdir` is validated before any git command runs.
+/// `pin` selects the revision: `Some` restores exactly that one, which is what
+/// `fetch` does from a lock file, and `None` resolves whatever the ref points at
+/// now, which is what `update` does. `subdir` is validated before any git command
+/// runs.
 pub fn fetch_git(
     manifest_root: &Path,
     source_name: &str,
     spec: &SourceSpec,
     git_ref: Option<&str>,
     subdir: Option<&Path>,
-) -> Result<PathBuf> {
+    pin: Option<&str>,
+) -> Result<FetchedSource> {
     if let Some(subdir) = subdir {
         git::validate_subdir(subdir)?;
     }
@@ -95,18 +109,28 @@ pub fn fetch_git(
         message: "not a git-backed source".to_string(),
     })?;
 
-    // Resolve first so the cache key is known before anything is written, which
-    // is what makes an already-cached revision free.
-    let revision = git::remote_revision(&transport, git_ref)?;
+    // The revision is settled before anything is written, so the cache key is
+    // known up front and an already-present revision costs nothing.
+    let revision = match pin {
+        Some(pin) => pin.to_string(),
+        None => git::remote_revision(&transport, git_ref)?,
+    };
     let destination = cache_dir(manifest_root, source_name, &revision);
     if destination.join(".git").is_dir() {
-        return git::resolve_subdir(&destination, subdir);
+        return Ok(FetchedSource {
+            root: git::resolve_subdir(&destination, subdir)?,
+            revision,
+            reused: true,
+        });
     }
 
     ensure_dir(&destination)?;
     let fetched = git::fetch_into(&transport, Some(&revision), &destination)?;
-    debug_assert_eq!(fetched, revision, "fetched revision should match ls-remote");
-    git::resolve_subdir(&destination, subdir)
+    Ok(FetchedSource {
+        root: git::resolve_subdir(&destination, subdir)?,
+        revision: fetched,
+        reused: false,
+    })
 }
 
 /// Copy one skill directory out of a source tree, checking what it contains.

@@ -166,6 +166,12 @@ enum Command {
     )]
     Migrate(MigrateArgs),
     #[command(
+        about = "Compare the lock against what each remote ref points at now.",
+        long_about = "Requires a skillenv.toml manifest. Reads only: contacts each remote \
+                      with git ls-remote and touches neither the cache nor the lock."
+    )]
+    Outdated,
+    #[command(
         about = "Scan the manifest's skills for hidden instructions and unsafe patterns.",
         long_about = "Requires a skillenv.toml manifest. Reports findings using Snyk's \
                       agent-scan codes and exits non-zero when anything is found."
@@ -300,6 +306,10 @@ struct TargetArgs {
 
 #[derive(Debug, Args)]
 struct ManagedSourceArgs {
+    /// With a manifest: move to whatever each ref points at now, instead of
+    /// restoring the locked revision.
+    #[arg(long)]
+    update: bool,
     #[arg(help = "Managed source names to operate on. Defaults to every recorded source.")]
     names: Vec<String>,
     #[arg(
@@ -427,6 +437,20 @@ fn dispatch_manifest(cli: &Cli) -> Option<skillenv::Result<CommandOutput>> {
             Some(link_manifest_command(args.quiet))
         }
         Command::List => Some(skillenv::list_manifest(".").map(CommandOutput::text)),
+        // Being out of date is a state to report, not a failure, so this exits 0
+        // either way. A CI job that wants to fail on staleness can match the output.
+        Command::Outdated => Some(
+            skillenv::outdated_manifest(".").map(|(stdout, _stale)| CommandOutput::text(stdout)),
+        ),
+        Command::Fetch(args) if skillenv::has_manifest(".") => Some(
+            skillenv::fetch_manifest(".", args.update).map(|(stdout, warnings, problems)| {
+                CommandOutput {
+                    stdout,
+                    warnings,
+                    problems,
+                }
+            }),
+        ),
         Command::Migrate(args) => Some(if args.apply {
             skillenv::apply_migration(".", args.prune).map(CommandOutput::text)
         } else {
@@ -527,6 +551,9 @@ fn run(cli: Cli) -> skillenv::Result<String> {
         // `dispatch_manifest` declined, i.e. there is no skillenv.toml, so the
         // error explains what is missing rather than silently doing nothing.
         Command::Migrate(_) => unreachable!("handled by dispatch_manifest"),
+        Command::Outdated => Err(skillenv::SkillenvError::ManifestNotFound {
+            searched_from: std::path::PathBuf::from("."),
+        }),
         Command::List | Command::Lint => Err(skillenv::SkillenvError::ManifestNotFound {
             searched_from: std::path::PathBuf::from("."),
         }),

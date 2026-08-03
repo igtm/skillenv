@@ -61,6 +61,58 @@ pub fn apply_migration(cwd: impl AsRef<Path>, prune: bool) -> Result<String> {
     Ok(migrate::format_report(&report))
 }
 
+/// Populate the cache for every remote skill the manifest declares.
+///
+/// Without `update`, restores exactly what the lock records — which is what a
+/// fresh clone needs, since the cache is not committed. With it, moves to whatever
+/// each ref points at now.
+pub fn fetch_manifest(cwd: impl AsRef<Path>, update: bool) -> Result<(String, Vec<String>, bool)> {
+    let mut session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let report = session.fetch(update)?;
+    let mut lines = vec![format!(
+        "{} skill(s) cached{}",
+        report.fetched.len(),
+        if report.reused.is_empty() {
+            String::new()
+        } else {
+            format!(", {} source(s) already current", report.reused.len())
+        }
+    )];
+    for id in &report.fetched {
+        lines.push(format!("  {id}"));
+    }
+    Ok((lines.join("\n"), report.warnings(), report.has_problems()))
+}
+
+/// Compare the lock against what each remote ref points at now. Reads only.
+pub fn outdated_manifest(cwd: impl AsRef<Path>) -> Result<(String, bool)> {
+    let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let stale = session.outdated()?;
+    if stale.is_empty() {
+        return Ok(("everything is current".to_string(), false));
+    }
+    let short = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(|revision| revision[..12.min(revision.len())].to_string())
+            .unwrap_or_else(|| "none".to_string())
+    };
+    let mut lines = Vec::new();
+    for entry in &stale {
+        match &entry.note {
+            Some(note) => lines.push(format!("{}: could not check: {note}", entry.source_name)),
+            None => lines.push(format!(
+                "{}: locked {} -> available {}",
+                entry.source_name,
+                short(&entry.locked),
+                short(&entry.latest)
+            )),
+        }
+    }
+    lines.push("run `skillenv fetch --update` to move to these revisions".to_string());
+    Ok((lines.join("\n"), true))
+}
+
 /// Whether a v1 manifest governs `cwd`.
 ///
 /// Callers use this to decide which engine to run. While both exist, a repository
