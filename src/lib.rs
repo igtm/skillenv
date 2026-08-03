@@ -17,8 +17,19 @@ mod manifest;
 mod paths;
 mod remote;
 mod render;
+mod safeguard;
 
 pub use inventory::format_skill_inventory_report;
+pub use safeguard::{Finding, Severity};
+
+/// Scan one `SKILL.md` for hidden instructions and unsafe patterns.
+///
+/// Frontmatter is included on purpose: `description` is loaded eagerly into agent
+/// context while the body is not, which makes it the most valuable place to hide
+/// an instruction.
+pub fn scan_skill_text(text: &str) -> Vec<Finding> {
+    safeguard::scan_text(text)
+}
 use inventory::skill_inventory_with_config;
 use paths::{
     create_symlink, ensure_dir, ensure_layout_dir, ensure_unmanaged_target_absent,

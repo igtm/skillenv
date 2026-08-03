@@ -89,15 +89,31 @@ fn is_legacy_skillenv_description(value: &str) -> bool {
     value.starts_with("[skillenv: ") && value.contains("] repo=")
 }
 
-fn summarize_markdown_body(body: &str) -> Option<String> {
+/// Which lines sit inside a fenced code block.
+///
+/// Shared with `crate::safeguard` deliberately: if the summarizer and the scanner
+/// disagreed about what counts as code, the same text could be prose to one and
+/// code to the other, and an instruction could hide in the gap. The fence line
+/// itself counts as code so a crafted info string is not read as prose.
+pub(crate) fn fenced_lines(text: &str) -> Vec<bool> {
+    let mut flags = Vec::new();
     let mut in_code_block = false;
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("```") {
+    for line in text.lines() {
+        if line.trim().starts_with("```") {
             in_code_block = !in_code_block;
+            flags.push(true);
             continue;
         }
-        if in_code_block
+        flags.push(in_code_block);
+    }
+    flags
+}
+
+fn summarize_markdown_body(body: &str) -> Option<String> {
+    let fenced = fenced_lines(body);
+    for (index, line) in body.lines().enumerate() {
+        let trimmed = line.trim();
+        if fenced.get(index).copied().unwrap_or(false)
             || trimmed.is_empty()
             || trimmed.starts_with('#')
             || trimmed.starts_with("<!--")
