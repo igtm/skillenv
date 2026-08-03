@@ -49,6 +49,18 @@ pub fn plan_migration(cwd: impl AsRef<Path>) -> Result<String> {
     Ok(out)
 }
 
+/// Carry out the conversion `plan_migration` described.
+///
+/// Clears v0's deployments first, while their markers still refer to a layout that
+/// exists, and leaves `skillenv/` in place unless `prune` is set — so the result
+/// can be checked, and undone by deleting two files, before anything is lost.
+pub fn apply_migration(cwd: impl AsRef<Path>, prune: bool) -> Result<String> {
+    let root = fs::canonicalize(cwd.as_ref()).unwrap_or_else(|_| cwd.as_ref().to_path_buf());
+    let plan = migrate::plan(&root, &home_dir()?)?;
+    let report = migrate::apply(&plan, &migrate::ApplyOptions { prune })?;
+    Ok(migrate::format_report(&report))
+}
+
 /// Whether a v1 manifest governs `cwd`.
 ///
 /// Callers use this to decide which engine to run. While both exist, a repository

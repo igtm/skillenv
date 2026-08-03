@@ -164,7 +164,7 @@ enum Command {
                       manifest would carry, the v0 deployments that must be cleared \
                       first, and the proposed manifest itself. Nothing is written."
     )]
-    Migrate,
+    Migrate(MigrateArgs),
     #[command(
         about = "Scan the manifest's skills for hidden instructions and unsafe patterns.",
         long_about = "Requires a skillenv.toml manifest. Reports findings using Snyk's \
@@ -270,6 +270,16 @@ struct ScopeArgs {
     no_claude: bool,
     #[arg(long, help = "Suppress normal output. Useful from shell hooks.")]
     quiet: bool,
+}
+
+#[derive(Debug, Args)]
+struct MigrateArgs {
+    /// Carry out the conversion. Without this, nothing is written.
+    #[arg(long)]
+    apply: bool,
+    /// With --apply, also remove the old skillenv/ layout.
+    #[arg(long, requires = "apply")]
+    prune: bool,
 }
 
 #[derive(Debug, Args)]
@@ -417,7 +427,11 @@ fn dispatch_manifest(cli: &Cli) -> Option<skillenv::Result<CommandOutput>> {
             Some(link_manifest_command(args.quiet))
         }
         Command::List => Some(skillenv::list_manifest(".").map(CommandOutput::text)),
-        Command::Migrate => Some(skillenv::plan_migration(".").map(CommandOutput::text)),
+        Command::Migrate(args) => Some(if args.apply {
+            skillenv::apply_migration(".", args.prune).map(CommandOutput::text)
+        } else {
+            skillenv::plan_migration(".").map(CommandOutput::text)
+        }),
         Command::Lint => {
             Some(
                 skillenv::lint_manifest(".").map(|(stdout, problems)| CommandOutput {
@@ -512,7 +526,7 @@ fn run(cli: Cli) -> skillenv::Result<String> {
         // These only exist against a manifest. Reached only when
         // `dispatch_manifest` declined, i.e. there is no skillenv.toml, so the
         // error explains what is missing rather than silently doing nothing.
-        Command::Migrate => unreachable!("handled by dispatch_manifest"),
+        Command::Migrate(_) => unreachable!("handled by dispatch_manifest"),
         Command::List | Command::Lint => Err(skillenv::SkillenvError::ManifestNotFound {
             searched_from: std::path::PathBuf::from("."),
         }),

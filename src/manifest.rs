@@ -34,9 +34,6 @@ pub(crate) const MANIFEST_FILE: &str = "skillenv.toml";
 /// repository name cannot smuggle an invalid file past us.
 pub(crate) const MAX_SKILL_ID_CHARS: usize = 32;
 
-/// Words an id may not take, because a selector or target would become ambiguous.
-const RESERVED_IDS: &[&str] = &["all", "none", "skillenv", "local", "home", "repo"];
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub version: u32,
@@ -260,11 +257,11 @@ fn validate_skill_id(raw: &str) -> Option<String> {
              name stays within the 64-character cap providers enforce"
         ));
     }
-    if RESERVED_IDS.contains(&raw) {
-        return Some(
-            "is reserved; it would be ambiguous with a selector or target scope".to_string(),
-        );
-    }
+    // No word is reserved. An earlier version reserved "skillenv", "all",
+    // "local", "home", and "repo", and a migration rehearsal against a real setup
+    // showed that rejecting a skill genuinely named `skillenv`. None of them is
+    // ambiguous in practice: the selector wildcard is `*`, a target scope only
+    // appears after a `:`, and "local" only appears in a source position.
     None
 }
 
@@ -801,6 +798,18 @@ allow = ["W012:draft-pr:sha256:abc"]
         assert!(error.contains("explicit ASCII id"), "unexpected: {error}");
     }
 
+    /// No word is reserved. An earlier version reserved "skillenv", "all", "local",
+    /// "home", and "repo", which broke a real skill named `skillenv` during a
+    /// migration rehearsal. None of them is actually ambiguous: the selector
+    /// wildcard is `*`, a target scope only ever appears after a `:`, and "local"
+    /// only appears in a source position.
+    #[test]
+    fn no_word_is_reserved() {
+        for raw in ["skillenv", "all", "none", "local", "home", "repo"] {
+            assert!(SkillId::parse(raw).is_ok(), "{raw:?} should be a usable id");
+        }
+    }
+
     #[test]
     fn rejects_malformed_ids() {
         for (raw, expected) in [
@@ -810,8 +819,6 @@ allow = ["W012:draft-pr:sha256:abc"]
             ("-lead", "start or end"),
             ("trail-", "start or end"),
             ("double--hyphen", "consecutive"),
-            ("all", "reserved"),
-            ("skillenv", "reserved"),
         ] {
             let error = SkillId::parse(raw).unwrap_err().to_string();
             assert!(

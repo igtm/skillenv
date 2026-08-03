@@ -352,6 +352,228 @@ fn tracked_remote_files(root: &Path) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOptions {
+    /// Remove the v0 layout once the conversion is in place.
+    ///
+    /// Off by default: leaving `skillenv/` alone means the conversion can be
+    /// checked, and reverted by deleting two files, before anything is lost.
+    pub prune: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MigrationReport {
+    pub cleared: usize,
+    pub skills_copied: Vec<SkillId>,
+    pub cached: Vec<SkillId>,
+    /// Locked entries that could not be seeded from the v0 tree, so a `fetch` is
+    /// needed before they can deploy.
+    pub needs_fetch: Vec<SkillId>,
+    pub pruned: bool,
+    pub notes: Vec<String>,
+}
+
+/// Carry out a plan.
+///
+/// Order is load-bearing: v0's deployments are cleared first, while their markers
+/// still refer to a layout that exists. Only then is anything relocated.
+pub fn apply(plan: &MigrationPlan, options: &ApplyOptions) -> Result<MigrationReport> {
+    if !plan.can_apply() {
+        return Err(SkillenvError::InvalidManifest {
+            path: plan.root.join(MANIFEST_FILE),
+            message: format!("migration is blocked: {}", plan.blockers.join("; ")),
+        });
+    }
+    let mut report = MigrationReport::default();
+
+    // 1. Clear v0's deployments while their markers can still be matched.
+    for sweep in &plan.legacy {
+        report.cleared += legacy_sweep::remove(sweep)?;
+        for path in &sweep.unmarked {
+            report.notes.push(format!(
+                "left {} in place: it carries the prefix but no marker, so there is no \
+                 evidence skillenv created it",
+                path.display()
+            ));
+        }
+    }
+
+    // 2. Copy local skills into the flat catalog. Copied, not moved, so the v0
+    //    layout stays intact until `--prune`.
+    for skill in &plan.local_skills {
+        let destination = plan.root.join(&skill.to);
+        copy_tree(&skill.from, &destination)?;
+        report.skills_copied.push(skill.id.clone());
+    }
+
+    // 3. Seed the cache from v0's vendored copies, so `link` works offline
+    //    immediately after migrating rather than needing a fetch first.
+    let mut lock = crate::lock::LockFile::default();
+    for source in &plan.sources {
+        for raw_id in &source.skills {
+            let Ok(id) = SkillId::parse(raw_id) else {
+                report
+                    .notes
+                    .push(format!("skipped '{raw_id}': not a usable skill id"));
+                continue;
+            };
+            let Some(revision) = &source.revision else {
+                report.needs_fetch.push(id);
+                continue;
+            };
+            match v0_installed_skill(&plan.root, &source.name, raw_id) {
+                Some(from) => {
+                    let cache = crate::source::cache_dir(&plan.root, &source.name, revision)
+                        .join(id.as_str());
+                    copy_tree(&from, &cache)?;
+                    lock.upsert(crate::lock::LockedSkill {
+                        id: id.clone(),
+                        source: normalize_source(&source.from),
+                        source_name: Some(source.name.clone()),
+                        resolved_ref: source.git_ref.clone(),
+                        resolved_revision: Some(revision.clone()),
+                        content_digest: crate::lock::digest_tree(&cache)?,
+                        safeguard: crate::lock::SafeguardState::default(),
+                    });
+                    report.cached.push(id);
+                }
+                None => report.needs_fetch.push(id),
+            }
+        }
+    }
+
+    // 4. Write the manifest and the lock.
+    let manifest_path = plan.root.join(MANIFEST_FILE);
+    fs::write(&manifest_path, render_manifest(plan)).map_err(|source| {
+        SkillenvError::WriteFile {
+            path: manifest_path,
+            source,
+        }
+    })?;
+    lock.save(&plan.root)?;
+
+    // 5. The cache is generated content and must not be committed.
+    if add_gitignore_entry(&plan.root, ".skillenv/")? {
+        report
+            .notes
+            .push(".gitignore: added .skillenv/ so the cache is not tracked".to_string());
+    }
+
+    if options.prune {
+        let v0 = plan.root.join(V0_DIR);
+        if v0.is_dir() {
+            fs::remove_dir_all(&v0)
+                .map_err(|source| SkillenvError::WriteFile { path: v0, source })?;
+            report.pruned = true;
+        }
+    } else {
+        report.notes.push(format!(
+            "{V0_DIR}/ was left in place; remove it with --prune once the result is \
+             confirmed"
+        ));
+    }
+
+    Ok(report)
+}
+
+/// Where v0 installed one skill of a managed source.
+///
+/// Both scopes are probed independently, since a source may have used either.
+fn v0_installed_skill(root: &Path, source_name: &str, skill: &str) -> Option<PathBuf> {
+    let install_root = root.join(V0_DIR).join("remote").join(source_name);
+    V0_SCOPES
+        .iter()
+        .map(|scope| install_root.join(scope).join(skill))
+        .find(|candidate| candidate.join("SKILL.md").is_file())
+}
+
+/// Copy a directory tree, refusing symlinks rather than following them.
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    crate::paths::ensure_dir(to)?;
+    for entry in walkdir::WalkDir::new(from).follow_links(false) {
+        let entry = entry.map_err(|error| SkillenvError::ReadFile {
+            path: from.to_path_buf(),
+            source: std::io::Error::other(error),
+        })?;
+        let relative =
+            entry
+                .path()
+                .strip_prefix(from)
+                .map_err(|error| SkillenvError::ReadFile {
+                    path: from.to_path_buf(),
+                    source: std::io::Error::other(error),
+                })?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let target = to.join(relative);
+        if entry.file_type().is_dir() {
+            crate::paths::ensure_dir(&target)?;
+            continue;
+        }
+        // A symlink in a v0 tree would be carried into the catalog, where the
+        // acceptance checks refuse them anyway; skipping keeps the copy honest.
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            crate::paths::ensure_dir(parent)?;
+        }
+        fs::copy(entry.path(), &target).map_err(|source| SkillenvError::WriteFile {
+            path: target,
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+/// Append one `.gitignore` line if it is not already there.
+fn add_gitignore_entry(root: &Path, entry: &str) -> Result<bool> {
+    let path = root.join(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == entry) {
+        return Ok(false);
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(entry);
+    updated.push('\n');
+    fs::write(&path, updated).map_err(|source| SkillenvError::WriteFile { path, source })?;
+    Ok(true)
+}
+
+/// Human-readable rendering of what an apply did.
+pub fn format_report(report: &MigrationReport) -> String {
+    let mut lines = vec![format!(
+        "cleared {} v0 deployment(s), copied {} skill(s) into skills/, seeded {} from the \
+         v0 cache",
+        report.cleared,
+        report.skills_copied.len(),
+        report.cached.len()
+    )];
+    if !report.needs_fetch.is_empty() {
+        lines.push(format!(
+            "run `skillenv fetch` for: {}",
+            report
+                .needs_fetch
+                .iter()
+                .map(SkillId::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if report.pruned {
+        lines.push(format!("removed {V0_DIR}/"));
+    }
+    for note in &report.notes {
+        lines.push(format!("  - {note}"));
+    }
+    lines.push("next: `skillenv lint`, then `skillenv link`".to_string());
+    lines.join("\n")
+}
+
 /// Render the manifest this plan describes.
 ///
 /// Written out as text rather than serialized, so the result carries the comments
@@ -524,6 +746,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let slug = repo_slug(root.path());
+        // v0 required a git repository, and a repo-scoped deploy rule still needs
+        // one to resolve a directory.
+        fs::create_dir_all(root.path().join(".git")).unwrap();
 
         for (scope, id, description) in [
             ("default", "draft-pr", "Draft PR を作る"),
@@ -769,6 +994,131 @@ mod tests {
             text.contains("before anything moves"),
             "the ordering guarantee should be visible:\n{text}"
         );
+        Ok(())
+    }
+
+    /// The conversion has to be checkable, not just plausible: the skills
+    /// deployed afterwards must be the same set that was deployed before.
+    #[test]
+    fn applying_reproduces_the_same_skill_set() -> Result<()> {
+        let (root, home) = v0_setup();
+        // Give the managed source a vendored copy, as v0 would have.
+        let installed = root.path().join(V0_DIR).join("remote/kinko/default/kinko");
+        fs::create_dir_all(&installed).unwrap();
+        fs::write(
+            installed.join("SKILL.md"),
+            "---\nname: kinko\ndescription: Stores secrets\n---\n\nBody\n",
+        )
+        .unwrap();
+
+        let before = plan(root.path(), home.path())?;
+        let deployed_before: Vec<String> = before
+            .legacy
+            .iter()
+            .flat_map(|sweep| sweep.entries.iter().map(|entry| entry.skill.clone()))
+            .collect();
+        assert!(!deployed_before.is_empty());
+
+        let report = apply(&before, &ApplyOptions::default())?;
+
+        // v0's deployments are gone, and the catalog is in place.
+        assert_eq!(report.cleared, 2);
+        assert_eq!(report.skills_copied.len(), 2);
+        assert!(root.path().join("skills/draft-pr/SKILL.md").is_file());
+        assert!(root.path().join(MANIFEST_FILE).is_file());
+        assert!(root.path().join("skillenv.lock").is_file());
+
+        // The managed skill was seeded from the v0 tree, so no fetch is required.
+        assert_eq!(report.cached.len(), 1, "{report:?}");
+        assert!(report.needs_fetch.is_empty(), "{report:?}");
+
+        // v0 is untouched until --prune.
+        assert!(root.path().join(V0_DIR).is_dir());
+        assert!(!report.pruned);
+
+        // The cache is generated content, so it must not be tracked.
+        let gitignore = fs::read_to_string(root.path().join(".gitignore")).unwrap();
+        assert!(gitignore.lines().any(|line| line.trim() == ".skillenv/"));
+
+        // And the new engine deploys the same skills, offline.
+        let mut session = crate::session::Session::open(root.path(), home.path().to_path_buf())?;
+        let linked = session.link()?;
+        let deployed_after: Vec<String> = linked
+            .targets
+            .iter()
+            .flat_map(|target| target.written.iter().map(SkillId::to_string))
+            .collect();
+        assert!(
+            deployed_after.contains(&"draft-pr".to_string()),
+            "expected the previously-deployed skill back: {deployed_after:?}"
+        );
+        assert!(
+            deployed_after.contains(&"kinko".to_string()),
+            "the seeded managed skill should deploy without a fetch: {deployed_after:?}"
+        );
+        assert!(linked.unavailable.is_empty(), "{:?}", linked.unavailable);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_removes_the_v0_layout_only_when_asked() -> Result<()> {
+        let (root, home) = v0_setup();
+        let plan = plan(root.path(), home.path())?;
+        let report = apply(&plan, &ApplyOptions { prune: true })?;
+        assert!(report.pruned);
+        assert!(!root.path().join(V0_DIR).exists());
+        Ok(())
+    }
+
+    /// A source with no recorded revision cannot be seeded, so it is named as
+    /// needing a fetch rather than silently omitted.
+    #[test]
+    fn an_unversioned_source_is_reported_as_needing_a_fetch() -> Result<()> {
+        let (root, home) = v0_setup();
+        fs::write(
+            root.path().join(V0_LOCK),
+            serde_json::to_string(&json!({
+                "version": 1,
+                "sources": [{
+                    "name": "local-src",
+                    "source": "../shared",
+                    "kind": "local",
+                    "transport": "/tmp/shared",
+                    "requested_ref": null,
+                    "subdir": null,
+                    "install_root": "skillenv/remote/local-src",
+                    "selected_skills": ["shared-skill"],
+                    "resolved_revision": "unversioned",
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let plan = plan(root.path(), home.path())?;
+        let report = apply(&plan, &ApplyOptions::default())?;
+        assert_eq!(
+            report
+                .needs_fetch
+                .iter()
+                .map(SkillId::to_string)
+                .collect::<Vec<_>>(),
+            vec!["shared-skill"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn applying_a_blocked_plan_is_refused() -> Result<()> {
+        let (root, home) = v0_setup();
+        fs::create_dir_all(root.path().join(V0_DIR).join("profiles/review")).unwrap();
+        let plan = plan(root.path(), home.path())?;
+        let error = apply(&plan, &ApplyOptions::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("blocked"), "unexpected: {error}");
+        // Nothing was written.
+        assert!(!root.path().join(MANIFEST_FILE).exists());
         Ok(())
     }
 
