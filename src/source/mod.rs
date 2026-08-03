@@ -10,7 +10,6 @@
 //!
 //! Nothing calls this yet — the CLI is the first consumer, and this allow goes
 //! away with it.
-#![allow(dead_code)]
 
 mod git;
 
@@ -64,6 +63,11 @@ pub fn peek_revision(spec: &SourceSpec, git_ref: Option<&str>) -> Result<Option<
         Some(transport) => git::remote_revision(&transport, git_ref).map(Some),
         None => Ok(None),
     }
+}
+
+/// The directory every fetched source is cached under.
+pub fn cache_root(manifest_root: &Path) -> PathBuf {
+    manifest_root.join(CACHE_DIR)
 }
 
 /// Directory a revision of a source caches into.
@@ -194,6 +198,15 @@ pub fn accept_skill(
         }
 
         let target = destination.join(relative);
+        // `relative` comes from `strip_prefix` on a walked path, so it should never
+        // climb out. Checked anyway: this is the last point before a write, and the
+        // cost of being wrong here is a file placed outside the cache.
+        if !contains(destination, &target) {
+            return Err(SkillenvError::UnsafeSourceEntry {
+                path: entry.path().to_path_buf(),
+                reason: format!("resolves outside {}", destination.display()),
+            });
+        }
         if metadata.is_dir() {
             ensure_dir(&target)?;
             continue;

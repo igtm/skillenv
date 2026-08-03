@@ -2,64 +2,36 @@
 
 [English README](./README.md)
 
-`skillenv` は、リポジトリ内で管理する AI skill と、外部から導入した managed skill source をまとめて扱い、`.agents/skills` や `.claude/skills` のような agent 向け skill directory にリンクするためのツールです。
+`skillenv` は、agent skill の取得・バージョン管理・展開を 1 つの `skillenv.toml`
+から行うツールです。skill の出どころは自分の `skills/` ディレクトリ、GitHub
+リポジトリ、gist、ローカルパスのいずれかで、展開先は各 agent が読むディレクトリ
+——`.claude/skills`、`.agents/skills`、`$CODEX_HOME/skills`、`.opencode/skills`
+——です。展開時に frontmatter は provider ごとに書き換えられ、すべての skill は
+書き込み前に検査されます。
 
 提供するもの:
 
-- `skillenv/` のひな型と managed `.gitignore` エントリを作る初期化コマンド
-- `default` / `local` / `profile` scope を対象にした repo-local の link / unlink
-- `skillenv.lock.json` で追跡する remote / local の managed source インストール
-- `$HOME/.agents/skills` と `$HOME/.claude/skills` への手動 global link
-- リポジトリ移動時に自動で relink する shell hook
-- 同じ操作を埋め込める Rust ライブラリ
+- 何が存在し、どこから来て、どこへ行くかを宣言する、手書きの manifest 1 つ
+- 各 source の解決結果を記録する lock ファイル（別マシンで同じ状態を再現するため）
+- provider ごとの frontmatter（公式バリデータ同士で許可キーが一致しないため）
+- Snyk `agent-scan` のコード体系による、skill の供給経路検査
+- リポジトリ移動時に relink する shell hook
+- 同じ操作を呼び出せる Rust ライブラリ
 
-現在のバージョンは `0.3.1` です。
+現在のバージョンは `1.0.0` です。
 
-## 2 つのレイアウト
+## 1.0 は破壊的リリースです
 
-skillenv には 2 世代あり、**`skillenv.toml` があるかどうか**でどちらが動くかが決まります。旧レイアウトのままのリポジトリは、これまでと変わらず動きます。
+v0 のレイアウト——`skillenv/{default,local,profiles}/` でディレクトリとして scope
+を表現し、`skillenv.lock.json` を使い、その上に `add` / `update` / `global` を
+載せていたもの——は**もう動きません**。skill を対象に動くコマンドはすべて
+`skillenv.toml` を読み、無ければ
+`no skillenv.toml found from <dir> upwards; create one or set SKILLENV_MANIFEST`
+で停止します。
 
-**v1 — `skillenv.toml`。** 1 つの manifest に、どの skill がどこから来てどこへ行くかをすべて宣言します。skill の名前空間は平坦で、frontmatter は provider ごとに書き換えられ、source には gist を含められ、展開前にすべての skill が検査されます。
-
-**v0 — `skillenv/{default,local,profiles}/`。** scope をディレクトリで表現します。この節より下はすべて v0 の説明で、移行していないリポジトリでは現在も正確です。
-
-### 移行する
-
-1 段階目は何も書き込みません。
-
-```bash
-skillenv migrate           # 計画を表示するだけ。読み取り専用
-skillenv migrate --apply   # 実行する（旧 skillenv/ は残す）
-skillenv migrate --prune   # 結果を確認してから、旧 skillenv/ を削除
-```
-
-`--apply` は `skillenv/` を残し、v0 の vendored コピーから新しい cache を種付けするので、直後にネットワーク無しで `link` が通ります。取り消したいときは `skillenv.toml` と `skillenv.lock` を削除してください。
-
-推測はしません。`profiles/` が使われている場合、あるいは `default/` と `local/` に同じ id がある場合は、勝手にまとめずに名前を挙げて移行を止めます。
-
-### v1 のコマンド
-
-```bash
-skillenv list             # 宣言されている skill を source・label つきで一覧
-skillenv lint             # frontmatter の妥当性と安全性検査
-skillenv link             # 展開する
-skillenv outdated         # lock と remote を比較する。読み取り専用
-skillenv fetch            # lock の revision で cache を復元する
-skillenv fetch --update   # remote の最新に移動する
-```
-
-新しいマシンでは `fetch` が必要です。cache は git 管理外なので、clone 直後は manifest と lock だけがあります。
-
-`link` は **`--quiet` でも**警告を stderr に出し、問題があれば非 0 で終了します。shell hook が実行するのはこの形なので、展開できなかった skill が無音になることはありません。
-
-### v1 で加わるもの
-
-- **平坦な skill 名前空間。** 全 source 横断で id が一意。大文字小文字を区別せず比較するので、case-insensitive なファイルシステムで「書き込み時にだけ現れる衝突」が起きません。
-- **provider ごとの frontmatter。** 実機にある 2 つの公式バリデータは許可キーが異なり（Claude は `compatibility` を受け、Codex は拒否）、`allowed-tools` には互換性のない 4 種の書式が実在します。provider が受け付けないキーは黙って捨てず報告し、Codex には `agents/openai.yaml` サイドカーを出します。
-- **`codex` は `$CODEX_HOME/skills` に解決される。** v0 は `.agents/skills` を Codex の宛先として扱っていましたが、あのディレクトリは多くの tool が読む Agent Skills open standard であり、独立した `agents` provider になりました。
-- **安全性検査を既定で有効化。** skill は agent の文脈に直接読み込まれる指示文です。隠し Unicode による命令の埋め込み、注入的な言い回し、資格情報の持ち出しを Snyk の `agent-scan` コード体系で検出し、`critical` は展開をブロックします。ブロックされた skill は削除もされません — そうしないと、上流を乗っ取った側が意図的に検査を踏ませて skill を消せてしまいます。
-- **非破壊の陳腐化チェック。** `outdated` は `git ls-remote` を使い、cache も lock も触りません。
-- **失敗は skill 単位。** 壊れた `SKILL.md` 1 つが他を止めることはなく、全体を止めるのは systemic な I/O 障害だけです。
+**移行していないリポジトリでは `skillenv migrate --apply` の実行が必要です。**
+旧レイアウトを理解するのは `migrate` だけです。詳細は
+[v0 から移行する](#v0-から移行する)を参照してください。
 
 ## インストール
 
@@ -78,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 バージョンを指定する場合:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v0.3.1
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v1.0.0
 ```
 
 Cargo で GitHub からインストールする場合:
@@ -93,428 +65,485 @@ cargo install --git https://github.com/igtm/skillenv.git --locked
 cargo install --path . --locked
 ```
 
-## クイックスタート
+## はじめかた
 
-まず、対象リポジトリごとに 1 回だけ初期化します。
-
-```bash
-cd my-repo
-skillenv init
-```
-
-repo-local の skill は次のように配置します。
+1. manifest を置きたい場所——通常は dotfiles リポジトリ——で `skillenv init` を 1 回だけ実行する
+2. skill、その source、展開先を `skillenv.toml` に宣言する
+3. `skillenv fetch` で cache を用意し、`skillenv link` で展開する
+4. 上流が動いたかは `skillenv outdated`、新しい素材を信用する前には `skillenv lint`
 
 ```text
-skillenv/
-  default/
-    review/SKILL.md
-  local/
-    private-helper/SKILL.md
-  profiles/
-    migration/
-      schema-audit/SKILL.md
+skillenv.toml            手で書く唯一のファイル
+skillenv.lock            各 source の解決結果。commit する
+skills/<name>/SKILL.md   自分で書く skill
+.skillenv/cache/         取得した source。commit しない
 ```
 
-`default` と `local` を link します。
+manifest を読むコマンドは、作業ディレクトリから上に向かって manifest を探します。
+manifest があるリポジトリの任意のサブディレクトリから実行できます。
+`SKILLENV_MANIFEST` にファイルパスを与えると、その探索を上書きできます。
 
-```bash
-skillenv link
+`skillenv init` は `.gitignore` にも次の行を加えます。cache と生成ディレクトリを
+`git status` に出さないためです。
+
+```text
+.skillenv/
+.agents/skills/skillenv-*
+.claude/skills/skillenv-*
+.opencode/skills/skillenv-*
 ```
 
-必要な profile だけ link する場合:
+既存の `skillenv.toml` は決して上書きしません。手で書く入力はこのファイルだけ
+なので、テンプレートで置き換えると設定全体が失われます。また `init` は何も展開
+しません。skill を宣言したら `skillenv link` を実行してください。
+
+## コマンド
 
 ```bash
-skillenv link --profile migration
-```
-
-managed source を追加して relink する場合:
-
-```bash
-skillenv add vercel-labs/agent-skills --skill frontend-design
-```
-
-別マシンで `skillenv.lock.json` から復元する場合:
-
-```bash
-skillenv fetch
-```
-
-インストール済み CLI のバージョン確認:
-
-```bash
-skillenv version
-skillenv --version
-```
-
-## 使い方
-
-バイナリ名は `skillenv` です。
-
-```bash
-skillenv init [--claude|--no-claude]
-skillenv link [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
-skillenv unlink [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
-skillenv status [--claude|--no-claude]
-skillenv skills [--tool <claude|codex|opencode|antigravity>...] [--repo-tree] [--json]
+skillenv init
+skillenv link [--quiet]
+skillenv unlink [--quiet]
+skillenv status
+skillenv list
+skillenv remove <name>
+skillenv migrate [--apply] [--prune]
+skillenv outdated
+skillenv lint
+skillenv fetch [--update]
+skillenv skills [--tool <claude|codex|opencode|antigravity>]... [--repo-tree] [--json]
 skillenv doctor [--json]
-skillenv add <source> [--skill <slug>...] [--into <dir>] [--ref <ref>] [--name <source-name>] [--claude|--no-claude]
-skillenv fetch [<managed-source>...] [--claude|--no-claude]
-skillenv update [<managed-source>...] [--claude|--no-claude]
-skillenv global link [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
-skillenv global unlink [--profile <name>...] [--all] [--claude|--no-claude] [--quiet]
-skillenv global status [--claude|--no-claude]
 skillenv hook <zsh|bash>
 skillenv version
 ```
 
-## コマンドの整理
+`skillenv <command> --help` で、同じ理由づけをより詳しく読めます。
 
-### Repo-local の初期化と linking
+### link と unlink
 
-- `skillenv init`: repo-local の `skillenv/` layout と managed `.gitignore` エントリを作成
-- `skillenv link`: デフォルトで `default/` と `local/` を生成
-- `skillenv link --profile <name>`: 指定した profile scope だけを link
-- `skillenv link --all`: 見つかった全 scope を link
-- `skillenv unlink`: 対象 scope の generated link を削除
-- `skillenv status`: repo-local target の状態を確認
+`link` は、各 `[[deploy]]` ルールが選んだ skill を、そのルールが名指しした
+ディレクトリへ展開します。同じディレクトリに解決したルールは選択を**合併**します。
+そうしないと、2 つのルールが毎回互いの成果を消し合うことになります。`when.repo`
+付きのルールはそのリポジトリの中でだけ効きます。これがあるので、ディレクトリ移動
+フックから実行する意味が出ます。
 
-### Skill inventory
+失敗は skill 単位です。`SKILL.md` の不正、名前の衝突、safeguard による保留は、
+報告してその skill を skip するだけで、残りは展開されます。全体を止めるのは
+systemic な I/O 障害だけです。
 
-- `skillenv skills`: Codex / Claude Code / OpenCode / Antigravity から現在見えている custom skill を列挙
-- `skillenv skills --tool codex --tool opencode`: 対象 tool を絞って表示
-- `skillenv skills --repo-tree`: 現在は見えていない nested tool dir も repo inventory として追加
-- `skillenv skills --json`: 安定した機械可読 JSON を出力
+警告は stderr に出て、問題があれば**`--quiet` でも**終了コードが非 0 になります。
+shell hook が実行するのはこの形なので、展開できなかった skill がそこで無音に
+なってはいけません。
 
-### Diagnostics
+`unlink` が削除するのは、marker がこの manifest を指しているディレクトリだけです。
+`skillenv-` の prefix を持つが marker が無いもの、あるいは別の manifest の marker
+を持つものは、報告してそのまま残します。
 
-- `skillenv doctor`: config path、解決済み source root、managed source metadata、repo/global target 状態を詳細表示
-- `skillenv doctor --json`: 同じ診断情報を JSON で出力
+### status
 
-### Managed source
+この manifest が展開先とする各ディレクトリについて、`skillenv-` で始まる
+ディレクトリをすべて報告します。別の manifest のものや、prefix はあるが marker が
+無いものも含みます。それらは決して削除しません——marker が無ければ skillenv が
+作った証拠が無いからです——し、隠すと件数が `ls` と食い違います。
 
-- `skillenv add`: GitHub shorthand、Git URL、または local checkout path から managed source を導入
-- `skillenv fetch`: `skillenv.lock.json` の lock 内容から managed install root を復元
-- `skillenv update`: `skillenv.lock.json` に記録された managed source を更新
+ルールが選んでいるのにディスク上に無い skill は、名前を挙げて報告します。よくある
+原因は cache を取得していないことです。
 
-### Global target
+### fetch
 
-- `skillenv global link`: 現在のリポジトリを `$HOME/.agents/skills` と必要なら `$HOME/.claude/skills` に手動 link
-- `skillenv global unlink`: 現在のリポジトリに属する generated entry だけを global target から削除
-- `skillenv global status`: global target の状態を確認
+manifest が宣言する remote source について `.skillenv/cache/` を用意します。
 
-### Shell hook
+`--update` なしのときは、`skillenv.lock` が記録している revision をそのまま復元
+します。clone 直後に必要なのはこれです。cache は commit しないので、新しいマシンに
+あるのは manifest と lock だけです。`--update` を付けると、各 ref が今指している
+ものへ移動し、lock を書き換えます。何が動くかは先に `skillenv outdated` で見て
+ください。
 
-- `skillenv hook zsh`: `add-zsh-hook` を使う `zsh` hook を出力
-- `skillenv hook bash`: `PROMPT_COMMAND` を使う `bash` hook を出力
+lock は最後に 1 回ではなく source ごとに保存します。途中で到達できない source が
+あっても、インストール済みのツリーと記録された revision が食い違った状態を残さない
+ためです。
 
-### バージョン表示
+取得するツリーには 500 ファイル、1 ファイル 2 MiB、合計 16 MiB の上限があります。
+敵対的な source や、事故で巨大になった source が、ディスクを埋めたり shell hook を
+止めたりしないようにするためです。`.git` と `.DS_Store` は決してコピーしません。
 
-- `skillenv version`: インストール済み `skillenv` のバージョンを表示
-- `skillenv --version`: 短い標準形式
+### outdated
 
-## Repository Layout
+読み取り専用です。各 remote に `git ls-remote` で問い合わせるだけで、cache も lock
+も触りません。古いことは失敗ではなく状態なので、どちらでも終了コードは 0 です。
+陳腐化で落としたい CI は出力を突き合わせてください。
 
-repo-local source は次の layout を使います。
+### lint
 
-```text
-skillenv/
-  default/
-    <skill-name>/SKILL.md
-  local/
-    <skill-name>/SKILL.md
-  profiles/
-    <profile-name>/
-      <skill-name>/SKILL.md
-  remote/
-    <source-name>/
-      ...
+宣言されている skill をすべて検査し、何か見つかれば非 0 で終了します。`link` も
+同じ検査を実行して critical でブロックするので、`lint` は展開前にそれを見るための
+コマンドです。frontmatter がパースできない場合——skill が展開されない最も多い原因
+——も報告し、`SKILL.md` が無い場合は `W014 [low]` として報告します。
+
+### remove
+
+`skillenv.toml` をその場で編集し、コメントと残るエントリの順序をすべて保ったまま、
+続けて relink して、消したエントリのディレクトリも一緒に片付けます。`[[source]]`
+を名指しすると、その source が持ち込んだ skill すべてが消えます。
+
+manifest を先に編集してから relink します。逆順だと、relink がまだエントリを見て
+しまい、出ていく途中でもう一度展開してしまいます。
+
+### skills
+
+「ここから、この tool には実際どの custom skill が見えているのか」に答えます。
+managed かどうかは問いません。この manifest が置いたものを知りたいときは
+`skillenv status` を使ってください。
+
+探索先:
+
+- `codex`: 現在の repo の `.agents/skills`、`$HOME/.agents/skills`、`/etc/codex/skills`
+- `claude`: 現在の repo の `.claude/skills`、`$HOME/.claude/skills`
+- `opencode`: 現在の repo の `.opencode/skills`、`.claude/skills`、`.agents/skills`、および `$HOME` 側の global パス
+- `antigravity`: repo ルートの `.agents/skills`、旧 `.agent/skills`、`$HOME/.gemini/antigravity/skills`
+
+既定では作業ディレクトリから見えているものを報告します。`--repo-tree` を付けると、
+今は見えていないネストした tool ディレクトリも repo 全体から拾います。`--json` は
+安定した機械可読の報告を出します。
+
+### doctor
+
+`status` が「何が展開されているか」に答えるのに対し、`doctor` は「なぜそこへ行った
+のか」に答えます。報告する内容は、このディレクトリを支配している `skillenv.toml`
+と解決されたリポジトリ、home ディレクトリと cache パスおよび cache 済み source 数、
+manifest が宣言する skill 数と deploy ルール数に対する lock の記録数、そして解決
+された各 target とその provider・展開数です。`--json` で同じ内容を安定した形で
+出せます。
+
+## skillenv.toml
+
+```toml
+[skillenv]
+version = 1
+
+# 自作の skill: skills/<name>/SKILL.md を読む
+[[skill]]
+name = "japanese-tech-writing"
+source = "local"
+labels = ["writing"]
+
+# gist には frontmatter が無いので、description をここで補う
+[[skill]]
+name = "jp-writing-upstream"
+source = "gist:fd287c3133457c4fd8f5601d34aa817d"
+description = "日本語技術文書の文章規範"
+labels = ["writing"]
+
+# 1 つの source から複数の skill
+[[source]]
+name = "igtm-skills"
+from = "github:igtm/skills"
+ref = "main"
+skills = ["user-context"]   # "*" にすると、その source の全 skill に追従する
+labels = ["tools"]
+
+# どこへ展開するか
+[[deploy]]
+target = "claude:home"           # ~/.claude/skills
+include = ["*"]
+
+[[deploy]]
+target = "claude:repo"           # 実行中のリポジトリの .claude/skills
+include = ["writing"]
+exclude = ["jp-writing-upstream"]
+when.repo = "~/tmp/kaijin-web"   # このリポジトリでだけ有効
+
+[safeguard]
+on_critical = "block"            # 既定
+on_high = "warn"
+allow = ["W012:figma-to-code:sha256:abc123…"]
 ```
 
-生成された skill は次に link されます。
+`version` は `1` でなければなりません。`[skillenv]` テーブル自体を省略した場合も
+同じ意味になります。ファイル中のどこであれ、未知のキーは無視ではなくエラーです。
 
-- デフォルトでは `.agents/skills`
-- config または CLI flag で有効なら `.claude/skills`
+### source の書き方
 
-`skillenv init` が作るのは `default/`, `local/`, `profiles/` です。`remote/` は `skillenv add` を実行したときに必要に応じて作られます。
+| 形式 | 意味 |
+|---|---|
+| `local` | manifest と同じ場所の `skills/<name>/` |
+| `gist:<id>` | gist。他と同じく git リポジトリとして clone する |
+| `github:owner/repo` | GitHub。末尾の `.git` は許容する |
+| `path:../shared` | このマシン上のパス |
+| `git@…` / `ssh://…` / `https://…` / `.git` で終わる文字列 | そのまま git remote として渡す |
 
-## 命名規則
+取得したツリーの中では、ルート自身、`<id>/`、`skills/<id>/`、
+`.agents/skills/<id>/` の順に skill を探します。実際に存在するレイアウトを
+カバーするためです。
 
-`skillenv` は repository 名、profile 名、skill 名、managed source 名を kebab-case に正規化します。
+source 自身が frontmatter を持たない場合、`description` は必須です。provider は
+いずれも description を要求します。典型例は gist です。
 
-- 英字は小文字化
-- ASCII の英数字はそのまま利用
-- それ以外の連続文字は `-` に変換
-- 先頭末尾の `-` は削除
+### target と provider
 
-例:
+target は `<provider>:<scope>` 形式です。scope は `home`（`$HOME` 配下。マシン上の
+全リポジトリで共有）か `repo`（link 対象のリポジトリ）です。
 
-- `My Repo` -> `my-repo`
-- `Review Helpers` -> `review-helpers`
-- `frontend_design` -> `frontend-design`
+| provider | ディレクトリ |
+|---|---|
+| `claude` | `.claude/skills` |
+| `agents` | `.agents/skills` |
+| `codex` | `$CODEX_HOME/skills`（既定 `~/.codex/skills`） |
+| `opencode` | `.opencode/skills` |
 
-生成される output 名は次の規則です。
+**`.agents/skills` は Codex の宛先ではありません。** これは多くの tool が読む
+Agent Skills open standard のディレクトリで、だからこそ独立した provider です。
+Codex 自身が読むのは `$CODEX_HOME/skills` です。`codex:repo` はリポジトリ内の
+`.codex/skills` に解決されます。
 
-- repo-local target: `skillenv-<repo-slug>-<scope>-<skill-slug>`
-- global target: `skillenv-<repo-slug>-g<path-hash>-<scope>-<skill-slug>`
-- profile scope は status では `profile:<name>`、generated name では `profile-<name>`
+opencode は `.claude/skills` と `.agents/skills` も読みます。したがって opencode
+へ直接展開する意味があるのは、その skill を opencode にだけ見せ、それらの
+ディレクトリを共有する他の tool には見せたくない場合です。
 
-例:
+すべての tool に共通するキーは `name` と `description` だけなので、frontmatter は
+provider ごとに書き換えます。Claude・`agents`・opencode は `license`、
+`allowed-tools`、`metadata`、`compatibility` を受け付けます。Codex のバリデータは
+`compatibility` を拒否するので、黙って捨てるのではなく、落としたキーとして報告
+します。`allowed-tools` は取り込み時に正規化します——スペース区切りの文字列、
+カンマ区切りの文字列、inline sequence、block sequence の 4 形式が実在する skill に
+現れます——そのうえで Claude・`agents`・Codex にはスペース区切りの文字列、opencode
+には sequence として書き出します。
 
-- `skillenv-my-repo-default-review`
-- `skillenv-my-repo-local-private-helper`
-- `skillenv-my-repo-profile-migration-schema-audit`
-- `skillenv-my-repo-g2f9d13e4c1ab-default-review`
+Codex にはさらに `agents/openai.yaml` サイドカーを出し、`metadata` の表示系キー
+——`short-description`、`display-name`、`brand-color`——を `interface` 以下へ移します。
+frontmatter は `name` と `description` に限り、product 固有の設定はサイドカーに置く
+（agent ではなく harness が読む設定として）というのが Codex 自身の指針なので、これ
+らのキーは捨てずにそこへ回します。入れるものが無い skill にはサイドカーを作りません。
 
-## `init` の詳細
+複数の provider が同じディレクトリに解決した場合は、許可キーが最も少ない provider
+の形で書き出します。そうすればどの provider から見ても妥当な出力になります。
 
-repo-local output を使うリポジトリでは、最初に 1 回 `skillenv init` を実行します。
+### deploy ルール
+
+`include` は必須です。include が無いルールは何も展開しないので、意図したルールと
+いうより壊れたルールに見えます。全 skill を意味するときは `include = ["*"]` と
+書いてください。`exclude` は `include` を上書きします。`*` 以外の selector は
+skill の label と id の両方に一致するので、1 つの skill を指すために label を
+作る必要はありません。
+
+`when.repo` はルールを 1 つのリポジトリに限定します。`~` は展開され、末尾の `/**`
+はサブツリーに一致するので、`when.repo = "~/work/**"` は `~/work` 以下すべてを
+覆います。省略は「すべてのリポジトリ」で、`home` target では通常こちらです。
+
+### skill の id
+
+- `[a-z0-9-]` のみ、32 文字以内、先頭・末尾・連続のハイフン不可
+- **非 ASCII は自動変換せずエラー**にします。v0 は名前を slugifier に通して非 ASCII
+  を削り、代わりの語を当てていたため、名前の異なる日本語の skill 2 つが黙って同じ
+  id になりました。`skillenv.toml` で明示的な ASCII の id を付けてください
+- 大文字小文字を区別せず一意。macOS は既定で case-insensitive なので、素朴な一意性
+  検査を通った `Foo` と `foo` がディスク上で衝突します
+- 予約語はありません。selector の wildcard は `*`、target の scope は `:` の後にしか
+  現れず、`local` は source の位置にしか現れないので、どれも曖昧ではありません
+  ——実際、これらを予約していた過去の版は `skillenv` という名前の実在の skill を
+  壊しました
+
+32 文字という上限があるのは、provider が frontmatter の `name` を 64 文字までしか
+受け付けず、展開後の名前が `skillenv-<repo>-g<hash>-<id>` になるからです。この上限は
+早い段階で気づくための静的な見積もりで、prefix はリポジトリ名の長さで伸びるため
+厳密にはなりません。`link` は実際の生成名を測り、それでも超えるものは skip します。
+
+### `skills = "*"` と明示リスト
+
+`"*"` は source が持つものに追従する指定で、解決結果は `skillenv.lock` に記録される
+ので再現性は保たれます。明示リストは固定で、上流から消えた名前は全体の失敗ではなく
+その skill だけの報告になります。
+
+## safeguard
+
+skill は他人のリポジトリから取ってきた、実行される指示文です。つまりここは
+サプライチェーンです。検出コードは独自体系ではなく Snyk `agent-scan` の分類に
+揃えてあり、既存のスキャナと突き合わせられます。frontmatter も本文と一緒に検査
+します。`description` は agent の文脈へ先に読み込まれる一方で本文はそうではなく、
+指示を隠すのに最も効く場所だからです。
+
+| code | 内容 | 既定の severity |
+|---|---|---|
+| E004 | 文脈にある指示を上書きする命令 | critical |
+| E005 | ダウンロードを shell に直接パイプ | high |
+| E006 | 秘密情報を読んでどこかへ渡す指示 | critical |
+| W007 | 秘密情報を読む指示（渡し先は不明） | high |
+| W008 | 資格情報リテラルの埋め込み | high |
+| W012 | 実行時に外部 URL から指示を取得 | high |
+| W021 | 不可視 Unicode | medium。構築されたものに見える場合は critical |
+
+`[safeguard]` で severity ごとに `block` / `warn` / `allow` を割り当てます。既定は
+`on_critical = "block"`、残りは `warn` です。設定しなかった severity は緩くなるの
+ではなく既定のままになります。
+
+判定は語彙ではなく**指示の形**で行います。ここで難しいのは検出そのものではなく、
+既に使っている正当な skill で発火しないことです。秘密管理の skill は `.env` を
+何度も挙げ、Figma の skill は `127.0.0.1` から取得し `curl … | sh` を説明し、PR の
+skill は `gh pr create` を実行します。これらがブロックされれば機能ごと切られてしまい、
+それは機能が無いより悪い結果です。ですから、秘密のパスを挙げるのは文書であり、それを
+読んで返答に含めろと言うのが findings です。fenced code block 内の検出は severity
+が下がり、loopback ホストは外部の指示源として扱いません。
+
+W021 も文字種ではなく構造で判定します。Unicode Tags（`U+E0000`–`U+E007F`）の連続、
+zero-width によるステガノグラフィ、閉じていない bidi override を、連続長・混在した
+種類の数・デコード可能性で評価し、デコードできた場合は隠されていた文面を findings に
+出します。絵文字の joiner、`U+3000`、`U+00A0` では発火しません。
+
+ブロックされた skill は**展開されず、既存の展開も削除されません**。そうでないと、
+上流を乗っ取った側が意図的に検査を踏ませて skill を消せてしまいます。
+
+`allow` の書式は `<code>:<skill>:<digest>` で、digest は必須です。レビューした内容が
+変わった時点で抑制が失効するようにするためです。
+
+## 何が書き込まれるか
+
+展開された skill は、repo target では `skillenv-<repo>-<id>`、`$HOME` 配下では
+`skillenv-<repo>-g<hash>-<id>` というディレクトリになります。`<repo>` は manifest
+ディレクトリ名を slug 化したもの、`<hash>` はその正規化パスの sha256 の先頭 12 桁
+です。hash があるのは、`$HOME` がマシン上の全リポジトリで共有される一方、削除は
+名前の prefix を手がかりにしているからです。これが無ければ、あるリポジトリの
+`link` が別のリポジトリのエントリを消してしまいます。
+
+各ディレクトリには `.skillenv-generated.json`（marker）が入り、どの manifest の
+ものか、skill、provider、revision、content digest を記録します。**marker は
+skillenv が作ったことの唯一の証拠**なので、marker が無いディレクトリは削除されず、
+報告されるだけです。手で置いたものは安全です。
+
+`link` は marker を `SKILL.md` の生成や asset のコピーより**先に**書きます。v0 は
+最後に書いていたため、frontmatter のパースに失敗した skill は asset だけがあって
+marker が無いディレクトリを残し、以降のすべての実行がそこに触るのを拒否しました。
+打ち間違い 1 つで、ある環境が 6 週間凍りついたままになりました。
+
+`SKILL.md` はコピーではなく生成します。frontmatter に生成名と provider が受け付ける
+キーを載せるためです。skill ディレクトリの他のファイルはそのままコピーされます。
+
+## v0 から移行する
+
+1 段階目は何も書き込みません。
 
 ```bash
-skillenv init
-skillenv init --claude
+skillenv migrate           # 計画を表示するだけ。読み取り専用
+skillenv migrate --apply   # 実行する（旧 skillenv/ は残す）
+skillenv migrate --prune   # 結果を確認してから、旧 skillenv/ を削除
 ```
 
-このコマンドが行うこと:
+`migrate` が報告するのは、v1 manifest に載る skill・source・deploy ルール、先に
+片付ける必要がある v0 の展開、そして生成予定の `skillenv.toml` 全文です。deploy
+ルールは**実際にディスク上に展開されているものから推定**します。その記録は v0 の
+marker しか持っておらず、変換はその marker を壊すので、読み直す機会は二度と
+ありません。
 
-- `skillenv/default/`, `skillenv/local/`, `skillenv/profiles/` を不足時に作成
-- generated target 用に必要な managed `skillenv` エントリを `.gitignore` に追加
-- skill の link 自体は実行しない
+`--apply` は、marker がまだ存在するレイアウトを指している状態で v0 の展開を片付け、
+続いて v0 の vendored コピーから新しい cache を種付けします。だから直後に
+ネットワーク無しで `link` が通ります。旧 `skillenv/` は残るので、結果を確認してから
+`--prune` してください。それより前に取り消したいだけなら、`skillenv.toml` と
+`skillenv.lock` を削除すれば戻ります。
 
-このコマンドが行わないこと:
+移行は推測せず、理由を名指しして止まります。
 
-- global の `$HOME/.agents/skills` や `$HOME/.claude/skills` の作成
-- remote source のインストール
-- shell startup file の編集
+| 条件 | 理由 |
+|---|---|
+| `profiles/` が使われている | profile を label に対応付けるのは推測になるので、手で宣言してもらう |
+| `default/` と `local/` に同じ id がある | 平坦な名前空間では共存できない |
+| `skillenv.toml` が既にある | 移行済み |
+| `skillenv/` が無い、または中身が無い | 移行するものが無い |
 
-repo-local の `link`, `add`, `fetch`, `update`, shell hook を使う前に `skillenv init` を実行してください。`$HOME` 配下の global target は固定 path を使うため、`init` は不要です。
+source は `"*"` ではなく**明示リスト**として移行します。v0 は「全件追従」と「手書きの
+列挙」を同じフィールドに記録していたので両者を区別できず、`"*"` を選ぶと、その
+source が今提供している skill 全部が未レビューで入ってきます。追従したいものだけ
+手で書き換えてください。
 
-## Skill Inventory
+`skillenv/remote` が git 追跡されていた場合、`migrate` は
+`git rm -r --cached skillenv/remote` の実行を促します。`.gitignore` のエントリだけ
+ではファイルの追跡は外れません。
 
-`skillenv skills` は、「`skillenv` が何を link したか」ではなく「この場所から各 tool が実際にどの custom skill を見に行くか」を確認したいときに使います。
+## shell hook
 
-```bash
-skillenv skills
-skillenv skills --tool codex
-skillenv skills --tool claude --repo-tree
-skillenv skills --json
-```
+`skillenv` はディレクトリ移動時に relink できます。
 
-レポートには次を含みます。
-
-- 対象 tool と scope
-- 可視な skill 名と directory path
-- `skillenv` 管理物らしいかどうか
-- `repo:default`、`repo:profile:review`、`external:shared`、`managed:vercel` のような由来
-- `duplicate-visible`、`shadowed`、`legacy`、frontmatter 不正、`SKILL.md` 欠落などの warning
-
-`--repo-tree` を付けると、通常の current discovery を残したまま、repo 全体の nested tool dir inventory を追加します。Claude Code の nested `.claude/skills` は `nested-on-demand`、それ以外の追加 entry は `repo-tree-only` と表示されます。
-
-## Doctor
-
-`status` では情報が足りないときは `skillenv doctor` を使います。設定と source の配線をまとめて確認できます。
-
-```bash
-skillenv doctor
-skillenv doctor --json
-```
-
-レポートには次を含みます。
-
-- repo root と `HOME`
-- config file path と存在有無
-- 有効 target と default strategy
-- config から解決した external source directory
-- `skillenv.lock.json` の managed source metadata。元の source と transport URL も含みます
-- repo-local / global target の状態
-
-## Managed Source
-
-generated link と managed install root を ignore した状態にしたいので、先に `skillenv init` を実行してください。
-
-GitHub repo shorthand を追加する場合:
-
-```bash
-skillenv add vercel-labs/agent-skills
-```
-
-特定の skill だけ追加する場合:
-
-```bash
-skillenv add vercel-labs/agent-skills --skill frontend-design
-```
-
-ref を固定し、custom な managed directory に入れる場合:
-
-```bash
-skillenv add vercel-labs/agent-skills --ref main --into skillenv/remote/vercel
-```
-
-GitHub URL や local checkout から追加する場合:
-
-```bash
-skillenv add https://github.com/vercel-labs/agent-skills
-skillenv add ../agent-skills-local --name local-pack
-```
-
-`skillenv.lock.json` に記録された lock 済み revision をそのまま復元する場合:
-
-```bash
-skillenv fetch
-```
-
-指定した source だけ復元する場合:
-
-```bash
-skillenv fetch vercel local-pack
-```
-
-`skillenv.lock.json` に記録された全 source を更新する場合:
-
-```bash
-skillenv update
-```
-
-指定した source だけ更新する場合:
-
-```bash
-skillenv update vercel local-pack
-```
-
-別マシンで今の lock をそのまま再現したいときは `fetch`、最新 revision に進めて lock を書き換えたいときは `update` を使います。
-
-## Global Target
-
-global target は固定です。
-
-- `$HOME/.agents/skills`
-- `$HOME/.claude/skills`
-
-これらのコマンドは手動運用向けです。`skillenv init` は不要で、`.gitignore` も編集せず、repo-local の `skillenv/default`, `skillenv/local`, `skillenv/profiles` も作成しません。
-
-```bash
-skillenv global link
-skillenv global link --claude
-skillenv global unlink --all
-skillenv global status
-```
-
-global の generated name には repository path の安定 hash が入るため、basename が同じ別 repository と衝突しません。
-
-## Shell Setup
-
-ディレクトリ移動時に自動で relink したい場合は shell hook を使います。
-
-`zsh` の場合は `~/.zshrc` に追加します。
+`zsh` では `~/.zshrc` に次を追加します。
 
 ```bash
 eval "$(skillenv hook zsh)"
 ```
 
-`bash` の場合は `~/.bashrc` または `~/.bash_profile` に追加します。
+`bash` では `~/.bashrc` または `~/.bash_profile` に次を追加します。
 
 ```bash
 eval "$(skillenv hook bash)"
 ```
 
-`$HOME/.local/bin` のような custom directory に入れた場合は、hook を設定する前にその directory が `PATH` に入っていることを確認してください。
+zsh 側は `add-zsh-hook chpwd`、bash 側は `PROMPT_COMMAND` を使い、リポジトリルートが
+変わったときだけ動きます。どちらも実行するのは `skillenv link --quiet` だけで、
+`.gitignore` は触りません。`$HOME/.local/bin` のような場所へインストールした場合は、
+hook を入れる前にそのディレクトリを `PATH` に入れてください。
 
-shell hook が実行するのは `skillenv link --quiet` だけで、`.gitignore` は編集しません。
+## lock ファイル
 
-## Lock File
+`skillenv.lock` は manifest ルートに置かれる JSON です。`skillenv.toml` が*意図*を
+記録するのに対し、lock はその*解決結果*を記録します。skill ごとに、書かれたままの
+source、持ち込んだ `[[source]]`、解決された ref と revision、取得したツリーの digest、
+そして safeguard の findings とそれを算出した digest を持ちます。digest を持つので、
+revision が動いていなくても内容の変化に気づけ、古い findings は信用せず再検査します。
 
-remote source と managed local source は repository root の `skillenv.lock.json` に記録されます。
+このファイルは commit してください。clone 直後にあるのは manifest と lock だけで、
+`skillenv fetch` はそこから cache を作り直します。エントリは id 順に並ぶので diff に
+出るのは実際の変更だけです。将来のバージョンが書いた lock は、黙って劣化させるのでは
+なく拒否します。
 
-各 entry には次が入ります。
+## ライブラリとして使う
 
-- logical source name
-- requested source と optional ref
-- managed install root
-- selected skill slug
-- 現在 install されている resolved revision
-
-複数マシンで同じ skill set を再現したい場合は、この file を commit してください。
-
-別マシンでは、最初に `skillenv init` を実行してから `skillenv fetch` を実行すると、lock file から managed install root を再作成できます。Git source は lock 済み revision で復元されます。local path source は、その path が対象マシンにも存在する場合だけ復元できます。
-
-## Config
-
-global config は `~/.config/skillenv/config.toml` にあります。
-
-現在サポートしている key:
-
-```toml
-[targets]
-agents = true
-claude = false
-
-[defaults]
-strategy = "render" # or "symlink"
-
-[[external_sources]]
-name = "shared"
-path = "/path/to/skills"
-```
-
-古い `[gitignore].auto_update` 設定は `0.1.1` 以降無視されます。repo-local ignore の管理には `skillenv init` を使ってください。
-
-## バージョニング
-
-`skillenv` は `Cargo.toml` の crate version を CLI version と release version に使います。
-
-- `skillenv version` でインストール済み version を表示
-- `skillenv --version` でも同じ値を表示
-- GitHub Release の tag は `vX.Y.Z`
-
-## Library Usage
-
-`skillenv` は Rust ライブラリとしても使えます。
+`skillenv` は Rust ライブラリでもあります。
 
 ```rust
 use skillenv::{
-    add_source, init_repo, link_global, link_repo, status_global, status_repo,
-    AddSourceOptions, InitOptions, LinkOptions, ScopeSelector, StatusOptions, TargetOverride,
+    LinkReport, format_link_manifest_report, has_manifest, link_manifest, scan_skill_text,
 };
 
-let init_report = init_repo(".", InitOptions::default())?;
+if has_manifest(".") {
+    let report: LinkReport = link_manifest(".")?;
+    print!("{}", format_link_manifest_report(&report));
+    for warning in report.warnings() {
+        eprintln!("{warning}");
+    }
+    if report.has_problems() {
+        // 終了コードに反映する
+    }
+}
 
-let add_report = add_source(
-    ".",
-    AddSourceOptions {
-        source: "vercel-labs/agent-skills".to_string(),
-        into: None,
-        skills: vec!["frontend-design".to_string()],
-        ref_name: None,
-        name: Some("vercel".to_string()),
-        claude: TargetOverride::UseConfig,
-    },
-)?;
-
-let link_report = link_repo(
-    ".",
-    LinkOptions {
-        selector: ScopeSelector::DefaultLocal,
-        claude: TargetOverride::UseConfig,
-        quiet: false,
-    },
-)?;
-
-let status = status_repo(".", StatusOptions::default())?;
-
-let global_link_report = link_global(".", LinkOptions::default())?;
-let global_status = status_global(".", StatusOptions::default())?;
+// SKILL.md 単体を検査する
+for finding in scan_skill_text(&text) {
+    if finding.blocks_by_default() {
+        // 既定の policy では展開されない
+    }
+}
 ```
 
-主な exported flow:
+公開している操作:
 
-- `init_repo`: repo-local layout と `.gitignore` entry の作成
-- `link_repo` / `unlink_repo`: generated skill の反映と削除
-- `status_repo`: linked 状態の確認
-- `link_global` / `unlink_global` / `status_global`: `$HOME` 配下の global target を手動操作
-- `hook_script`: shell hook の生成
-- `add_source`: managed source の install と lock
-- `update_sources`: lock 済み source の更新
+- `init_manifest`、`has_manifest`
+- `link_manifest`、`unlink_manifest`、`status_manifest`、`format_link_manifest_report`、`format_status_manifest_report`
+- `list_manifest`、`lint_manifest`、`remove_from_manifest`
+- `fetch_manifest`、`outdated_manifest`
+- `doctor_manifest`
+- `plan_migration`、`apply_migration`、`prune_legacy_layout`、`sweep_legacy`、`remove_legacy`
+- `scan_skill_text`（`Vec<Finding>` を返す）
+- `skill_inventory`、`format_skill_inventory_report`
+- `hook_script`
 
-正確な API surface は [src/lib.rs](./src/lib.rs) と [src/remote.rs](./src/remote.rs) を参照してください。
+正確な API surface は [src/lib.rs](./src/lib.rs) を参照してください。crate 内部では、
+`src/manifest.rs` がパースと id 検証、`src/lock.rs` が lock と content digest、
+`src/catalog.rs` が平坦な名前空間、`src/provider/` が provider 別 frontmatter と
+target 解決、`src/source/` が取得、`src/deploy.rs` が書き込みと marker、
+`src/safeguard/` が検査を持ち、`src/session.rs` がそれらを組み立てます。
+
+## バージョニング
+
+`skillenv` は `Cargo.toml` の crate バージョンを、CLI のバージョンとリリース
+バージョンの両方に使います。
+
+- `skillenv version` はインストール済みのバージョンを表示します
+- `skillenv --version` も同じ値を表示します
+- GitHub Release のタグは `vX.Y.Z` です
 
 ## 開発
 
@@ -529,9 +558,11 @@ sh -n install.sh
 
 ## リリース自動化
 
-GitHub Actions は pull request と `main` への push で CI を実行します。pull request の merge も GitHub 上では `main` への push になるため、release workflow が実行されます。
+GitHub Actions は pull request と `main` への push で CI を実行します。pull request
+の merge も `main` への push になるため、release workflow が実行されます。
 
-release workflow は `Cargo.toml` の `version` を読み取り、`vX.Y.Z` の GitHub Release を作成または更新し、以下のクロスビルド成果物をアップロードします。
+release workflow は `Cargo.toml` の `version` を読み取り、`vX.Y.Z` の GitHub Release
+を作成または更新し、以下のクロスビルド成果物をアップロードします。
 
 - `skillenv_vX.Y.Z_x86_64-unknown-linux-gnu.tar.gz`
 - `skillenv_vX.Y.Z_aarch64-unknown-linux-gnu.tar.gz`

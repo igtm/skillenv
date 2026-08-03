@@ -5,16 +5,12 @@
 //! so it is its own provider and the lowest common denominator: it carries only
 //! what the published specification defines.
 
-use super::{Provider, ProviderId, ToolsStyle};
+use super::{Provider, ToolsStyle};
 use crate::manifest::TargetScope;
 
 pub(super) struct Agents;
 
 impl Provider for Agents {
-    fn id(&self) -> ProviderId {
-        ProviderId::Agents
-    }
-
     fn relative_root(&self, _scope: TargetScope) -> &'static str {
         ".agents/skills"
     }

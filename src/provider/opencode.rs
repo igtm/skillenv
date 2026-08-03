@@ -4,16 +4,12 @@
 //! directly is only needed when a skill should be visible to opencode and not to
 //! the tools sharing those directories.
 
-use super::{Provider, ProviderId, ToolsStyle};
+use super::{Provider, ToolsStyle};
 use crate::manifest::TargetScope;
 
 pub(super) struct Opencode;
 
 impl Provider for Opencode {
-    fn id(&self) -> ProviderId {
-        ProviderId::Opencode
-    }
-
     fn relative_root(&self, _scope: TargetScope) -> &'static str {
         ".opencode/skills"
     }

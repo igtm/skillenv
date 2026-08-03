@@ -20,7 +20,6 @@
 //!
 //! Nothing reads a lock yet — `source` and `deploy` become the first consumers,
 //! and this allow goes away with them.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fs;

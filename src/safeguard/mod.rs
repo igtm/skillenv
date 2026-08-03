@@ -10,7 +10,6 @@
 //!
 //! Nothing calls this yet — `source` scans on fetch and `deploy` consults the
 //! cached verdict, and this allow goes away with them.
-#![allow(dead_code)]
 
 mod patterns;
 mod unicode;
@@ -97,6 +96,10 @@ pub struct Verdict {
 }
 
 impl Verdict {
+    // Only the tests read these; the code paths that need a verdict look at
+    // `blocked` and `findings` directly.
+    #![allow(dead_code)]
+
     /// Whether anything at all needs reporting.
     pub fn is_clean(&self) -> bool {
         self.findings.is_empty()

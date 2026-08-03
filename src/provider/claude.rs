@@ -5,16 +5,12 @@
 //! 'metadata', 'compatibility'}`. Unknown keys are rejected outright, so anything
 //! outside that set has to be dropped rather than passed through.
 
-use super::{Provider, ProviderId, ToolsStyle};
+use super::{Provider, ToolsStyle};
 use crate::manifest::TargetScope;
 
 pub(super) struct Claude;
 
 impl Provider for Claude {
-    fn id(&self) -> ProviderId {
-        ProviderId::Claude
-    }
-
     fn relative_root(&self, _scope: TargetScope) -> &'static str {
         ".claude/skills"
     }

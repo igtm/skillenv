@@ -1,14 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
 mod catalog;
@@ -110,6 +106,324 @@ pub fn outdated_manifest(cwd: impl AsRef<Path>) -> Result<(String, bool)> {
     }
     lines.push("run `skillenv fetch --update` to move to these revisions".to_string());
     Ok((lines.join("\n"), true))
+}
+
+/// Lines `init` keeps in `.gitignore`.
+///
+/// The cache is not committed, and a repository that is itself a deploy target
+/// would otherwise show every generated directory as untracked.
+const V1_GITIGNORE: &[&str] = &[
+    ".skillenv/",
+    ".agents/skills/skillenv-*",
+    ".claude/skills/skillenv-*",
+    ".opencode/skills/skillenv-*",
+];
+
+/// The manifest `init` writes when there is none.
+const MANIFEST_TEMPLATE: &str = r#"[skillenv]
+version = 1
+
+# Your own skills live in skills/<name>/SKILL.md.
+# [[skill]]
+# name = "my-skill"
+# source = "local"
+# labels = ["writing"]
+
+# A source can contribute several skills. Use skills = "*" to follow all of them.
+# [[source]]
+# name = "upstream"
+# from = "github:owner/repo"
+# skills = ["one", "two"]
+
+# Where the skills go. Scope is "home" ($HOME) or "repo" (whatever repository
+# you are standing in), and `when.repo` limits a rule to one of them.
+[[deploy]]
+target = "claude:home"
+include = ["*"]
+"#;
+
+/// Create the v1 layout: a manifest, a place for your own skills, and the
+/// `.gitignore` lines that keep the generated output out of the way.
+///
+/// Never overwrites an existing manifest — that file is the only hand-written
+/// input, so replacing it with a template would discard the whole configuration.
+pub fn init_manifest(cwd: impl AsRef<Path>) -> Result<String> {
+    let root = fs::canonicalize(cwd.as_ref()).unwrap_or_else(|_| cwd.as_ref().to_path_buf());
+    let manifest_path = root.join(manifest::MANIFEST_FILE);
+    let mut lines = Vec::new();
+
+    if manifest_path.is_file() {
+        lines.push(format!("{} already exists", manifest::MANIFEST_FILE));
+    } else {
+        fs::write(&manifest_path, MANIFEST_TEMPLATE).map_err(|source| {
+            SkillenvError::WriteFile {
+                path: manifest_path.clone(),
+                source,
+            }
+        })?;
+        lines.push(format!("created {}", manifest::MANIFEST_FILE));
+    }
+
+    let skills = root.join("skills");
+    if !skills.is_dir() {
+        fs::create_dir_all(&skills).map_err(|source| SkillenvError::WriteFile {
+            path: skills.clone(),
+            source,
+        })?;
+        lines.push("created skills/".to_string());
+    }
+
+    if append_gitignore(&root, V1_GITIGNORE)? {
+        lines.push(".gitignore updated".to_string());
+    }
+
+    Ok(lines.join("\n"))
+}
+
+/// Add any of `patterns` that are missing, leaving the rest of the file alone.
+fn append_gitignore(root: &Path, patterns: &[&str]) -> Result<bool> {
+    let path = root.join(".gitignore");
+    let existing = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(SkillenvError::ReadFile {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
+
+    let missing: Vec<&str> = patterns
+        .iter()
+        .copied()
+        .filter(|pattern| !existing.lines().any(|line| line.trim() == *pattern))
+        .collect();
+    if missing.is_empty() {
+        return Ok(false);
+    }
+
+    let mut contents = existing;
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    contents.push_str("# skillenv\n");
+    for pattern in missing {
+        contents.push_str(pattern);
+        contents.push('\n');
+    }
+    fs::write(&path, contents).map_err(|source| SkillenvError::WriteFile { path, source })?;
+    Ok(true)
+}
+
+/// Everything about how this invocation resolved: which manifest, which cache,
+/// which targets. Reads only.
+///
+/// Deliberately broader than `status`. `status` answers "what is deployed"; this
+/// answers "why did it go there", which is the question when a `link` deploys
+/// somewhere unexpected or nowhere at all.
+pub fn doctor_manifest(cwd: impl AsRef<Path>, json: bool) -> Result<String> {
+    let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let status = session.status()?;
+    let cache = source::cache_root(&session.root);
+    let cached = count_cached_sources(&cache);
+
+    if json {
+        let value = serde_json::json!({
+            "manifest": session.root.join(manifest::MANIFEST_FILE),
+            "root": session.root,
+            "repo_root": session.repo_root,
+            "home": session.home,
+            "cache": { "path": cache, "sources": cached },
+            "lock": { "skills": session.lock.skills.len() },
+            "catalog": {
+                "skills": session.catalog.entries.len(),
+                "deploy_rules": session.catalog.deploys.len(),
+            },
+            "targets": status.targets.iter().map(|target| serde_json::json!({
+                "path": target.path,
+                "provider": target.provider,
+                "manifest_id": target.manifest_id,
+                "deployed": target.ours(),
+                "missing": target.missing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        return serde_json::to_string_pretty(&value).map_err(|source| {
+            SkillenvError::SerializeLock {
+                path: PathBuf::from("stdout"),
+                source,
+            }
+        });
+    }
+
+    let mut lines = vec![
+        format!(
+            "manifest: {}",
+            session.root.join(manifest::MANIFEST_FILE).display()
+        ),
+        format!(
+            "repo: {}",
+            session
+                .repo_root
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none — repo-scoped rules will not apply".to_string())
+        ),
+        format!("home: {}", session.home.display()),
+        format!("cache: {} ({cached} source(s))", cache.display()),
+        format!(
+            "declared: {} skill(s), {} deploy rule(s); lock records {}",
+            session.catalog.entries.len(),
+            session.catalog.deploys.len(),
+            session.lock.skills.len()
+        ),
+    ];
+    lines.push("targets:".to_string());
+    if status.targets.is_empty() {
+        lines.push("  none — no deploy rule applies from here".to_string());
+    }
+    for target in &status.targets {
+        lines.push(format!(
+            "  {} [{}] {} deployed{}",
+            target.path.display(),
+            target.provider,
+            target.ours(),
+            if target.missing.is_empty() {
+                String::new()
+            } else {
+                format!(", {} missing", target.missing.len())
+            }
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// How many source directories the cache holds. Absent cache counts as zero
+/// rather than an error: a fresh clone has none, and that is the normal state.
+fn count_cached_sources(cache: &Path) -> usize {
+    fs::read_dir(cache)
+        .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+        .unwrap_or(0)
+}
+
+/// Report what the manifest governing `cwd` has deployed. Reads only.
+pub fn status_manifest(cwd: impl AsRef<Path>) -> Result<(String, bool)> {
+    let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let report = session.status()?;
+    Ok((
+        format_status_manifest_report(&report),
+        report.has_problems(),
+    ))
+}
+
+pub fn format_status_manifest_report(report: &session::StatusReport) -> String {
+    if report.targets.is_empty() {
+        return "no deploy rules apply here".to_string();
+    }
+    let mut lines = Vec::new();
+    for target in &report.targets {
+        lines.push(format!(
+            "{} [{}] {} deployed",
+            target.path.display(),
+            target.provider,
+            target.ours()
+        ));
+        for entry in &target.entries {
+            let detail = match &entry.ownership {
+                session::Ownership::Ours => match &entry.revision {
+                    Some(revision) => format!(" @{}", &revision[..12.min(revision.len())]),
+                    None => String::new(),
+                },
+                session::Ownership::OtherManifest(id) => format!(" (manifest {id})"),
+                session::Ownership::Unmanaged => " (no marker, left alone)".to_string(),
+            };
+            lines.push(format!(
+                "  {}{}",
+                entry.skill.as_deref().unwrap_or(&entry.dir_name),
+                detail
+            ));
+        }
+        for id in &target.missing {
+            lines.push(format!("  {id}: selected but not deployed"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Drop a `[[skill]]` or `[[source]]` entry from the manifest, forget it in the
+/// lock, and clear whatever it had deployed.
+///
+/// The order matters. The manifest is edited first so the re-link that follows sees
+/// the entry gone and removes its directories; doing it the other way round would
+/// deploy it again on the way out. v0 had no removal at all — a lock entry could
+/// only be taken out by hand, and its deployments were then orphaned.
+///
+/// Not transactional: if saving the lock or the re-link fails after the manifest has
+/// been rewritten, the manifest and the deployed state disagree until the next
+/// `link`, which then reconciles them. Left that way deliberately — `link` is
+/// already the operation that makes the two agree, so a rollback here would add a
+/// second recovery path to keep correct.
+pub fn remove_from_manifest(cwd: impl AsRef<Path>, name: &str) -> Result<RemoveReport> {
+    let mut session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let manifest_path = session.root.join(manifest::MANIFEST_FILE);
+    let kind = manifest::remove_entry(&manifest_path, name)?;
+
+    match kind {
+        // Here `name` is the skill's own id.
+        manifest::RemovedKind::Skill => {
+            if let Ok(id) = manifest::SkillId::parse(name) {
+                session.lock.remove(&id);
+            }
+        }
+        // Here it is a source's label, which is a *different* namespace: id
+        // uniqueness is only checked between skill ids, so a source may share a
+        // name with a skill some other source contributes. Matching on the id
+        // would then delete that unrelated skill's lock entry, and the relink
+        // below would take its directory with it.
+        manifest::RemovedKind::Source => session
+            .lock
+            .skills
+            .retain(|skill| skill.source_name.as_deref() != Some(name)),
+    }
+    session.lock.save(&session.root)?;
+
+    // Reopened so the re-link reads the edited manifest rather than the copy this
+    // session parsed before the edit.
+    let mut session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let report = session.link()?;
+    let cleared: usize = report
+        .targets
+        .iter()
+        .map(|target| target.removed.len())
+        .sum();
+    let label = match kind {
+        manifest::RemovedKind::Skill => "skill",
+        manifest::RemovedKind::Source => "source",
+    };
+    Ok(RemoveReport {
+        summary: format!("removed {label} {name}; {cleared} deployment(s) cleared"),
+        warnings: report.warnings(),
+        // The relink can block a skill or skip one. Every other command turns that
+        // into a non-zero exit; discarding it here would make `skillenv remove` the
+        // one place a scripted caller could not tell that something went wrong.
+        problems: report.has_problems(),
+    })
+}
+
+/// What a removal did, and whether anything needs a human's attention.
+pub struct RemoveReport {
+    pub summary: String,
+    pub warnings: Vec<String>,
+    pub problems: bool,
+}
+
+/// Remove every deployment belonging to the manifest governing `cwd`.
+pub fn unlink_manifest(cwd: impl AsRef<Path>) -> Result<LinkReport> {
+    let mut session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    session.unlink()
 }
 
 /// Remove the v0 layout from an already-migrated repository.
@@ -271,145 +585,12 @@ pub fn scan_skill_text(text: &str) -> Vec<Finding> {
     safeguard::scan_text(text)
 }
 use inventory::take_inventory;
-use paths::{
-    create_symlink, ensure_dir, ensure_layout_dir, ensure_unmanaged_target_absent,
-    marker_source_matches_known_root, normalize_path, repo_slug, short_path_digest, slugify_or,
-    stable_global_repo_root, symlink_targets_known_root,
-};
-use render::{copy_source_tree, parse_frontmatter, render_skill_markdown};
+use paths::normalize_path;
+use render::parse_frontmatter;
 
 const GENERATED_MARKER_FILE: &str = ".skillenv-generated.json";
-const REPO_LAYOUT_DIR: &str = "skillenv";
-const DEFAULT_SCOPE_DIR: &str = "default";
-const LOCAL_SCOPE_DIR: &str = "local";
-const PROFILES_SCOPE_DIR: &str = "profiles";
 
 pub type Result<T> = std::result::Result<T, SkillenvError>;
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-pub struct Config {
-    pub targets: TargetsConfig,
-    // Legacy no-op field retained for backward-compatible config parsing.
-    pub gitignore: GitignoreConfig,
-    pub defaults: DefaultsConfig,
-    pub external_sources: Vec<ExternalSourceConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct TargetsConfig {
-    pub agents: bool,
-    pub claude: bool,
-}
-
-impl Default for TargetsConfig {
-    fn default() -> Self {
-        Self {
-            agents: true,
-            claude: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-// Legacy no-op config retained for backward-compatible parsing.
-pub struct GitignoreConfig {
-    pub auto_update: bool,
-}
-
-impl Default for GitignoreConfig {
-    fn default() -> Self {
-        Self { auto_update: true }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct DefaultsConfig {
-    pub strategy: Strategy,
-}
-
-impl Default for DefaultsConfig {
-    fn default() -> Self {
-        Self {
-            strategy: Strategy::Render,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ExternalSourceConfig {
-    pub name: String,
-    pub path: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Strategy {
-    Render,
-    Symlink,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScopeSelector {
-    DefaultLocal,
-    Profiles(Vec<String>),
-    All,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TargetOverride {
-    #[default]
-    UseConfig,
-    ForceEnabled,
-    ForceDisabled,
-}
-
-#[derive(Debug, Clone)]
-pub struct LinkOptions {
-    pub selector: ScopeSelector,
-    pub claude: TargetOverride,
-    pub quiet: bool,
-}
-
-impl Default for LinkOptions {
-    fn default() -> Self {
-        Self {
-            selector: ScopeSelector::DefaultLocal,
-            claude: TargetOverride::UseConfig,
-            quiet: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct UnlinkOptions {
-    pub selector: ScopeSelector,
-    pub claude: TargetOverride,
-    pub quiet: bool,
-}
-
-impl Default for UnlinkOptions {
-    fn default() -> Self {
-        Self {
-            selector: ScopeSelector::DefaultLocal,
-            claude: TargetOverride::UseConfig,
-            quiet: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct StatusOptions {
-    pub claude: TargetOverride,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct InitOptions {
-    pub claude: TargetOverride,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
@@ -446,9 +627,6 @@ pub struct SkillInventoryOptions {
     pub tools: Vec<SkillInventoryTool>,
     pub repo_tree: bool,
 }
-
-#[derive(Debug, Clone, Default)]
-pub struct DoctorOptions;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillInventoryMode {
@@ -502,137 +680,6 @@ pub struct SkillInventoryEntry {
     pub skillenv_managed: bool,
     pub skillenv_origin: String,
     pub status: Vec<SkillInventoryStatus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorReport {
-    pub repo_root: Option<PathBuf>,
-    pub home_dir: Option<PathBuf>,
-    pub config_path: Option<PathBuf>,
-    pub config_exists: bool,
-    pub repo_initialized: Option<bool>,
-    pub config: DoctorConfigReport,
-    pub source_roots: Vec<DoctorSourceRoot>,
-    pub external_sources: Vec<DoctorExternalSource>,
-    pub managed_sources: Vec<DoctorManagedSource>,
-    pub repo_targets: Vec<DoctorTargetReport>,
-    pub global_targets: Vec<DoctorTargetReport>,
-    pub notes: Vec<String>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorConfigReport {
-    pub targets_agents: bool,
-    pub targets_claude: bool,
-    pub strategy: Strategy,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorSourceRoot {
-    pub origin: String,
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorExternalSource {
-    pub name: String,
-    pub configured_path: String,
-    pub resolved_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorManagedSource {
-    pub name: String,
-    pub kind: String,
-    pub source: String,
-    pub transport: String,
-    pub requested_ref: Option<String>,
-    pub subdir: Option<String>,
-    pub install_root: PathBuf,
-    pub selected_skills: Vec<String>,
-    pub resolved_revision: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DoctorTargetState {
-    #[serde(rename = "linked")]
-    Linked,
-    #[serde(rename = "not-linked")]
-    NotLinked,
-    #[serde(rename = "disabled")]
-    Disabled,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoctorTargetReport {
-    pub label: String,
-    pub path: Option<PathBuf>,
-    pub state: DoctorTargetState,
-    pub managed_count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct Report {
-    pub repo_root: Option<PathBuf>,
-    pub repo_slug: Option<String>,
-    pub strategy: Option<Strategy>,
-    pub touched_scopes: Vec<String>,
-    pub target_reports: Vec<TargetReport>,
-    pub gitignore_updated: bool,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TargetReport {
-    pub kind: TargetKind,
-    pub path: Option<PathBuf>,
-    pub linked: usize,
-    pub removed: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct StatusReport {
-    pub repo_root: Option<PathBuf>,
-    pub repo_slug: Option<String>,
-    pub target_statuses: Vec<TargetStatus>,
-}
-
-#[derive(Debug, Clone)]
-pub struct InitReport {
-    pub repo_root: PathBuf,
-    pub created_dirs: Vec<PathBuf>,
-    pub gitignore_updated: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct TargetStatus {
-    pub kind: TargetKind,
-    pub path: Option<PathBuf>,
-    pub state: LinkState,
-    pub managed_count: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkState {
-    Linked,
-    NotLinked,
-    Disabled,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TargetKind {
-    Agents,
-    Claude,
-}
-
-impl TargetKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Agents => ".agents/skills",
-            Self::Claude => ".claude/skills",
-        }
-    }
 }
 
 #[derive(Debug, Error)]
@@ -763,121 +810,13 @@ pub enum SkillenvError {
     UnsupportedShell(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum ScopeKey {
-    Default,
-    Local,
-    Profile(String),
-}
-
-impl ScopeKey {
-    fn selector_names(selector: &ScopeSelector) -> Vec<Self> {
-        match selector {
-            ScopeSelector::DefaultLocal => vec![Self::Default, Self::Local],
-            ScopeSelector::Profiles(names) => names
-                .iter()
-                .map(|name| Self::Profile(slugify_or(name, "profile")))
-                .collect(),
-            ScopeSelector::All => Vec::new(),
-        }
-    }
-
-    fn display_name(&self) -> String {
-        match self {
-            Self::Default => "default".to_string(),
-            Self::Local => "local".to_string(),
-            Self::Profile(name) => format!("profile:{name}"),
-        }
-    }
-
-    fn context_path(&self) -> String {
-        match self {
-            Self::Default => "default".to_string(),
-            Self::Local => "local".to_string(),
-            Self::Profile(name) => format!("profiles/{name}"),
-        }
-    }
-
-    fn generated_segment(&self) -> String {
-        match self {
-            Self::Default => "default".to_string(),
-            Self::Local => "local".to_string(),
-            Self::Profile(name) => format!("profile-{name}"),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Discovery {
-    sources: BTreeMap<ScopeKey, Vec<SkillSource>>,
-    known_source_roots: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-struct SkillSource {
-    scope_origin: PathBuf,
-    skill_slug: String,
-    dir: PathBuf,
-    #[cfg_attr(not(test), allow(dead_code))]
-    origin_label: String,
-}
-
-#[derive(Debug, Clone)]
-struct TargetSpec {
-    kind: TargetKind,
-    path: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetRootMode {
-    RepoLocal,
-    Global,
-}
-
-#[derive(Debug, Clone)]
-struct GeneratedNameLayout {
-    repo_slug: String,
-    prefix: String,
-}
-
-impl GeneratedNameLayout {
-    fn for_mode(repo_root: &Path, mode: TargetRootMode) -> Self {
-        match mode {
-            TargetRootMode::RepoLocal => {
-                let repo_slug = repo_slug(repo_root);
-                let prefix = format!("skillenv-{repo_slug}-");
-                Self { repo_slug, prefix }
-            }
-            TargetRootMode::Global => {
-                let stable_root = stable_global_repo_root(repo_root);
-                let repo_slug = repo_slug(&stable_root);
-                let hash = short_path_digest(&stable_root);
-                let prefix = format!("skillenv-{repo_slug}-g{hash}-");
-                Self { repo_slug, prefix }
-            }
-        }
-    }
-
-    fn generated_name(&self, scope: &ScopeKey, skill_slug: &str) -> String {
-        format!("{}{}-{skill_slug}", self.prefix, scope.generated_segment())
-    }
-
-    fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    fn scope_prefix(&self, scope: &str) -> String {
-        format!("{}{}-", self.prefix, scope_segment_from_display(scope))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct LoadedConfig {
-    config: Config,
-    path: Option<PathBuf>,
-    base_dir: Option<PathBuf>,
-}
-
+/// A v0 marker, as the inventory still finds them on disk.
+///
+/// Frozen: v0 wrote these and nothing writes them now, so the shape is whatever
+/// v0 produced. `strategy` is a string rather than an enum for the same reason
+/// [`legacy_sweep`] keeps it one — a value this code does not recognise must not
+/// turn a readable marker into an unreadable one, since an unreadable marker means
+/// the directory can never be identified as generated and so is never cleaned up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GeneratedMarker {
     repo: String,
@@ -885,41 +824,7 @@ struct GeneratedMarker {
     skill: String,
     generated_name: String,
     source: String,
-    strategy: Strategy,
-}
-
-#[derive(Debug, Clone)]
-enum ScopeFilter {
-    AllCurrentRepo,
-    Exact(BTreeSet<String>),
-}
-
-pub fn link_repo(cwd: impl AsRef<Path>, options: LinkOptions) -> Result<Report> {
-    link_with_config(cwd.as_ref(), &options, None, TargetRootMode::RepoLocal)
-}
-
-pub fn link_global(cwd: impl AsRef<Path>, options: LinkOptions) -> Result<Report> {
-    link_with_config(cwd.as_ref(), &options, None, TargetRootMode::Global)
-}
-
-pub fn unlink_repo(cwd: impl AsRef<Path>, options: UnlinkOptions) -> Result<Report> {
-    unlink_with_config(cwd.as_ref(), &options, None, TargetRootMode::RepoLocal)
-}
-
-pub fn unlink_global(cwd: impl AsRef<Path>, options: UnlinkOptions) -> Result<Report> {
-    unlink_with_config(cwd.as_ref(), &options, None, TargetRootMode::Global)
-}
-
-pub fn status_repo(cwd: impl AsRef<Path>, options: StatusOptions) -> Result<StatusReport> {
-    status_with_config(cwd.as_ref(), &options, None, TargetRootMode::RepoLocal)
-}
-
-pub fn status_global(cwd: impl AsRef<Path>, options: StatusOptions) -> Result<StatusReport> {
-    status_with_config(cwd.as_ref(), &options, None, TargetRootMode::Global)
-}
-
-pub fn init_repo(cwd: impl AsRef<Path>, options: InitOptions) -> Result<InitReport> {
-    init_repo_with_config(cwd.as_ref(), &options, None)
+    strategy: String,
 }
 
 pub fn skill_inventory(
@@ -929,10 +834,16 @@ pub fn skill_inventory(
     take_inventory(cwd.as_ref(), &options)
 }
 
-pub fn doctor(cwd: impl AsRef<Path>, options: DoctorOptions) -> Result<DoctorReport> {
-    doctor_with_config(cwd.as_ref(), &options, None)
-}
-
+/// A shell hook that relinks when you change directory.
+///
+/// Runs `link --quiet`, which exits silently outside a managed tree: a hook that
+/// complained on every `cd` would be turned off within the hour. Warnings about a
+/// skill that failed to deploy still reach stderr, because that is the failure the
+/// hook exists to surface.
+///
+/// Set `SKILLENV_MANIFEST` to deploy into repositories that do not contain the
+/// manifest themselves — the usual arrangement, with the manifest in a dotfiles
+/// checkout and `[[deploy]]` rules naming the repositories it applies to.
 pub fn hook_script(shell: Shell) -> String {
     match shell {
         Shell::Zsh => r#"autoload -Uz add-zsh-hook
@@ -968,811 +879,6 @@ esac
     }
 }
 
-pub fn format_link_report(report: &Report, action: &str) -> String {
-    if let Some(message) = &report.message {
-        return message.clone();
-    }
-
-    let mut lines = Vec::new();
-    if let Some(repo_root) = &report.repo_root {
-        lines.push(format!("repo root: {}", repo_root.display()));
-    }
-
-    for target in &report.target_reports {
-        let path = target
-            .path
-            .as_ref()
-            .map(|value| value.display().to_string())
-            .unwrap_or_else(|| target.kind.label().to_string());
-        lines.push(format!(
-            "{action} {} skill(s) in {} ({} removed)",
-            target.linked, path, target.removed
-        ));
-    }
-
-    if report.gitignore_updated {
-        lines.push(".gitignore updated".to_string());
-    }
-
-    lines.join("\n")
-}
-
-pub fn format_status_report(report: &StatusReport) -> String {
-    let mut lines = Vec::new();
-    match &report.repo_root {
-        Some(repo_root) => lines.push(format!("repo root: {}", repo_root.display())),
-        None => lines.push("repo root: not detected".to_string()),
-    }
-
-    for status in &report.target_statuses {
-        let label = status
-            .path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| status.kind.label().to_string());
-        let state = match status.state {
-            LinkState::Linked => "linked",
-            LinkState::NotLinked => "not linked",
-            LinkState::Disabled => "disabled",
-        };
-        if matches!(status.state, LinkState::Disabled) {
-            lines.push(format!("{label}: {state}"));
-        } else {
-            lines.push(format!(
-                "{label}: {state} ({} managed skill(s))",
-                status.managed_count
-            ));
-        }
-    }
-
-    lines.join("\n")
-}
-
-pub fn format_init_report(report: &InitReport) -> String {
-    let mut lines = vec![format!("repo root: {}", report.repo_root.display())];
-
-    if report.created_dirs.is_empty() {
-        lines.push("skillenv layout already present".to_string());
-    } else {
-        for dir in &report.created_dirs {
-            let display = dir
-                .strip_prefix(&report.repo_root)
-                .unwrap_or(dir)
-                .display()
-                .to_string();
-            lines.push(format!("created {display}"));
-        }
-    }
-
-    if report.gitignore_updated {
-        lines.push(".gitignore updated".to_string());
-    } else {
-        lines.push(".gitignore already up to date".to_string());
-    }
-
-    lines.join("\n")
-}
-
-pub fn format_doctor_report(report: &DoctorReport) -> String {
-    let mut lines = Vec::new();
-    match &report.repo_root {
-        Some(repo_root) => lines.push(format!("repo root: {}", repo_root.display())),
-        None => lines.push("repo root: not detected".to_string()),
-    }
-    match &report.home_dir {
-        Some(home_dir) => lines.push(format!("home: {}", home_dir.display())),
-        None => lines.push("home: not set".to_string()),
-    }
-    match &report.config_path {
-        Some(config_path) => lines.push(format!(
-            "config path: {} ({})",
-            config_path.display(),
-            if report.config_exists {
-                "exists"
-            } else {
-                "missing"
-            }
-        )),
-        None => lines.push("config path: unavailable".to_string()),
-    }
-    lines.push(format!(
-        "repo initialized: {}",
-        match report.repo_initialized {
-            Some(true) => "yes",
-            Some(false) => "no",
-            None => "not applicable",
-        }
-    ));
-
-    lines.push("config:".to_string());
-    lines.push(format!(
-        "  targets.agents: {}",
-        enabled_label(report.config.targets_agents)
-    ));
-    lines.push(format!(
-        "  targets.claude: {}",
-        enabled_label(report.config.targets_claude)
-    ));
-    lines.push(format!(
-        "  defaults.strategy: {}",
-        strategy_label(report.config.strategy)
-    ));
-
-    lines.push("targets:".to_string());
-    lines.push("  repo-local:".to_string());
-    append_doctor_target_lines(&mut lines, &report.repo_targets);
-    lines.push("  global:".to_string());
-    append_doctor_target_lines(&mut lines, &report.global_targets);
-
-    lines.push("source roots:".to_string());
-    if report.source_roots.is_empty() {
-        lines.push("  - none".to_string());
-    } else {
-        for root in &report.source_roots {
-            lines.push(format!(
-                "  - origin={} path={}",
-                root.origin,
-                root.path.display()
-            ));
-        }
-    }
-
-    lines.push("external sources:".to_string());
-    if report.external_sources.is_empty() {
-        lines.push("  - none".to_string());
-    } else {
-        for source in &report.external_sources {
-            let resolved = source
-                .resolved_path
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "unresolved".to_string());
-            lines.push(format!(
-                "  - name={} configured={} resolved={}",
-                source.name, source.configured_path, resolved
-            ));
-        }
-    }
-
-    lines.push("managed sources:".to_string());
-    if report.managed_sources.is_empty() {
-        lines.push("  - none".to_string());
-    } else {
-        for source in &report.managed_sources {
-            let skills = if source.selected_skills.is_empty() {
-                "all".to_string()
-            } else {
-                source.selected_skills.join(",")
-            };
-            let mut parts = vec![
-                format!("name={}", source.name),
-                format!("kind={}", source.kind),
-                format!("source={}", source.source),
-                format!("transport={}", source.transport),
-                format!("install_root={}", source.install_root.display()),
-                format!("revision={}", source.resolved_revision),
-                format!("skills={skills}"),
-            ];
-            if let Some(requested_ref) = &source.requested_ref {
-                parts.push(format!("ref={requested_ref}"));
-            }
-            if let Some(subdir) = &source.subdir {
-                parts.push(format!("subdir={subdir}"));
-            }
-            lines.push(format!("  - {}", parts.join(" ")));
-        }
-    }
-
-    if !report.notes.is_empty() {
-        lines.push("notes:".to_string());
-        for note in &report.notes {
-            lines.push(format!("  - {note}"));
-        }
-    }
-    if !report.warnings.is_empty() {
-        lines.push("warnings:".to_string());
-        for warning in &report.warnings {
-            lines.push(format!("  - {warning}"));
-        }
-    }
-
-    lines.join("\n")
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn doctor_with_config(
-    cwd: &Path,
-    _options: &DoctorOptions,
-    config_override: Option<&Path>,
-) -> Result<DoctorReport> {
-    let loaded = load_config(config_override)?;
-    let repo_root = detect_repo_root(cwd);
-    let home_dir = env::var_os("HOME").map(PathBuf::from);
-    let config_exists = loaded.path.as_ref().is_some_and(|path| path.exists());
-    let mut notes = Vec::new();
-    let mut warnings = Vec::new();
-
-    if !config_exists {
-        match &loaded.path {
-            Some(path) => notes.push(format!(
-                "config file not found at {}; using built-in defaults",
-                path.display()
-            )),
-            None => notes.push("config path unavailable; using built-in defaults".to_string()),
-        }
-    }
-
-    if repo_root.is_none() {
-        notes.push("repo root not detected; repo-local diagnostics are limited".to_string());
-    }
-    if home_dir.is_none() {
-        notes.push("HOME not set; global target diagnostics are unavailable".to_string());
-    }
-
-    let repo_initialized = match repo_root.as_deref() {
-        Some(repo_root) => Some(repo_is_initialized(
-            repo_root,
-            include_claude_target(&loaded.config, TargetOverride::UseConfig),
-        )?),
-        None => None,
-    };
-
-    let external_sources = doctor_external_sources(
-        repo_root.as_deref(),
-        &loaded.config,
-        loaded.base_dir.as_deref(),
-        &mut notes,
-        &mut warnings,
-    );
-
-    let managed_sources = match repo_root.as_deref() {
-        Some(_) => Vec::<DoctorManagedSource>::new()
-            .into_iter()
-            .map(|source| {
-                if !source.install_root.exists() {
-                    warnings.push(format!(
-                        "managed source '{}' install root is missing: {}",
-                        source.name,
-                        source.install_root.display()
-                    ));
-                }
-                DoctorManagedSource {
-                    name: source.name,
-                    kind: source.kind,
-                    source: source.source,
-                    transport: source.transport,
-                    requested_ref: source.requested_ref,
-                    subdir: source.subdir,
-                    install_root: source.install_root,
-                    selected_skills: source.selected_skills,
-                    resolved_revision: source.resolved_revision,
-                }
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-
-    let source_roots = match repo_root.as_deref() {
-        Some(repo_root) => {
-            let repo_slug = repo_slug(repo_root);
-            all_source_roots(
-                repo_root,
-                &repo_slug,
-                &loaded.config,
-                loaded.base_dir.as_deref(),
-            )?
-            .into_iter()
-            .map(|(origin, path)| DoctorSourceRoot { origin, path })
-            .collect()
-        }
-        None => Vec::new(),
-    };
-
-    let enabled_targets = resolve_target_kinds(&loaded.config, TargetOverride::UseConfig);
-    let repo_targets = match repo_root.as_deref() {
-        Some(repo_root) => doctor_targets_from_status_report(status_with_config(
-            repo_root,
-            &StatusOptions::default(),
-            config_override,
-            TargetRootMode::RepoLocal,
-        )?),
-        None => doctor_targets_from_statuses(all_target_statuses(None, &enabled_targets)),
-    };
-    let global_targets = match (home_dir.as_deref(), repo_root.as_deref()) {
-        (Some(_), Some(repo_root)) => doctor_targets_from_status_report(status_with_config(
-            repo_root,
-            &StatusOptions::default(),
-            config_override,
-            TargetRootMode::Global,
-        )?),
-        (Some(home_dir), None) => {
-            notes.push(
-                "repo root not detected; global managed counts for the current repository are unavailable"
-                    .to_string(),
-            );
-            doctor_default_global_targets(home_dir, &enabled_targets)
-        }
-        (None, _) => Vec::new(),
-    };
-
-    Ok(DoctorReport {
-        repo_root,
-        home_dir,
-        config_path: loaded.path,
-        config_exists,
-        repo_initialized,
-        config: DoctorConfigReport {
-            targets_agents: loaded.config.targets.agents,
-            targets_claude: loaded.config.targets.claude,
-            strategy: loaded.config.defaults.strategy,
-        },
-        source_roots,
-        external_sources,
-        managed_sources,
-        repo_targets,
-        global_targets,
-        notes,
-        warnings,
-    })
-}
-
-fn enabled_label(enabled: bool) -> &'static str {
-    if enabled { "enabled" } else { "disabled" }
-}
-
-fn strategy_label(strategy: Strategy) -> &'static str {
-    match strategy {
-        Strategy::Render => "render",
-        Strategy::Symlink => "symlink",
-    }
-}
-
-fn append_doctor_target_lines(lines: &mut Vec<String>, targets: &[DoctorTargetReport]) {
-    if targets.is_empty() {
-        lines.push("    - none".to_string());
-        return;
-    }
-
-    for target in targets {
-        let path = target
-            .path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| target.label.clone());
-        let state = match target.state {
-            DoctorTargetState::Linked => "linked",
-            DoctorTargetState::NotLinked => "not linked",
-            DoctorTargetState::Disabled => "disabled",
-        };
-        if matches!(target.state, DoctorTargetState::Disabled) {
-            lines.push(format!("    - {path}: {state}"));
-        } else {
-            lines.push(format!(
-                "    - {path}: {state} ({} managed skill(s))",
-                target.managed_count
-            ));
-        }
-    }
-}
-
-fn doctor_external_sources(
-    repo_root: Option<&Path>,
-    config: &Config,
-    config_base_dir: Option<&Path>,
-    notes: &mut Vec<String>,
-    warnings: &mut Vec<String>,
-) -> Vec<DoctorExternalSource> {
-    let repo_slug = repo_root.map(repo_slug);
-    config
-        .external_sources
-        .iter()
-        .map(|external| {
-            let resolved_path = if repo_slug.is_none() && external.path.contains("{repo}") {
-                notes.push(format!(
-                    "external source '{}' uses {{repo}} and cannot be fully resolved without a repo root",
-                    external.name
-                ));
-                None
-            } else {
-                Some(resolve_external_root(
-                    external,
-                    repo_slug.as_deref().unwrap_or("repo"),
-                    config_base_dir,
-                ))
-            };
-            if let Some(path) = resolved_path.as_ref()
-                && !path.is_dir()
-            {
-                warnings.push(format!(
-                    "external source '{}' resolved path is missing: {}",
-                    external.name,
-                    path.display()
-                ));
-            }
-            DoctorExternalSource {
-                name: external.name.clone(),
-                configured_path: external.path.clone(),
-                resolved_path,
-            }
-        })
-        .collect()
-}
-
-fn doctor_targets_from_status_report(report: StatusReport) -> Vec<DoctorTargetReport> {
-    doctor_targets_from_statuses(report.target_statuses)
-}
-
-fn doctor_targets_from_statuses(statuses: Vec<TargetStatus>) -> Vec<DoctorTargetReport> {
-    statuses
-        .into_iter()
-        .map(|status| DoctorTargetReport {
-            label: status.kind.label().to_string(),
-            path: status.path,
-            state: match status.state {
-                LinkState::Linked => DoctorTargetState::Linked,
-                LinkState::NotLinked => DoctorTargetState::NotLinked,
-                LinkState::Disabled => DoctorTargetState::Disabled,
-            },
-            managed_count: status.managed_count,
-        })
-        .collect()
-}
-
-fn doctor_default_global_targets(
-    home_dir: &Path,
-    enabled_targets: &[TargetKind],
-) -> Vec<DoctorTargetReport> {
-    [TargetKind::Agents, TargetKind::Claude]
-        .into_iter()
-        .map(|kind| DoctorTargetReport {
-            label: kind.label().to_string(),
-            path: Some(home_dir.join(kind.label())),
-            state: if enabled_targets.contains(&kind) {
-                DoctorTargetState::NotLinked
-            } else {
-                DoctorTargetState::Disabled
-            },
-            managed_count: 0,
-        })
-        .collect()
-}
-
-fn init_repo_with_config(
-    cwd: &Path,
-    options: &InitOptions,
-    config_override: Option<&Path>,
-) -> Result<InitReport> {
-    let loaded = load_config(config_override)?;
-    let config = &loaded.config;
-    let repo_root = detect_repo_root(cwd).ok_or(SkillenvError::RepoRequired)?;
-
-    let layout_root = repo_root.join(REPO_LAYOUT_DIR);
-    ensure_dir(&layout_root)?;
-
-    let mut created_dirs = Vec::new();
-    for scope_dir in [DEFAULT_SCOPE_DIR, LOCAL_SCOPE_DIR, PROFILES_SCOPE_DIR] {
-        ensure_layout_dir(&layout_root.join(scope_dir), &mut created_dirs)?;
-    }
-
-    let gitignore_updated =
-        update_gitignore(&repo_root, include_claude_target(config, options.claude))?;
-
-    Ok(InitReport {
-        repo_root,
-        created_dirs,
-        gitignore_updated,
-    })
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn link_repo_with_config(
-    cwd: &Path,
-    options: &LinkOptions,
-    config_override: Option<&Path>,
-) -> Result<Report> {
-    link_with_config(cwd, options, config_override, TargetRootMode::RepoLocal)
-}
-
-fn link_with_config(
-    cwd: &Path,
-    options: &LinkOptions,
-    config_override: Option<&Path>,
-    mode: TargetRootMode,
-) -> Result<Report> {
-    let loaded = load_config(config_override)?;
-    let config = &loaded.config;
-    let repo_root = detect_repo_root(cwd);
-    let Some(repo_root) = repo_root else {
-        return match mode {
-            TargetRootMode::RepoLocal => Ok(Report {
-                repo_root: None,
-                repo_slug: None,
-                strategy: None,
-                touched_scopes: Vec::new(),
-                target_reports: Vec::new(),
-                gitignore_updated: false,
-                message: if options.quiet {
-                    None
-                } else {
-                    Some("repo root not detected; nothing linked".to_string())
-                },
-            }),
-            TargetRootMode::Global => Err(SkillenvError::RepoRequired),
-        };
-    };
-
-    let generated_names = GeneratedNameLayout::for_mode(&repo_root, mode);
-    let discovery_root = source_repo_root(mode, &repo_root);
-    if matches!(mode, TargetRootMode::RepoLocal) {
-        match require_repo_initialized(&repo_root, include_claude_target(config, options.claude)) {
-            Ok(()) => {}
-            Err(SkillenvError::RepoNotInitialized) if options.quiet => {
-                return Ok(Report {
-                    repo_root: Some(repo_root),
-                    repo_slug: Some(generated_names.repo_slug.clone()),
-                    strategy: Some(config.defaults.strategy),
-                    touched_scopes: Vec::new(),
-                    target_reports: Vec::new(),
-                    gitignore_updated: false,
-                    message: None,
-                });
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    let discovery = discover_sources(
-        &discovery_root,
-        &generated_names.repo_slug,
-        config,
-        loaded.base_dir.as_deref(),
-    )?;
-    let desired_sources = desired_sources(&discovery, &options.selector);
-    let targets = resolve_targets(mode, &repo_root, config, options.claude)?;
-    let filter = removal_filter(&options.selector);
-    let touched_scopes = touched_scope_names(&options.selector, &desired_sources);
-
-    let mut target_reports = Vec::new();
-    for target in &targets {
-        ensure_dir(&target.path)?;
-        let removed = remove_managed_entries(
-            &target.path,
-            &generated_names,
-            &filter,
-            &discovery.known_source_roots,
-        )?;
-        let linked = reconcile_target(
-            &target.path,
-            &generated_names,
-            config.defaults.strategy,
-            &desired_sources,
-        )?;
-        target_reports.push(TargetReport {
-            kind: target.kind,
-            path: Some(target.path.clone()),
-            linked,
-            removed,
-        });
-    }
-
-    Ok(Report {
-        repo_root: Some(repo_root),
-        repo_slug: Some(generated_names.repo_slug),
-        strategy: Some(config.defaults.strategy),
-        touched_scopes,
-        target_reports,
-        gitignore_updated: false,
-        message: None,
-    })
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn unlink_repo_with_config(
-    cwd: &Path,
-    options: &UnlinkOptions,
-    config_override: Option<&Path>,
-) -> Result<Report> {
-    unlink_with_config(cwd, options, config_override, TargetRootMode::RepoLocal)
-}
-
-fn unlink_with_config(
-    cwd: &Path,
-    options: &UnlinkOptions,
-    config_override: Option<&Path>,
-    mode: TargetRootMode,
-) -> Result<Report> {
-    let loaded = load_config(config_override)?;
-    let config = &loaded.config;
-    let repo_root = detect_repo_root(cwd);
-    let Some(repo_root) = repo_root else {
-        return match mode {
-            TargetRootMode::RepoLocal => Ok(Report {
-                repo_root: None,
-                repo_slug: None,
-                strategy: None,
-                touched_scopes: Vec::new(),
-                target_reports: Vec::new(),
-                gitignore_updated: false,
-                message: if options.quiet {
-                    None
-                } else {
-                    Some("repo root not detected; nothing unlinked".to_string())
-                },
-            }),
-            TargetRootMode::Global => Err(SkillenvError::RepoRequired),
-        };
-    };
-
-    let generated_names = GeneratedNameLayout::for_mode(&repo_root, mode);
-    let discovery_root = source_repo_root(mode, &repo_root);
-    let targets = resolve_targets(mode, &repo_root, config, options.claude)?;
-    let filter = removal_filter(&options.selector);
-    let touched_scopes = touched_scope_names(&options.selector, &BTreeMap::new());
-    let known_source_roots = known_source_roots(
-        &discovery_root,
-        &generated_names.repo_slug,
-        config,
-        loaded.base_dir.as_deref(),
-    )?;
-
-    let mut target_reports = Vec::new();
-    for target in &targets {
-        let removed = if target.path.exists() {
-            remove_managed_entries(&target.path, &generated_names, &filter, &known_source_roots)?
-        } else {
-            0
-        };
-        target_reports.push(TargetReport {
-            kind: target.kind,
-            path: Some(target.path.clone()),
-            linked: 0,
-            removed,
-        });
-    }
-
-    Ok(Report {
-        repo_root: Some(repo_root),
-        repo_slug: Some(generated_names.repo_slug),
-        strategy: Some(config.defaults.strategy),
-        touched_scopes,
-        target_reports,
-        gitignore_updated: false,
-        message: None,
-    })
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn status_repo_with_config(
-    cwd: &Path,
-    options: &StatusOptions,
-    config_override: Option<&Path>,
-) -> Result<StatusReport> {
-    status_with_config(cwd, options, config_override, TargetRootMode::RepoLocal)
-}
-
-fn status_with_config(
-    cwd: &Path,
-    options: &StatusOptions,
-    config_override: Option<&Path>,
-    mode: TargetRootMode,
-) -> Result<StatusReport> {
-    let loaded = load_config(config_override)?;
-    let config = &loaded.config;
-    let enabled = resolve_target_kinds(config, options.claude);
-    let repo_root = detect_repo_root(cwd);
-    let Some(repo_root) = repo_root else {
-        return match mode {
-            TargetRootMode::RepoLocal => Ok(StatusReport {
-                repo_root: None,
-                repo_slug: None,
-                target_statuses: all_target_statuses(None, &enabled),
-            }),
-            TargetRootMode::Global => Err(SkillenvError::RepoRequired),
-        };
-    };
-
-    let generated_names = GeneratedNameLayout::for_mode(&repo_root, mode);
-    let discovery_root = source_repo_root(mode, &repo_root);
-    let discovery = discover_sources(
-        &discovery_root,
-        &generated_names.repo_slug,
-        config,
-        loaded.base_dir.as_deref(),
-    )?;
-    let target_root = target_root(mode, &repo_root)?;
-    let mut statuses = Vec::new();
-    for kind in [TargetKind::Agents, TargetKind::Claude] {
-        let path = target_root.join(kind.label());
-        if enabled.contains(&kind) {
-            let managed_count =
-                count_managed_entries(&path, &generated_names, &discovery.known_source_roots)?;
-            statuses.push(TargetStatus {
-                kind,
-                path: Some(path.clone()),
-                state: if managed_count > 0 {
-                    LinkState::Linked
-                } else {
-                    LinkState::NotLinked
-                },
-                managed_count,
-            });
-        } else {
-            statuses.push(TargetStatus {
-                kind,
-                path: Some(path),
-                state: LinkState::Disabled,
-                managed_count: 0,
-            });
-        }
-    }
-
-    Ok(StatusReport {
-        repo_root: Some(repo_root),
-        repo_slug: Some(generated_names.repo_slug),
-        target_statuses: statuses,
-    })
-}
-
-fn all_target_statuses(repo_root: Option<PathBuf>, enabled: &[TargetKind]) -> Vec<TargetStatus> {
-    [TargetKind::Agents, TargetKind::Claude]
-        .into_iter()
-        .map(|kind| {
-            let state = if enabled.contains(&kind) {
-                LinkState::NotLinked
-            } else {
-                LinkState::Disabled
-            };
-            let path = repo_root.as_ref().map(|root| root.join(kind.label()));
-            TargetStatus {
-                kind,
-                path,
-                state,
-                managed_count: 0,
-            }
-        })
-        .collect()
-}
-
-fn load_config(config_override: Option<&Path>) -> Result<LoadedConfig> {
-    let Some(config_path) = config_override
-        .map(PathBuf::from)
-        .or_else(default_config_path)
-    else {
-        return Ok(LoadedConfig {
-            config: Config::default(),
-            path: None,
-            base_dir: None,
-        });
-    };
-    let base_dir = config_path.parent().map(Path::to_path_buf);
-
-    if !config_path.exists() {
-        return Ok(LoadedConfig {
-            config: Config::default(),
-            path: Some(config_path),
-            base_dir,
-        });
-    }
-
-    let raw = fs::read_to_string(&config_path).map_err(|source| SkillenvError::ReadFile {
-        path: config_path.clone(),
-        source,
-    })?;
-    let config = toml_edit::de::from_str(&raw).map_err(|source| SkillenvError::ParseConfig {
-        path: config_path.clone(),
-        source,
-    })?;
-    Ok(LoadedConfig {
-        config,
-        path: Some(config_path),
-        base_dir,
-    })
-}
-
-fn default_config_path() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/skillenv/config.toml"))
-}
-
 fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -1795,611 +901,6 @@ fn detect_repo_root(cwd: &Path) -> Option<PathBuf> {
     None
 }
 
-fn resolve_targets(
-    mode: TargetRootMode,
-    repo_root: &Path,
-    config: &Config,
-    override_value: TargetOverride,
-) -> Result<Vec<TargetSpec>> {
-    let target_root = target_root(mode, repo_root)?;
-    Ok(build_target_specs(
-        &target_root,
-        &resolve_target_kinds(config, override_value),
-    ))
-}
-
-fn target_root(mode: TargetRootMode, repo_root: &Path) -> Result<PathBuf> {
-    match mode {
-        TargetRootMode::RepoLocal => Ok(repo_root.to_path_buf()),
-        TargetRootMode::Global => home_dir(),
-    }
-}
-
-fn source_repo_root(mode: TargetRootMode, repo_root: &Path) -> PathBuf {
-    match mode {
-        TargetRootMode::RepoLocal => repo_root.to_path_buf(),
-        TargetRootMode::Global => stable_global_repo_root(repo_root),
-    }
-}
-
-fn build_target_specs(target_root: &Path, kinds: &[TargetKind]) -> Vec<TargetSpec> {
-    kinds
-        .iter()
-        .copied()
-        .map(|kind| TargetSpec {
-            kind,
-            path: target_root.join(kind.label()),
-        })
-        .collect()
-}
-
-fn resolve_target_kinds(config: &Config, override_value: TargetOverride) -> Vec<TargetKind> {
-    let claude = match override_value {
-        TargetOverride::UseConfig => config.targets.claude,
-        TargetOverride::ForceEnabled => true,
-        TargetOverride::ForceDisabled => false,
-    };
-
-    let mut targets = Vec::new();
-    if config.targets.agents {
-        targets.push(TargetKind::Agents);
-    }
-    if claude {
-        targets.push(TargetKind::Claude);
-    }
-    targets
-}
-
-fn include_claude_target(config: &Config, override_value: TargetOverride) -> bool {
-    resolve_target_kinds(config, override_value).contains(&TargetKind::Claude)
-}
-
-fn discover_sources(
-    repo_root: &Path,
-    repo_slug: &str,
-    config: &Config,
-    config_base_dir: Option<&Path>,
-) -> Result<Discovery> {
-    let all_roots = all_source_roots(repo_root, repo_slug, config, config_base_dir)?;
-    let known_source_roots = all_roots.iter().map(|(_, root)| root.clone()).collect();
-
-    let mut by_scope: BTreeMap<ScopeKey, Vec<SkillSource>> = BTreeMap::new();
-    let mut seen: BTreeMap<(ScopeKey, String), String> = BTreeMap::new();
-
-    for (origin_name, root) in all_roots {
-        collect_scope_sources(
-            &mut by_scope,
-            &mut seen,
-            ScopeKey::Default,
-            root.join(DEFAULT_SCOPE_DIR),
-            &origin_name,
-        )?;
-        collect_scope_sources(
-            &mut by_scope,
-            &mut seen,
-            ScopeKey::Local,
-            root.join(LOCAL_SCOPE_DIR),
-            &origin_name,
-        )?;
-
-        let profiles_root = root.join(PROFILES_SCOPE_DIR);
-        if profiles_root.is_dir() {
-            for entry in fs::read_dir(&profiles_root).map_err(|source| SkillenvError::ReadFile {
-                path: profiles_root.clone(),
-                source,
-            })? {
-                let entry = entry.map_err(|source| SkillenvError::ReadFile {
-                    path: profiles_root.clone(),
-                    source,
-                })?;
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-
-                let profile_name = slugify_or(
-                    path.file_name()
-                        .and_then(OsStr::to_str)
-                        .unwrap_or("profile"),
-                    "profile",
-                );
-                collect_scope_sources(
-                    &mut by_scope,
-                    &mut seen,
-                    ScopeKey::Profile(profile_name),
-                    path,
-                    &origin_name,
-                )?;
-            }
-        }
-    }
-
-    Ok(Discovery {
-        sources: by_scope,
-        known_source_roots,
-    })
-}
-
-fn known_source_roots(
-    repo_root: &Path,
-    repo_slug: &str,
-    config: &Config,
-    config_base_dir: Option<&Path>,
-) -> Result<Vec<PathBuf>> {
-    Ok(
-        all_source_roots(repo_root, repo_slug, config, config_base_dir)?
-            .into_iter()
-            .map(|(_, root)| root)
-            .collect(),
-    )
-}
-
-fn resolve_external_root(
-    external: &ExternalSourceConfig,
-    repo_slug: &str,
-    config_base_dir: Option<&Path>,
-) -> PathBuf {
-    let replaced = external.path.replace("{repo}", repo_slug);
-    let path = PathBuf::from(replaced);
-    if path.is_absolute() {
-        path
-    } else if let Some(base_dir) = config_base_dir {
-        base_dir.join(path)
-    } else {
-        path
-    }
-}
-
-fn all_source_roots(
-    repo_root: &Path,
-    repo_slug: &str,
-    config: &Config,
-    config_base_dir: Option<&Path>,
-) -> Result<Vec<(String, PathBuf)>> {
-    let mut roots = vec![("repo".to_string(), repo_root.join(REPO_LAYOUT_DIR))];
-    for external in &config.external_sources {
-        roots.push((
-            external.name.clone(),
-            resolve_external_root(external, repo_slug, config_base_dir),
-        ));
-    }
-    Ok(roots)
-}
-
-fn collect_scope_sources(
-    by_scope: &mut BTreeMap<ScopeKey, Vec<SkillSource>>,
-    seen: &mut BTreeMap<(ScopeKey, String), String>,
-    scope: ScopeKey,
-    scope_dir: PathBuf,
-    origin_name: &str,
-) -> Result<()> {
-    if !scope_dir.is_dir() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(&scope_dir).map_err(|source| SkillenvError::ReadFile {
-        path: scope_dir.clone(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| SkillenvError::ReadFile {
-            path: scope_dir.clone(),
-            source,
-        })?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if !path.join("SKILL.md").is_file() {
-            continue;
-        }
-
-        let skill_slug = slugify_or(
-            path.file_name().and_then(OsStr::to_str).unwrap_or("skill"),
-            "skill",
-        );
-        let key = (scope.clone(), skill_slug.clone());
-        let origin_label = format!("{origin_name}:{}", path.display());
-        if let Some(existing) = seen.insert(key.clone(), origin_label.clone()) {
-            return Err(SkillenvError::DuplicateSkill {
-                scope: key.0.display_name(),
-                skill: key.1,
-                first: existing,
-                second: origin_label,
-            });
-        }
-        by_scope
-            .entry(scope.clone())
-            .or_default()
-            .push(SkillSource {
-                scope_origin: scope_dir.clone(),
-                skill_slug,
-                dir: path,
-                origin_label,
-            });
-    }
-
-    Ok(())
-}
-
-fn desired_sources(
-    discovery: &Discovery,
-    selector: &ScopeSelector,
-) -> BTreeMap<ScopeKey, Vec<SkillSource>> {
-    match selector {
-        ScopeSelector::DefaultLocal => discovery
-            .sources
-            .iter()
-            .filter(|(scope, _)| matches!(scope, ScopeKey::Default | ScopeKey::Local))
-            .map(|(scope, sources)| (scope.clone(), sources.clone()))
-            .collect(),
-        ScopeSelector::Profiles(names) => {
-            let requested: BTreeSet<_> = names
-                .iter()
-                .map(|name| ScopeKey::Profile(slugify_or(name, "profile")))
-                .collect();
-            discovery
-                .sources
-                .iter()
-                .filter(|(scope, _)| requested.contains(*scope))
-                .map(|(scope, sources)| (scope.clone(), sources.clone()))
-                .collect()
-        }
-        ScopeSelector::All => discovery.sources.clone(),
-    }
-}
-
-fn touched_scope_names(
-    selector: &ScopeSelector,
-    desired_sources: &BTreeMap<ScopeKey, Vec<SkillSource>>,
-) -> Vec<String> {
-    match selector {
-        ScopeSelector::All => desired_sources.keys().map(ScopeKey::display_name).collect(),
-        _ => ScopeKey::selector_names(selector)
-            .into_iter()
-            .map(|scope| scope.display_name())
-            .collect(),
-    }
-}
-
-fn removal_filter(selector: &ScopeSelector) -> ScopeFilter {
-    match selector {
-        ScopeSelector::All => ScopeFilter::AllCurrentRepo,
-        _ => ScopeFilter::Exact(
-            ScopeKey::selector_names(selector)
-                .into_iter()
-                .map(|scope| scope.display_name())
-                .collect(),
-        ),
-    }
-}
-
-fn remove_managed_entries(
-    target_dir: &Path,
-    generated_names: &GeneratedNameLayout,
-    filter: &ScopeFilter,
-    known_source_roots: &[PathBuf],
-) -> Result<usize> {
-    if !target_dir.exists() {
-        return Ok(0);
-    }
-
-    let mut removed = 0usize;
-    let prefix = generated_names.prefix();
-    for entry in fs::read_dir(target_dir).map_err(|source| SkillenvError::ReadFile {
-        path: target_dir.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| SkillenvError::ReadFile {
-            path: target_dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(prefix) {
-            continue;
-        }
-
-        let metadata = fs::symlink_metadata(&path).map_err(|source| SkillenvError::ReadFile {
-            path: path.clone(),
-            source,
-        })?;
-
-        if metadata.file_type().is_symlink() {
-            if generated_name_matches_scope(&name, generated_names, filter)
-                && symlink_targets_known_root(&path, known_source_roots)?
-            {
-                fs::remove_file(&path).map_err(|source| SkillenvError::WriteFile {
-                    path: path.clone(),
-                    source,
-                })?;
-                removed += 1;
-            }
-            continue;
-        }
-
-        if metadata.is_dir() {
-            let marker_path = path.join(GENERATED_MARKER_FILE);
-            if !marker_path.is_file() {
-                continue;
-            }
-
-            let marker_raw =
-                fs::read_to_string(&marker_path).map_err(|source| SkillenvError::ReadFile {
-                    path: marker_path.clone(),
-                    source,
-                })?;
-            let marker: GeneratedMarker = serde_json::from_str(&marker_raw).map_err(|source| {
-                SkillenvError::SerializeMarker {
-                    path: marker_path.clone(),
-                    source,
-                }
-            })?;
-
-            if marker.generated_name.starts_with(generated_names.prefix())
-                && filter.matches_scope(&marker.scope)
-                && marker_source_matches_known_root(&marker.source, known_source_roots)
-            {
-                fs::remove_dir_all(&path).map_err(|source| SkillenvError::WriteFile {
-                    path: path.clone(),
-                    source,
-                })?;
-                removed += 1;
-            }
-        }
-    }
-
-    Ok(removed)
-}
-
-fn reconcile_target(
-    target_dir: &Path,
-    generated_names: &GeneratedNameLayout,
-    strategy: Strategy,
-    desired_sources: &BTreeMap<ScopeKey, Vec<SkillSource>>,
-) -> Result<usize> {
-    let mut linked = 0usize;
-    for (scope, sources) in desired_sources {
-        for source in sources {
-            let generated_name = generated_names.generated_name(scope, &source.skill_slug);
-            let generated_path = target_dir.join(&generated_name);
-            ensure_unmanaged_target_absent(&generated_path)?;
-            match strategy {
-                Strategy::Render => render_source(
-                    &generated_names.repo_slug,
-                    scope,
-                    source,
-                    &generated_name,
-                    &generated_path,
-                )?,
-                Strategy::Symlink => symlink_source(source, &generated_path)?,
-            }
-            linked += 1;
-        }
-    }
-
-    Ok(linked)
-}
-
-fn render_source(
-    repo_slug: &str,
-    scope: &ScopeKey,
-    source: &SkillSource,
-    generated_name: &str,
-    generated_path: &Path,
-) -> Result<()> {
-    ensure_dir(generated_path)?;
-    copy_source_tree(&source.dir, generated_path)?;
-
-    let skill_md_path = source.dir.join("SKILL.md");
-    let rendered = render_skill_markdown(repo_slug, scope, source, generated_name, &skill_md_path)?;
-    let target_skill_md = generated_path.join("SKILL.md");
-    fs::write(&target_skill_md, rendered).map_err(|source| SkillenvError::WriteFile {
-        path: target_skill_md,
-        source,
-    })?;
-
-    let marker = GeneratedMarker {
-        repo: repo_slug.to_string(),
-        scope: scope.display_name(),
-        skill: source.skill_slug.clone(),
-        generated_name: generated_name.to_string(),
-        source: source.dir.display().to_string(),
-        strategy: Strategy::Render,
-    };
-    let marker_path = generated_path.join(GENERATED_MARKER_FILE);
-    let marker_json =
-        serde_json::to_string_pretty(&marker).map_err(|source| SkillenvError::SerializeMarker {
-            path: marker_path.clone(),
-            source,
-        })?;
-    fs::write(&marker_path, marker_json).map_err(|source| SkillenvError::WriteFile {
-        path: marker_path,
-        source,
-    })?;
-    Ok(())
-}
-
-fn symlink_source(source: &SkillSource, generated_path: &Path) -> Result<()> {
-    create_symlink(&source.dir, generated_path).map_err(|source| SkillenvError::WriteFile {
-        path: generated_path.to_path_buf(),
-        source,
-    })
-}
-
-fn gitignore_patterns(include_claude: bool) -> Vec<&'static str> {
-    let mut patterns = vec![".agents/skills/skillenv-*", "skillenv/local/"];
-    if include_claude {
-        patterns.push(".claude/skills/skillenv-*");
-    }
-    patterns
-}
-
-fn repo_is_initialized(repo_root: &Path, include_claude: bool) -> Result<bool> {
-    for scope_dir in [DEFAULT_SCOPE_DIR, LOCAL_SCOPE_DIR, PROFILES_SCOPE_DIR] {
-        if !repo_root.join(REPO_LAYOUT_DIR).join(scope_dir).is_dir() {
-            return Ok(false);
-        }
-    }
-
-    let gitignore_path = repo_root.join(".gitignore");
-    if !gitignore_path.is_file() {
-        return Ok(false);
-    }
-
-    let contents =
-        fs::read_to_string(&gitignore_path).map_err(|source| SkillenvError::ReadFile {
-            path: gitignore_path,
-            source,
-        })?;
-    let existing: BTreeSet<String> = contents
-        .lines()
-        .map(|line| line.trim().to_string())
-        .collect();
-
-    Ok(gitignore_patterns(include_claude)
-        .into_iter()
-        .all(|pattern| existing.contains(pattern)))
-}
-
-fn require_repo_initialized(repo_root: &Path, include_claude: bool) -> Result<()> {
-    if repo_is_initialized(repo_root, include_claude)? {
-        Ok(())
-    } else {
-        Err(SkillenvError::RepoNotInitialized)
-    }
-}
-
-fn update_gitignore(repo_root: &Path, include_claude: bool) -> Result<bool> {
-    let gitignore_path = repo_root.join(".gitignore");
-    let mut contents = if gitignore_path.exists() {
-        fs::read_to_string(&gitignore_path).map_err(|source| SkillenvError::ReadFile {
-            path: gitignore_path.clone(),
-            source,
-        })?
-    } else {
-        String::new()
-    };
-
-    let existing: BTreeSet<String> = contents
-        .lines()
-        .map(|line| line.trim().to_string())
-        .collect();
-    let mut changed = false;
-    for pattern in gitignore_patterns(include_claude) {
-        if existing.contains(pattern) {
-            continue;
-        }
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        contents.push_str(pattern);
-        contents.push('\n');
-        changed = true;
-    }
-
-    if changed {
-        fs::write(&gitignore_path, contents).map_err(|source| SkillenvError::WriteFile {
-            path: gitignore_path,
-            source,
-        })?;
-    }
-
-    Ok(changed)
-}
-
-fn count_managed_entries(
-    target_dir: &Path,
-    generated_names: &GeneratedNameLayout,
-    known_source_roots: &[PathBuf],
-) -> Result<usize> {
-    if !target_dir.is_dir() {
-        return Ok(0);
-    }
-
-    let mut count = 0usize;
-    let prefix = generated_names.prefix();
-    for entry in fs::read_dir(target_dir).map_err(|source| SkillenvError::ReadFile {
-        path: target_dir.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| SkillenvError::ReadFile {
-            path: target_dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with(prefix) {
-            continue;
-        }
-
-        let metadata = fs::symlink_metadata(&path).map_err(|source| SkillenvError::ReadFile {
-            path: path.clone(),
-            source,
-        })?;
-        if metadata.file_type().is_symlink() {
-            if symlink_targets_known_root(&path, known_source_roots)? {
-                count += 1;
-            }
-            continue;
-        }
-
-        if metadata.is_dir() {
-            let marker_path = path.join(GENERATED_MARKER_FILE);
-            if !marker_path.is_file() {
-                continue;
-            }
-            let marker_raw =
-                fs::read_to_string(&marker_path).map_err(|source| SkillenvError::ReadFile {
-                    path: marker_path.clone(),
-                    source,
-                })?;
-            let marker: GeneratedMarker = serde_json::from_str(&marker_raw).map_err(|source| {
-                SkillenvError::SerializeMarker {
-                    path: marker_path.clone(),
-                    source,
-                }
-            })?;
-            if marker.generated_name.starts_with(generated_names.prefix())
-                && marker_source_matches_known_root(&marker.source, known_source_roots)
-            {
-                count += 1;
-            }
-        }
-    }
-
-    Ok(count)
-}
-
-fn generated_name_matches_scope(
-    name: &str,
-    generated_names: &GeneratedNameLayout,
-    filter: &ScopeFilter,
-) -> bool {
-    match filter {
-        ScopeFilter::AllCurrentRepo => name.starts_with(generated_names.prefix()),
-        ScopeFilter::Exact(scopes) => scopes
-            .iter()
-            .any(|scope| name.starts_with(&generated_names.scope_prefix(scope))),
-    }
-}
-
-fn scope_segment_from_display(scope: &str) -> String {
-    if let Some(profile) = scope.strip_prefix("profile:") {
-        format!("profile-{profile}")
-    } else {
-        scope.to_string()
-    }
-}
-
-impl ScopeFilter {
-    fn matches_scope(&self, scope: &str) -> bool {
-        match self {
-            Self::AllCurrentRepo => true,
-            Self::Exact(scopes) => scopes.contains(scope),
-        }
-    }
-}
-
 impl fmt::Display for Shell {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2412,20 +913,22 @@ impl fmt::Display for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::paths::{ensure_dir, slugify_or};
     use crate::test_support::set_home_for_test;
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn frontmatter_string<'a>(metadata: &'a Mapping, key: &str) -> Option<&'a str> {
-        metadata
-            .get(Value::String(key.to_string()))
-            .and_then(Value::as_str)
+    /// A directory symlink, for the inventory tests that check skillenv follows
+    /// one a user made by hand. Deployment no longer creates any — v1 renders
+    /// only — so this lives here rather than in `paths`.
+    #[cfg(unix)]
+    fn create_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(source, destination)
     }
 
-    fn frontmatter_mapping<'a>(metadata: &'a Mapping, key: &str) -> Option<&'a Mapping> {
-        metadata
-            .get(Value::String(key.to_string()))
-            .and_then(Value::as_mapping)
+    #[cfg(windows)]
+    fn create_symlink(source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(source, destination)
     }
 
     #[test]
@@ -2437,1063 +940,10 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_apply_without_file() -> Result<()> {
-        let root = TempDir::new().unwrap();
-        let loaded = load_config(Some(&root.path().join("missing.toml")))?;
-        assert!(loaded.config.targets.agents);
-        assert!(!loaded.config.targets.claude);
-        assert_eq!(loaded.config.defaults.strategy, Strategy::Render);
-        Ok(())
-    }
-
-    #[test]
-    fn external_source_root_resolves_repo_placeholder() {
-        let external = ExternalSourceConfig {
-            name: "shared".to_string(),
-            path: "/tmp/skills/{repo}".to_string(),
-        };
-        assert_eq!(
-            resolve_external_root(&external, "demo-repo", None),
-            PathBuf::from("/tmp/skills/demo-repo")
-        );
-
-        let raw = ExternalSourceConfig {
-            name: "raw".to_string(),
-            path: "/tmp/skills".to_string(),
-        };
-        assert_eq!(
-            resolve_external_root(&raw, "demo-repo", None),
-            PathBuf::from("/tmp/skills")
-        );
-    }
-
-    #[test]
-    fn relative_external_paths_resolve_from_config_directory() {
-        let config_dir = PathBuf::from("/tmp/skillenv-config");
-        let external = ExternalSourceConfig {
-            name: "shared".to_string(),
-            path: "../shared/{repo}".to_string(),
-        };
-        assert_eq!(
-            resolve_external_root(&external, "demo-repo", Some(&config_dir)),
-            PathBuf::from("/tmp/skillenv-config/../shared/demo-repo")
-        );
-    }
-
-    #[test]
-    fn claude_cli_override_wins_over_config() {
-        let mut config = Config::default();
-        config.targets.claude = false;
-        assert_eq!(
-            resolve_target_kinds(&config, TargetOverride::ForceEnabled),
-            vec![TargetKind::Agents, TargetKind::Claude]
-        );
-        assert_eq!(
-            resolve_target_kinds(&config, TargetOverride::ForceDisabled),
-            vec![TargetKind::Agents]
-        );
-    }
-
-    #[test]
     fn detect_repo_root_normalizes_dot_segments() -> Result<()> {
         let repo = repo_fixture()?;
         let detected = detect_repo_root(&repo.path().join(".")).unwrap();
         assert_eq!(detected, repo.path());
-        Ok(())
-    }
-
-    #[test]
-    fn discover_sources_from_repo_only() -> Result<()> {
-        let repo = repo_fixture()?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            None,
-            "repo default",
-        )?;
-        let discovery = discover_sources(repo.path(), "repo", &Config::default(), None)?;
-        assert_eq!(discovery.sources.len(), 1);
-        assert_eq!(
-            discovery.sources.get(&ScopeKey::Default).unwrap()[0].skill_slug,
-            "research"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn discover_sources_from_external_only() -> Result<()> {
-        let repo = repo_fixture()?;
-        let external = TempDir::new().unwrap();
-        write_skill(
-            external.path(),
-            "default/research",
-            None,
-            "external default",
-        )?;
-
-        let mut config = Config::default();
-        config.external_sources.push(ExternalSourceConfig {
-            name: "shared".to_string(),
-            path: external.path().display().to_string(),
-        });
-
-        let discovery = discover_sources(repo.path(), "repo", &config, None)?;
-        assert_eq!(discovery.sources.get(&ScopeKey::Default).unwrap().len(), 1);
-        assert_eq!(
-            discovery.sources.get(&ScopeKey::Default).unwrap()[0].origin_label,
-            format!("shared:{}/default/research", external.path().display())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn discover_sources_from_repo_and_external() -> Result<()> {
-        let repo = repo_fixture()?;
-        let external = TempDir::new().unwrap();
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            None,
-            "repo default",
-        )?;
-        write_skill(
-            external.path(),
-            "profiles/review/lint",
-            None,
-            "external profile",
-        )?;
-
-        let mut config = Config::default();
-        config.external_sources.push(ExternalSourceConfig {
-            name: "shared".to_string(),
-            path: external.path().display().to_string(),
-        });
-
-        let discovery = discover_sources(repo.path(), "repo", &config, None)?;
-        assert!(discovery.sources.contains_key(&ScopeKey::Default));
-        assert!(
-            discovery
-                .sources
-                .contains_key(&ScopeKey::Profile("review".to_string()))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn duplicate_skills_are_rejected() -> Result<()> {
-        let repo = repo_fixture()?;
-        let external = TempDir::new().unwrap();
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            None,
-            "repo default",
-        )?;
-        write_skill(
-            external.path(),
-            "default/research",
-            None,
-            "external default",
-        )?;
-
-        let mut config = Config::default();
-        config.external_sources.push(ExternalSourceConfig {
-            name: "shared".to_string(),
-            path: external.path().display().to_string(),
-        });
-
-        let error = discover_sources(repo.path(), "repo", &config, None).unwrap_err();
-        assert!(matches!(error, SkillenvError::DuplicateSkill { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn render_rewrites_frontmatter_and_copies_extra_files() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let scope_origin = repo.path().join("skillenv/default");
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        let skill_md = format!(
-            r#"---
-name: original-name
-description: 'Original description [skillenv: {repo_slug}/default/research] repo={}'
-color: blue
-metadata:
-  owner: team-skillenv
----
-
-Body text
-"#,
-            scope_origin.display()
-        );
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some(skill_md.as_str()),
-            "Body text",
-        )?;
-        let extra_file = repo
-            .path()
-            .join("skillenv/default/research/assets/info.txt");
-        ensure_dir(extra_file.parent().unwrap())?;
-        fs::write(&extra_file, "extra").unwrap();
-        init_test_repo(repo.path(), &config_path)?;
-
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let generated_name = format!("skillenv-{repo_slug}-default-research");
-        let expected_source = format!("{repo_slug}/default/research");
-        let expected_scope_origin = scope_origin.display().to_string();
-        let generated = repo.path().join(".agents/skills").join(&generated_name);
-        let rendered = fs::read_to_string(generated.join("SKILL.md")).unwrap();
-        let (metadata, body) = parse_frontmatter(Path::new("generated"), &rendered)?;
-        assert_eq!(
-            frontmatter_string(&metadata, "name"),
-            Some(generated_name.as_str())
-        );
-        assert_eq!(
-            frontmatter_string(&metadata, "description"),
-            Some("Original description")
-        );
-        assert_eq!(frontmatter_string(&metadata, "color"), Some("blue"));
-        let extra_metadata = frontmatter_mapping(&metadata, "metadata").unwrap();
-        assert_eq!(
-            frontmatter_string(extra_metadata, "owner"),
-            Some("team-skillenv")
-        );
-        assert_eq!(
-            frontmatter_string(extra_metadata, "skillenv.source"),
-            Some(expected_source.as_str())
-        );
-        assert_eq!(
-            frontmatter_string(extra_metadata, "skillenv.scope_origin"),
-            Some(expected_scope_origin.as_str())
-        );
-        assert_eq!(body, "\nBody text\n");
-        assert_eq!(
-            fs::read_to_string(generated.join("assets/info.txt")).unwrap(),
-            "extra"
-        );
-        assert!(generated.join(GENERATED_MARKER_FILE).is_file());
-        Ok(())
-    }
-
-    #[test]
-    fn render_creates_frontmatter_when_missing() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some("Body only\n"),
-            "Body only",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let generated_name = format!("skillenv-{repo_slug}-default-research");
-        let expected_source = format!("{repo_slug}/default/research");
-        let expected_scope_origin = repo.path().join("skillenv/default").display().to_string();
-        let generated = repo
-            .path()
-            .join(".agents/skills")
-            .join(&generated_name)
-            .join("SKILL.md");
-        let rendered = fs::read_to_string(generated).unwrap();
-        let (metadata, body) = parse_frontmatter(Path::new("generated"), &rendered)?;
-        assert_eq!(
-            frontmatter_string(&metadata, "name"),
-            Some(generated_name.as_str())
-        );
-        assert_eq!(
-            frontmatter_string(&metadata, "description"),
-            Some("Body only")
-        );
-        let extra_metadata = frontmatter_mapping(&metadata, "metadata").unwrap();
-        assert_eq!(
-            frontmatter_string(extra_metadata, "skillenv.source"),
-            Some(expected_source.as_str())
-        );
-        assert_eq!(
-            frontmatter_string(extra_metadata, "skillenv.scope_origin"),
-            Some(expected_scope_origin.as_str())
-        );
-        assert_eq!(body, "\nBody only\n");
-        Ok(())
-    }
-
-    #[test]
-    fn render_replaces_legacy_description_with_non_provenance_fallback() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let scope_origin = repo.path().join("skillenv/default");
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        let skill_md = format!(
-            r#"---
-description: "[skillenv: {repo_slug}/default/research] repo={}"
----
-
-# Research Skill
-
-```bash
-echo test
-```
-"#,
-            scope_origin.display()
-        );
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some(skill_md.as_str()),
-            "ignored",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let expected_source = format!("{repo_slug}/default/research");
-        let expected_scope_origin = scope_origin.display().to_string();
-        let rendered = fs::read_to_string(
-            repo.path()
-                .join(".agents/skills")
-                .join(format!("skillenv-{repo_slug}-default-research"))
-                .join("SKILL.md"),
-        )
-        .unwrap();
-        let (metadata, body) = parse_frontmatter(Path::new("generated"), &rendered)?;
-        assert_eq!(
-            frontmatter_string(&metadata, "description"),
-            Some("Instructions for the research skill.")
-        );
-        let extra_metadata = frontmatter_mapping(&metadata, "metadata").unwrap();
-        assert_eq!(
-            frontmatter_string(extra_metadata, "skillenv.source"),
-            Some(expected_source.as_str())
-        );
-        assert_eq!(
-            frontmatter_string(extra_metadata, "skillenv.scope_origin"),
-            Some(expected_scope_origin.as_str())
-        );
-        assert_eq!(body, "\n# Research Skill\n\n```bash\necho test\n```\n");
-        Ok(())
-    }
-
-    #[test]
-    fn render_rejects_non_mapping_metadata_field() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some(
-                r#"---
-metadata: legacy-value
----
-
-Body text
-"#,
-            ),
-            "Body text",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        let error = link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))
-            .unwrap_err();
-
-        assert!(matches!(error, SkillenvError::InvalidMetadataField { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn symlink_strategy_creates_direct_symlink_and_leaves_source_unchanged() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "symlink"
-"#,
-        )?;
-        let source_path = write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some("plain body\n"),
-            "plain body",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let generated = repo
-            .path()
-            .join(".agents/skills")
-            .join(format!("skillenv-{repo_slug}-default-research"));
-        let metadata = fs::symlink_metadata(&generated).unwrap();
-        assert!(metadata.file_type().is_symlink());
-        assert_eq!(
-            normalize_path(&fs::read_link(&generated).unwrap()),
-            normalize_path(&source_path)
-        );
-        assert_eq!(
-            fs::read_to_string(source_path.join("SKILL.md")).unwrap(),
-            "plain body\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unlink_only_removes_safe_symlinks() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "symlink"
-"#,
-        )?;
-        let source_path = write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some("plain body\n"),
-            "plain body",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let target_dir = repo.path().join(".agents/skills");
-        let unsafe_target = TempDir::new().unwrap();
-        let unsafe_name = target_dir.join(format!("skillenv-{repo_slug}-default-unsafe"));
-        create_symlink(unsafe_target.path(), &unsafe_name).unwrap();
-        let handwritten = target_dir.join("handmade");
-        ensure_dir(&handwritten)?;
-
-        unlink_repo_with_config(repo.path(), &UnlinkOptions::default(), Some(&config_path))?;
-
-        assert!(
-            !target_dir
-                .join(format!("skillenv-{repo_slug}-default-research"))
-                .exists()
-        );
-        assert!(unsafe_name.exists());
-        assert!(handwritten.exists());
-        assert!(source_path.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn unlink_still_works_when_source_discovery_would_fail() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            None,
-            "primary source",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        write_skill(
-            repo.path(),
-            "skillenv/default/Research",
-            None,
-            "duplicate source",
-        )?;
-
-        unlink_repo_with_config(repo.path(), &UnlinkOptions::default(), Some(&config_path))?;
-
-        assert!(
-            !repo
-                .path()
-                .join(".agents/skills")
-                .join(format!("skillenv-{repo_slug}-default-research"))
-                .exists()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn unlink_removes_symlinks_after_source_root_is_deleted() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "symlink"
-"#,
-        )?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some("plain body\n"),
-            "plain body",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        fs::remove_dir_all(repo.path().join("skillenv")).unwrap();
-        unlink_repo_with_config(repo.path(), &UnlinkOptions::default(), Some(&config_path))?;
-
-        assert!(
-            !repo
-                .path()
-                .join(".agents/skills")
-                .join(format!("skillenv-{repo_slug}-default-research"))
-                .exists()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn link_refuses_to_overwrite_unmanaged_target() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(repo.path(), "")?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            None,
-            "primary source",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        let collision = repo
-            .path()
-            .join(".agents/skills")
-            .join(format!("skillenv-{repo_slug}-default-research"));
-        ensure_dir(&collision)?;
-        fs::write(collision.join("README.md"), "manual content").unwrap();
-
-        let error = link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))
-            .unwrap_err();
-        assert!(matches!(error, SkillenvError::TargetCollision { .. }));
-        assert_eq!(
-            fs::read_to_string(collision.join("README.md")).unwrap(),
-            "manual content"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn link_default_local_only_leaves_profiles_in_place() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            None,
-            "repo default",
-        )?;
-        write_skill(
-            repo.path(),
-            "skillenv/profiles/review/lint",
-            None,
-            "profile",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(
-            repo.path(),
-            &LinkOptions {
-                selector: ScopeSelector::All,
-                claude: TargetOverride::UseConfig,
-                quiet: false,
-            },
-            Some(&config_path),
-        )?;
-
-        fs::remove_dir_all(repo.path().join("skillenv/default/research")).unwrap();
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        assert!(
-            !repo
-                .path()
-                .join(".agents/skills")
-                .join(format!("skillenv-{repo_slug}-default-research"))
-                .exists()
-        );
-        assert!(
-            repo.path()
-                .join(".agents/skills")
-                .join(format!("skillenv-{repo_slug}-profile-review-lint"))
-                .exists()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn link_profile_targets_only_requested_profile() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        write_skill(repo.path(), "skillenv/profiles/review/lint", None, "review")?;
-        write_skill(
-            repo.path(),
-            "skillenv/profiles/migration/check",
-            None,
-            "migration",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        link_repo_with_config(
-            repo.path(),
-            &LinkOptions {
-                selector: ScopeSelector::Profiles(vec!["review".to_string()]),
-                claude: TargetOverride::UseConfig,
-                quiet: false,
-            },
-            Some(&config_path),
-        )?;
-
-        assert!(
-            repo.path()
-                .join(".agents/skills")
-                .join(format!("skillenv-{repo_slug}-profile-review-lint"))
-                .exists()
-        );
-        assert!(
-            !repo
-                .path()
-                .join(".agents/skills")
-                .join(format!("skillenv-{repo_slug}-profile-migration-check"))
-                .exists()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn link_all_cleans_current_repo_stale_entries_only() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let target_dir = repo.path().join(".agents/skills");
-        let stale_current = target_dir.join(format!("skillenv-{repo_slug}-local-stale"));
-        ensure_dir(&stale_current)?;
-        let stale_marker = GeneratedMarker {
-            repo: repo_slug.clone(),
-            scope: "local".to_string(),
-            skill: "stale".to_string(),
-            generated_name: format!("skillenv-{repo_slug}-local-stale"),
-            source: repo
-                .path()
-                .join("skillenv/local/stale")
-                .display()
-                .to_string(),
-            strategy: Strategy::Render,
-        };
-        fs::write(
-            stale_current.join(GENERATED_MARKER_FILE),
-            serde_json::to_string_pretty(&stale_marker).unwrap(),
-        )
-        .unwrap();
-
-        let other_repo = target_dir.join("skillenv-other-default-keep");
-        ensure_dir(&other_repo)?;
-        fs::write(
-            other_repo.join(GENERATED_MARKER_FILE),
-            serde_json::to_string_pretty(&GeneratedMarker {
-                repo: "other".to_string(),
-                scope: "default".to_string(),
-                skill: "keep".to_string(),
-                generated_name: "skillenv-other-default-keep".to_string(),
-                source: repo.path().display().to_string(),
-                strategy: Strategy::Render,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-        let manual = target_dir.join("manual-skill");
-        ensure_dir(&manual)?;
-
-        link_repo_with_config(
-            repo.path(),
-            &LinkOptions {
-                selector: ScopeSelector::All,
-                claude: TargetOverride::UseConfig,
-                quiet: false,
-            },
-            Some(&config_path),
-        )?;
-
-        assert!(!stale_current.exists());
-        assert!(other_repo.exists());
-        assert!(manual.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn cleanup_skips_rendered_directory_outside_known_roots() -> Result<()> {
-        let repo = repo_fixture()?;
-        let repo_slug = test_repo_slug(repo.path());
-        let config_path = write_config(repo.path(), "")?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-        init_test_repo(repo.path(), &config_path)?;
-
-        let target_dir = repo.path().join(".agents/skills");
-        let copied = target_dir.join(format!("skillenv-{repo_slug}-default-copied"));
-        ensure_dir(&copied)?;
-        fs::write(
-            copied.join(GENERATED_MARKER_FILE),
-            serde_json::to_string_pretty(&GeneratedMarker {
-                repo: repo_slug.clone(),
-                scope: "default".to_string(),
-                skill: "copied".to_string(),
-                generated_name: format!("skillenv-{repo_slug}-default-copied"),
-                source: "/tmp/not-managed/copied".to_string(),
-                strategy: Strategy::Render,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        assert!(copied.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn init_creates_layout_and_updates_gitignore() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
-
-        let report =
-            init_repo_with_config(repo.path(), &InitOptions::default(), Some(&config_path))?;
-        let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-
-        assert_eq!(report.created_dirs.len(), 3);
-        assert!(repo.path().join("skillenv/default").is_dir());
-        assert!(repo.path().join("skillenv/local").is_dir());
-        assert!(repo.path().join("skillenv/profiles").is_dir());
-        assert!(report.gitignore_updated);
-        assert!(gitignore.contains(".agents/skills/skillenv-*"));
-        assert!(gitignore.contains("skillenv/local/"));
-        assert!(!gitignore.contains(".claude/skills/skillenv-*"));
-        Ok(())
-    }
-
-    #[test]
-    fn init_is_idempotent_and_uses_claude_target_config() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[targets]
-claude = true
-"#,
-        )?;
-
-        let first =
-            init_repo_with_config(repo.path(), &InitOptions::default(), Some(&config_path))?;
-        let once = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-        let second =
-            init_repo_with_config(repo.path(), &InitOptions::default(), Some(&config_path))?;
-        let twice = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-
-        assert_eq!(once, twice);
-        assert_eq!(first.created_dirs.len(), 3);
-        assert!(second.created_dirs.is_empty());
-        assert!(first.gitignore_updated);
-        assert!(!second.gitignore_updated);
-        assert!(twice.contains(".agents/skills/skillenv-*"));
-        assert!(twice.contains(".claude/skills/skillenv-*"));
-        assert!(twice.contains("skillenv/local/"));
-        Ok(())
-    }
-
-    #[test]
-    fn link_does_not_change_gitignore_after_init() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-        init_test_repo(repo.path(), &config_path)?;
-        let before = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-
-        let report =
-            link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-        let after = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
-
-        assert!(!report.gitignore_updated);
-        assert_eq!(before, after);
-        Ok(())
-    }
-
-    #[test]
-    fn status_uses_linked_and_not_linked() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let before =
-            status_repo_with_config(repo.path(), &StatusOptions::default(), Some(&config_path))?;
-        let before_text = format_status_report(&before);
-        assert!(before_text.contains(".agents/skills: not linked"));
-
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-        let after =
-            status_repo_with_config(repo.path(), &StatusOptions::default(), Some(&config_path))?;
-        let after_text = format_status_report(&after);
-        assert!(after_text.contains(".agents/skills: linked"));
-        Ok(())
-    }
-
-    #[test]
-    fn repo_local_link_requires_init_but_quiet_is_noop() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let error = link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))
-            .unwrap_err();
-        assert!(matches!(error, SkillenvError::RepoNotInitialized));
-        assert!(!repo.path().join(".agents/skills").exists());
-
-        let report = link_repo_with_config(
-            repo.path(),
-            &LinkOptions {
-                quiet: true,
-                ..LinkOptions::default()
-            },
-            Some(&config_path),
-        )?;
-        assert!(report.message.is_none());
-        assert!(report.target_reports.is_empty());
-        assert!(!repo.path().join(".agents/skills").exists());
-        assert!(!repo.path().join(".gitignore").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn repo_local_unlink_still_works_before_init() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(repo.path(), "")?;
-        let source_dir = write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::RepoLocal)
-            .generated_name(&ScopeKey::Default, "research");
-        let generated_dir = repo.path().join(".agents/skills").join(generated_name);
-        ensure_dir(&generated_dir)?;
-        fs::write(
-            generated_dir.join(GENERATED_MARKER_FILE),
-            serde_json::to_string_pretty(&GeneratedMarker {
-                repo: test_repo_slug(repo.path()),
-                scope: "default".to_string(),
-                skill: "research".to_string(),
-                generated_name: generated_dir
-                    .file_name()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("generated")
-                    .to_string(),
-                source: source_dir.display().to_string(),
-                strategy: Strategy::Render,
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let report =
-            unlink_repo_with_config(repo.path(), &UnlinkOptions::default(), Some(&config_path))?;
-        assert_eq!(report.target_reports[0].removed, 1);
-        assert!(!generated_dir.exists());
-        assert!(!repo.path().join(".gitignore").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn global_link_uses_home_targets_without_repo_init() -> Result<()> {
-        let repo = repo_fixture()?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        let report = link_global(repo.path(), LinkOptions::default())?;
-
-        let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::Global)
-            .generated_name(&ScopeKey::Default, "research");
-        let target_dir = home.path().join(".agents/skills");
-        assert_eq!(report.target_reports.len(), 1);
-        assert_eq!(report.target_reports[0].path, Some(target_dir.clone()));
-        assert!(target_dir.join(generated_name).exists());
-        assert!(!repo.path().join(".gitignore").exists());
-        assert!(!repo.path().join("skillenv/local").exists());
-        assert!(!repo.path().join("skillenv/profiles").exists());
-        Ok(())
-    }
-
-    #[test]
-    fn global_link_supports_claude_target() -> Result<()> {
-        let repo = repo_fixture()?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        let report = link_global(
-            repo.path(),
-            LinkOptions {
-                claude: TargetOverride::ForceEnabled,
-                ..LinkOptions::default()
-            },
-        )?;
-
-        assert_eq!(report.target_reports.len(), 2);
-        assert!(home.path().join(".agents/skills").is_dir());
-        assert!(home.path().join(".claude/skills").is_dir());
-        Ok(())
-    }
-
-    #[test]
-    fn global_unlink_and_status_use_home_targets() -> Result<()> {
-        let repo = repo_fixture()?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        link_global(repo.path(), LinkOptions::default())?;
-
-        let target_dir = home.path().join(".agents/skills");
-        ensure_dir(&target_dir.join("manual-skill"))?;
-
-        let before = status_global(repo.path(), StatusOptions::default())?;
-        assert_eq!(before.target_statuses[0].path, Some(target_dir.clone()));
-        assert_eq!(before.target_statuses[0].state, LinkState::Linked);
-        assert_eq!(before.target_statuses[0].managed_count, 1);
-        assert!(format_status_report(&before).contains(&target_dir.display().to_string()));
-
-        unlink_global(repo.path(), UnlinkOptions::default())?;
-
-        assert!(
-            !target_dir
-                .join(
-                    GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::Global)
-                        .generated_name(&ScopeKey::Default, "research")
-                )
-                .exists()
-        );
-        assert!(target_dir.join("manual-skill").exists());
-
-        let after = status_global(repo.path(), StatusOptions::default())?;
-        assert_eq!(after.target_statuses[0].state, LinkState::NotLinked);
-        assert_eq!(after.target_statuses[0].managed_count, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn global_names_include_repo_path_hash_to_avoid_collisions() -> Result<()> {
-        let parent_one = TempDir::new().unwrap();
-        let parent_two = TempDir::new().unwrap();
-        let repo_one = repo_root_fixture(parent_one.path(), "demo")?;
-        let repo_two = repo_root_fixture(parent_two.path(), "demo")?;
-        write_skill(&repo_one, "skillenv/default/research", None, "default")?;
-        write_skill(&repo_two, "skillenv/default/research", None, "default")?;
-
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        link_global(&repo_one, LinkOptions::default())?;
-        link_global(&repo_two, LinkOptions::default())?;
-
-        let name_one = GeneratedNameLayout::for_mode(&repo_one, TargetRootMode::Global)
-            .generated_name(&ScopeKey::Default, "research");
-        let name_two = GeneratedNameLayout::for_mode(&repo_two, TargetRootMode::Global)
-            .generated_name(&ScopeKey::Default, "research");
-
-        assert_ne!(name_one, name_two);
-        assert!(home.path().join(".agents/skills").join(name_one).exists());
-        assert!(home.path().join(".agents/skills").join(name_two).exists());
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn global_alias_path_reuses_same_managed_entries() -> Result<()> {
-        let repo = repo_fixture()?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let alias_parent = TempDir::new().unwrap();
-        let alias_path = alias_parent.path().join("repo-alias");
-        create_symlink(repo.path(), &alias_path).unwrap();
-
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        link_global(repo.path(), LinkOptions::default())?;
-
-        let status_via_alias = status_global(&alias_path, StatusOptions::default())?;
-        assert_eq!(status_via_alias.target_statuses[0].managed_count, 1);
-
-        unlink_global(&alias_path, UnlinkOptions::default())?;
-
-        let status_after_unlink = status_global(repo.path(), StatusOptions::default())?;
-        assert_eq!(status_after_unlink.target_statuses[0].managed_count, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn global_link_fails_without_home() -> Result<()> {
-        let repo = repo_fixture()?;
-        write_skill(repo.path(), "skillenv/default/research", None, "default")?;
-
-        let _home = set_home_for_test(None);
-        let error = link_global(repo.path(), LinkOptions::default()).unwrap_err();
-        assert!(matches!(error, SkillenvError::HomeNotSet));
         Ok(())
     }
 
@@ -3652,107 +1102,6 @@ name: gravity
                 && entry.scope == "global"
                 && entry.name == "gravity"
         }));
-        Ok(())
-    }
-
-    #[test]
-    fn skill_inventory_marks_rendered_skillenv_entries() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "render"
-"#,
-        )?;
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some(
-                r#"---
-description: rendered
----
-"#,
-            ),
-            "rendered",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::RepoLocal)
-            .generated_name(&ScopeKey::Default, "research");
-        let report = take_inventory(
-            repo.path(),
-            &SkillInventoryOptions {
-                tools: vec![SkillInventoryTool::Codex],
-                repo_tree: false,
-            },
-        )?;
-        let entry = report
-            .entries
-            .iter()
-            .find(|entry| entry.tool == SkillInventoryTool::Codex && entry.name == generated_name)
-            .unwrap();
-        assert!(entry.skillenv_managed);
-        // A v0 marker records where it was rendered from; that path is reported
-        // as-is rather than being matched back against the scope directories it
-        // used to live under. Inferring "repo:default" required inventory to know
-        // the whole v0 layout, and went wrong the moment those directories moved.
-        assert!(
-            entry.skillenv_origin.starts_with("legacy:"),
-            "unexpected origin: {}",
-            entry.skillenv_origin
-        );
-        assert!(entry.skillenv_origin.contains("skillenv/default/research"));
-        Ok(())
-    }
-
-    #[test]
-    fn skill_inventory_marks_symlinked_skillenv_entries() -> Result<()> {
-        let repo = repo_fixture()?;
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[defaults]
-strategy = "symlink"
-"#,
-        )?;
-        let home = TempDir::new().unwrap();
-        let _home = set_home_for_test(Some(home.path()));
-        write_skill(
-            repo.path(),
-            "skillenv/default/research",
-            Some("plain body\n"),
-            "plain",
-        )?;
-        init_test_repo(repo.path(), &config_path)?;
-        link_repo_with_config(repo.path(), &LinkOptions::default(), Some(&config_path))?;
-
-        let generated_name = GeneratedNameLayout::for_mode(repo.path(), TargetRootMode::RepoLocal)
-            .generated_name(&ScopeKey::Default, "research");
-        let report = take_inventory(
-            repo.path(),
-            &SkillInventoryOptions {
-                tools: vec![SkillInventoryTool::Codex],
-                repo_tree: false,
-            },
-        )?;
-        let entry = report
-            .entries
-            .iter()
-            .find(|entry| entry.tool == SkillInventoryTool::Codex && entry.name == generated_name)
-            .unwrap();
-        assert!(entry.skillenv_managed);
-        // A symlinked entry has no marker, so the link target is all that can
-        // honestly be reported about it.
-        assert!(
-            entry.skillenv_origin.starts_with("symlink:"),
-            "unexpected origin: {}",
-            entry.skillenv_origin
-        );
-        assert!(entry.skillenv_origin.contains("skillenv/default/research"));
         Ok(())
     }
 
@@ -4146,62 +1495,334 @@ description: repo agent
         Ok(())
     }
 
+    /// Write a generated directory with a marker, the way `link` would, without
+    /// going through a deployment. The point is to fix the two marker shapes the
+    /// inventory has to read: v0 wrote one, v1 writes the other, and both exist on
+    /// a machine that has migrated.
+    fn write_marked_skill(target: &Path, name: &str, marker: &str) -> Result<()> {
+        let dir = target.join(name);
+        ensure_dir(&dir)?;
+        for (file, body) in [
+            ("SKILL.md", "---\ndescription: marked\n---\n"),
+            (GENERATED_MARKER_FILE, marker),
+        ] {
+            let path = dir.join(file);
+            fs::write(&path, body).map_err(|source| SkillenvError::WriteFile { path, source })?;
+        }
+        Ok(())
+    }
+
+    fn codex_entry<'a>(report: &'a SkillInventoryReport, name: &str) -> &'a SkillInventoryEntry {
+        report
+            .entries
+            .iter()
+            .find(|entry| entry.tool == SkillInventoryTool::Codex && entry.name == name)
+            .unwrap_or_else(|| panic!("no codex entry named {name}"))
+    }
+
+    /// A v0 marker records the path it was rendered from. That path is reported
+    /// as-is rather than matched back against the scope directories it used to live
+    /// under: inferring `repo:default` required the inventory to know the whole v0
+    /// layout, and went wrong the moment those directories moved.
     #[test]
-    fn doctor_reports_config_path_and_external_sources() -> Result<()> {
+    fn inventory_reports_a_v0_marker_by_its_recorded_source_path() -> Result<()> {
         let repo = repo_fixture()?;
         let home = TempDir::new().unwrap();
         let _home = set_home_for_test(Some(home.path()));
-        let config_path = write_config(
-            repo.path(),
-            r#"
-[targets]
-claude = true
 
-[defaults]
-strategy = "symlink"
-
-[[external_sources]]
-name = "shared"
-path = "../shared/{repo}"
-"#,
+        write_marked_skill(
+            &repo.path().join(".agents/skills"),
+            "skillenv-demo-default-research",
+            r#"{"repo":"demo","scope":"default","skill":"research",
+                "generated_name":"skillenv-demo-default-research",
+                "source":"/somewhere/skillenv/default/research","strategy":"render"}"#,
         )?;
-        let expected_external_root = resolve_external_root(
-            &ExternalSourceConfig {
-                name: "shared".to_string(),
-                path: "../shared/{repo}".to_string(),
+
+        let report = take_inventory(
+            repo.path(),
+            &SkillInventoryOptions {
+                tools: vec![SkillInventoryTool::Codex],
+                repo_tree: false,
             },
-            &test_repo_slug(repo.path()),
-            config_path.parent(),
+        )?;
+        let entry = codex_entry(&report, "skillenv-demo-default-research");
+        assert!(entry.skillenv_managed);
+        assert!(
+            entry.skillenv_origin.starts_with("legacy:"),
+            "unexpected origin: {}",
+            entry.skillenv_origin
         );
-        ensure_dir(&expected_external_root)?;
+        assert!(entry.skillenv_origin.contains("skillenv/default/research"));
+        Ok(())
+    }
 
-        let report = doctor_with_config(repo.path(), &DoctorOptions, Some(&config_path))?;
+    /// A v1 marker has no `repo` or `scope` field. Reading it must not fail: a
+    /// marker that cannot be parsed is a directory that can never be identified as
+    /// generated, and so can never be cleaned up. This shape was rejected once.
+    #[test]
+    fn inventory_reads_a_v1_marker_without_the_v0_fields() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
 
-        assert_eq!(report.config_path, Some(config_path));
-        assert!(report.config_exists);
-        assert_eq!(report.repo_root, Some(repo.path().to_path_buf()));
-        assert_eq!(report.home_dir, Some(home.path().to_path_buf()));
-        assert!(!report.repo_initialized.unwrap());
-        assert!(report.config.targets_agents);
-        assert!(report.config.targets_claude);
-        assert_eq!(report.config.strategy, Strategy::Symlink);
-        assert_eq!(report.external_sources.len(), 1);
-        assert_eq!(report.external_sources[0].name, "shared");
+        write_marked_skill(
+            &repo.path().join(".agents/skills"),
+            "skillenv-demo-research",
+            r#"{"manifest":"demo-a1b2c3d4e5f6","skill":"research",
+                "generated_name":"skillenv-demo-research","provider":"agents",
+                "revision":"cea10b92","content_digest":"sha256:abc"}"#,
+        )?;
+
+        let report = take_inventory(
+            repo.path(),
+            &SkillInventoryOptions {
+                tools: vec![SkillInventoryTool::Codex],
+                repo_tree: false,
+            },
+        )?;
+        let entry = codex_entry(&report, "skillenv-demo-research");
+        assert!(entry.skillenv_managed);
+        assert_eq!(entry.skillenv_origin, "manifest:demo-a1b2c3d4e5f6");
+        Ok(())
+    }
+
+    /// A directory carrying the prefix but no marker is still listed — it is
+    /// visible to the tool, which is what this report is about — and is not claimed
+    /// as skillenv's, because there is no evidence it is.
+    #[test]
+    fn inventory_does_not_claim_a_prefixed_directory_without_a_marker() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        write_skill(
+            repo.path(),
+            ".agents/skills/skillenv-demo-handmade",
+            Some("---\ndescription: mine\n---\n"),
+            "mine",
+        )?;
+
+        let report = take_inventory(
+            repo.path(),
+            &SkillInventoryOptions {
+                tools: vec![SkillInventoryTool::Codex],
+                repo_tree: false,
+            },
+        )?;
+        let entry = codex_entry(&report, "skillenv-demo-handmade");
+        assert!(!entry.skillenv_managed);
+        assert_eq!(entry.skillenv_origin, "manual");
+        Ok(())
+    }
+
+    /// `init` writes a manifest a subsequent `link` can actually load, and leaves
+    /// an existing one alone: it is the only hand-written input, so overwriting it
+    /// would discard the whole configuration.
+    #[test]
+    fn init_writes_a_loadable_manifest_and_never_replaces_one() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+
+        let first = init_manifest(repo.path())?;
+        assert!(first.contains("created skillenv.toml"));
+        assert!(first.contains("created skills/"));
+        assert!(first.contains(".gitignore updated"));
+
+        let manifest = repo.path().join("skillenv.toml");
+        fs::write(&manifest, "[skillenv]\nversion = 1\n").unwrap();
+        let second = init_manifest(repo.path())?;
+        assert!(second.contains("already exists"));
         assert_eq!(
-            report.external_sources[0].resolved_path,
-            Some(expected_external_root)
+            fs::read_to_string(&manifest).unwrap(),
+            "[skillenv]\nversion = 1\n"
+        );
+        // Second run adds nothing: the entries are already there.
+        assert!(!second.contains(".gitignore updated"));
+
+        let gitignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+        for pattern in V1_GITIGNORE {
+            assert!(gitignore.contains(pattern), "missing {pattern}");
+        }
+        Ok(())
+    }
+
+    /// The template has to parse and resolve, or `init` hands the user a file that
+    /// fails on the next command.
+    #[test]
+    fn the_init_template_is_a_valid_manifest() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        init_manifest(repo.path())?;
+
+        assert!(has_manifest(repo.path()));
+        // No skills declared yet, so this reports an empty catalog rather than
+        // failing.
+        let (listed, _) = status_manifest(repo.path())?;
+        assert!(!listed.is_empty());
+        let (_, findings) = lint_manifest(repo.path())?;
+        assert!(!findings, "a fresh manifest should have no findings");
+        Ok(())
+    }
+
+    /// `status` reports directories belonging to another manifest instead of
+    /// hiding them. Under `$HOME` two repositories share one directory, and a count
+    /// that silently excluded the other's would disagree with `ls`.
+    #[test]
+    fn status_reports_another_manifests_deployment_without_claiming_it() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        fs::write(
+            repo.path().join("skillenv.toml"),
+            "[skillenv]\nversion = 1\n\n[[deploy]]\ntarget = \"agents:repo\"\ninclude = [\"*\"]\n",
+        )
+        .unwrap();
+        write_marked_skill(
+            &repo.path().join(".agents/skills"),
+            "skillenv-other-research",
+            r#"{"manifest":"other-000000000000","skill":"research",
+                "generated_name":"skillenv-other-research","provider":"agents"}"#,
+        )?;
+
+        let (text, problems) = status_manifest(repo.path())?;
+        assert!(text.contains("0 deployed"), "unexpected report: {text}");
+        assert!(text.contains("manifest other-000000000000"));
+        assert!(!problems);
+        Ok(())
+    }
+
+    /// `doctor` answers "why did it go there", so the manifest it chose and the
+    /// cache it would read have to appear. The JSON form carries the same facts.
+    #[test]
+    fn doctor_reports_the_resolved_manifest_and_cache() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+        init_manifest(repo.path())?;
+
+        let text = doctor_manifest(repo.path(), false)?;
+        assert!(text.contains("manifest:"));
+        assert!(text.contains("skillenv.toml"));
+        assert!(text.contains("cache:"));
+        assert!(text.contains("0 source(s)"));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&doctor_manifest(repo.path(), true)?).unwrap();
+        assert_eq!(json["catalog"]["skills"], 0);
+        assert_eq!(json["cache"]["sources"], 0);
+        assert!(
+            json["manifest"]
+                .as_str()
+                .unwrap()
+                .ends_with("skillenv.toml")
+        );
+        Ok(())
+    }
+
+    /// Removing a `[[source]]` must not touch a skill that merely shares its name.
+    ///
+    /// Id uniqueness is only enforced between skill ids, and a source's label is a
+    /// different namespace — so a source may be called `review-tools` while a
+    /// *different* source contributes a skill with that id. Keying the lock removal
+    /// on the parsed id rather than on which kind of entry was removed deleted that
+    /// unrelated skill's lock entry, and the relink then took its directory too,
+    /// reported only inside the removal's own count.
+    ///
+    /// The name must not appear as a `[[skill]]` entry, or the removal would match
+    /// that first and never reach the source branch.
+    #[test]
+    fn removing_a_source_spares_another_sources_skill_of_the_same_name() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+
+        fs::write(
+            repo.path().join("skillenv.toml"),
+            "[skillenv]\nversion = 1\n\n\
+             [[source]]\nname = \"review-tools\"\nfrom = \"github:me/review-tools\"\n\
+             skills = [\"formatter\"]\n\n\
+             [[source]]\nname = \"other\"\nfrom = \"github:me/other-repo\"\n\
+             skills = [\"review-tools\"]\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+        )
+        .unwrap();
+        // Both already fetched, as far as the lock is concerned. Written by hand so
+        // the test needs no network.
+        fs::write(
+            repo.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"formatter","source":"github:me/review-tools",
+                 "source_name":"review-tools","resolved_revision":"aaaa",
+                 "content_digest":"sha256:aa","safeguard":{}},
+                {"id":"review-tools","source":"github:me/other-repo",
+                 "source_name":"other","resolved_revision":"bbbb",
+                 "content_digest":"sha256:bb","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        remove_from_manifest(repo.path(), "review-tools")?;
+
+        let manifest = fs::read_to_string(repo.path().join("skillenv.toml")).unwrap();
+        assert!(
+            !manifest.contains("github:me/review-tools"),
+            "the source should be gone: {manifest}"
         );
         assert!(
-            report
-                .repo_targets
-                .iter()
-                .any(|target| target.label == ".agents/skills")
+            manifest.contains("github:me/other-repo"),
+            "the other source must remain: {manifest}"
+        );
+
+        let lock = fs::read_to_string(repo.path().join("skillenv.lock")).unwrap();
+        assert!(
+            !lock.contains("\"formatter\""),
+            "the removed source's own skill should go with it: {lock}"
         );
         assert!(
-            report
-                .global_targets
-                .iter()
-                .any(|target| target.path == Some(home.path().join(".agents/skills")))
+            lock.contains("\"review-tools\""),
+            "the other source's identically-named skill must survive: {lock}"
+        );
+        assert!(lock.contains("\"other\""));
+        Ok(())
+    }
+
+    /// A removal relinks, and that relink can block or skip a skill. Every other
+    /// command turns that into a non-zero exit; this one must too, or a scripted
+    /// caller cannot tell that something went wrong.
+    #[test]
+    fn removing_a_skill_reports_a_problem_the_relink_found() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+
+        let dir = repo.path().join("skills/keeper");
+        ensure_dir(&dir)?;
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: keeper\ndescription: Stays behind.\n---\n\nBody\n",
+        )
+        .unwrap();
+        // `absent` is declared with no directory, so the relink cannot prepare it.
+        fs::write(
+            repo.path().join("skillenv.toml"),
+            "[skillenv]\nversion = 1\n\n\
+             [[skill]]\nname = \"keeper\"\nsource = \"local\"\n\n\
+             [[skill]]\nname = \"absent\"\nsource = \"local\"\n\n\
+             [[skill]]\nname = \"doomed\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+        )
+        .unwrap();
+
+        let report = remove_from_manifest(repo.path(), "doomed")?;
+        assert!(report.summary.contains("removed skill doomed"));
+        assert!(
+            report.problems,
+            "the relink could not prepare `absent`; that must reach the exit code"
+        );
+        assert!(
+            report.warnings.iter().any(|line| line.contains("absent")),
+            "got: {:?}",
+            report.warnings
         );
         Ok(())
     }
@@ -4210,28 +1831,6 @@ path = "../shared/{repo}"
         let dir = TempDir::new().unwrap();
         ensure_dir(&dir.path().join(".git"))?;
         Ok(dir)
-    }
-
-    fn repo_root_fixture(parent: &Path, name: &str) -> Result<PathBuf> {
-        let repo_root = parent.join(name);
-        ensure_dir(&repo_root)?;
-        ensure_dir(&repo_root.join(".git"))?;
-        Ok(repo_root)
-    }
-
-    fn init_test_repo(repo_root: &Path, config_path: &Path) -> Result<()> {
-        init_repo_with_config(repo_root, &InitOptions::default(), Some(config_path)).map(|_| ())
-    }
-
-    fn write_config(repo_root: &Path, body: &str) -> Result<PathBuf> {
-        let config_dir = repo_root.join("test-home/.config/skillenv");
-        ensure_dir(&config_dir)?;
-        let path = config_dir.join("config.toml");
-        fs::write(&path, body).map_err(|source| SkillenvError::WriteFile {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(path)
     }
 
     fn write_skill(
@@ -4249,15 +1848,5 @@ path = "../shared/{repo}"
             source,
         })?;
         Ok(dir)
-    }
-
-    fn test_repo_slug(repo_root: &Path) -> String {
-        slugify_or(
-            repo_root
-                .file_name()
-                .and_then(OsStr::to_str)
-                .unwrap_or("repo"),
-            "repo",
-        )
     }
 }

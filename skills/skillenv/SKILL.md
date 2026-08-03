@@ -7,15 +7,13 @@ description: skillenv で agent skill を一元管理し、各 provider の skil
 
 skillenv は agent skill を 1 箇所で宣言し、各 provider が読むディレクトリへ展開するツールです。
 
-## まず現在どちらのレイアウトか確認する
-
-skillenv には 2 世代あり、**`skillenv.toml` があるかどうか**で挙動が変わります。
+## まず `skillenv.toml` があるか確認する
 
 ```bash
-ls skillenv.toml        # ある → v1。無い → v0（旧レイアウト）
+ls skillenv.toml        # 無ければ移行が必要
 ```
 
-v0 は `skillenv/{default,local,profiles}/` にディレクトリで scope を表現していました。v1 は `skillenv.toml` に宣言を集約し、skill 名前空間を平坦にしています。**v0 レイアウトはそのまま動き続けます**が、新しい機能（safeguard、gist、outdated、provider 別 frontmatter）は v1 だけにあります。
+**1.0 で v0 レイアウト（`skillenv/{default,local,profiles}/`）の実行経路は削除されました。** `skillenv.toml` が無いリポジトリで動くのは `migrate` だけです。v0 を理解しているコードは移行専用に残してあります。
 
 ## v0 から移行する
 
@@ -52,17 +50,42 @@ skillenv migrate --prune   # 結果を確認してから、旧 skillenv/ を削�
 ## v1 の日常操作
 
 ```bash
+skillenv init             # skillenv.toml と skills/ と .gitignore を用意する
 skillenv list             # 宣言されている skill を source・label つきで一覧
 skillenv lint             # frontmatter の妥当性と安全性検査
-skillenv link             # 展開する
-skillenv outdated         # remote と比べて古いか（読み取り専用、書き込みなし）
 skillenv fetch            # lock の revision で cache を復元
 skillenv fetch --update   # remote の最新に移動する
+skillenv link             # 展開する
+skillenv status           # 各 target に何が展開されているか
+skillenv doctor           # どの manifest / cache / target に解決されたか
+skillenv outdated         # remote と比べて古いか（読み取り専用、書き込みなし）
+skillenv remove <name>    # manifest と lock から外し、展開先も掃除する
+skillenv unlink           # この manifest の展開をすべて削除する
+skillenv skills           # 各 tool から見える skill（管理外も含む）
 ```
+
+`status` と `skills` は役割が違います。**`status` は「この manifest が置いたもの」**、**`skills` は「各 tool から見えるもの全部」**です。手で置いた skill は後者にしか出ません。
+
+`doctor` は「なぜそこに行ったのか」に答えます。展開先が想定と違うとき、あるいはどこにも展開されないときはこれを見ます。
 
 **新しいマシンでは先に `fetch` が必要です。** cache（`.skillenv/cache/`）は git 管理外なので、clone 直後は manifest と lock だけがあります。`fetch` 無しで `link` すると、remote skill が「cache に無い」と名指しで報告されます。
 
 `link` は `--quiet` でも**警告を stderr に出し、問題があれば非 0 で終了します**。shell フックが実行するのはこの形なので、展開できなかった skill が無音で消えないようにするためです。
+
+ただし**manifest が見つからないときは `--quiet` なら無言で成功します**。フックは `cd` ごとに走るので、管理外のディレクトリでエラーを出していたらフック自体が外されてしまいます。手で打った `skillenv link` は従来どおり理由を出して失敗します。
+
+## 他の repo へ展開する（フックを効かせる）
+
+`target = "*:repo"` は「いま立っている repo」を指しますが、`link` は manifest を**上位ディレクトリに遡って**探します。dotfiles の外に `cd` すると manifest が見つからず、`*:repo` のルールは発火しません。
+
+manifest の位置を明示すると、どの repo にいても解決されます。
+
+```bash
+export SKILLENV_MANIFEST="$HOME/tmp/dotfiles/skillenv.toml"
+eval "$(skillenv hook zsh)"
+```
+
+こうすると `cd ~/work/foo` で `~/work/foo/.claude/skills` に展開されます。特定の repo だけに限りたいときは `when.repo` を付けます。
 
 ## skillenv.toml
 
@@ -175,12 +198,17 @@ skill は agent の文脈に直接読み込まれる指示文なので、供給�
 
 `skillenv link` は marker を**最初に**書きます。生成が途中で失敗しても残骸は自分のものと認識され、次回の実行で置き換わります。
 
+削除は marker が「この manifest のものだ」と言っている場合だけです。marker が無いディレクトリ、他の manifest の marker を持つディレクトリは、`status` に出るだけで消されません。`$HOME` は複数リポジトリで共有されるので、この判定を prefix だけに任せると別リポジトリの展開を消してしまいます。
+
+`link` は safeguard の判定結果を `skillenv.lock` に記録しますが、**内容が変わっていなければ書き込みません**。shell フックは `cd` ごとに `link` を走らせるので、毎回 lock を書き換えると git 管理下のファイルが常に差分ありになってしまいます。
+
 ## Rust library として使う
 
 ```rust
-use skillenv::{apply_migration, fetch_manifest, has_manifest, link_manifest,
-               lint_manifest, list_manifest, outdated_manifest, plan_migration,
-               remove_legacy, scan_skill_text, sweep_legacy};
+use skillenv::{apply_migration, doctor_manifest, fetch_manifest, has_manifest,
+               init_manifest, link_manifest, lint_manifest, list_manifest,
+               outdated_manifest, plan_migration, remove_from_manifest,
+               scan_skill_text, status_manifest, unlink_manifest};
 
 // v1 か v0 かを判定する
 if has_manifest(".") {
@@ -209,11 +237,12 @@ for finding in scan_skill_text(&text) {
 | 展開、marker、skill 単位の隔離 | `src/deploy.rs` |
 | 安全性検査 | `src/safeguard/` |
 | 全体の組み立て | `src/session.rs` |
+| コマンド表面 | `src/main.rs` |
 | v0 の掃除と移行 | `src/legacy_sweep.rs`, `src/migrate.rs` |
 
 ## 判断基準
 
-- **v0 レイアウトのまま使い続けてよいか** — 動くが、safeguard も gist も outdated も効かない。移行は 1 コマンドで、`--prune` するまで取り消せる
+- **v0 レイアウトのまま使い続けてよいか** — 1.0 では動かない。`skillenv migrate --apply` が必須。`--prune` するまで取り消せる
 - **`link` が「unavailable」と言う** — cache が無い。`skillenv fetch`
 - **`link` が skill を skip する** — その skill 固有の問題（frontmatter 不正、target 衝突、名前長超過）。理由が出力され、他の skill は展開済み。`skillenv lint` で先に見つけられる
 - **`link` が失敗して止まる** — I/O 障害（書き込み不能、容量不足）。全 skill に影響するので即座に止める設計

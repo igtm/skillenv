@@ -2,93 +2,81 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use skillenv::{
-    DoctorOptions, InitOptions, LinkOptions, ScopeSelector, Shell, SkillInventoryOptions,
-    SkillInventoryTool, StatusOptions, TargetOverride, UnlinkOptions, doctor, format_doctor_report,
-    format_init_report, format_link_report, format_skill_inventory_report, format_status_report,
-    hook_script, init_repo, link_global, link_repo, skill_inventory, status_global, status_repo,
-    unlink_global, unlink_repo,
+    Shell, SkillInventoryOptions, SkillInventoryTool, format_skill_inventory_report, hook_script,
+    skill_inventory,
 };
 
 const ROOT_AFTER_HELP: &str = r#"Workflow:
-  1. Run `skillenv init` once in each repository.
-  2. Put repo-owned skills under `skillenv/default`, `skillenv/local`, or `skillenv/profiles/<profile>`.
-  3. Run `skillenv link` to refresh `.agents/skills` and optional `.claude/skills` outputs.
-  4. Use `skillenv add`, `skillenv fetch`, and `skillenv update` for managed sources recorded in `skillenv.lock.json`.
+  1. Run `skillenv init` once, wherever you want the manifest to live — typically a dotfiles repository.
+  2. Declare your skills, their sources, and where they go, in `skillenv.toml`.
+  3. Run `skillenv fetch` to populate the cache, then `skillenv link` to deploy.
+  4. Use `skillenv outdated` to see what has moved upstream, and `skillenv lint` before trusting new material.
 
-Repo layout:
-  skillenv/
-    default/
-      <skill-name>/SKILL.md
-    local/
-      <skill-name>/SKILL.md
-    profiles/
-      <profile-name>/
-        <skill-name>/SKILL.md
-    remote/
-      <source-name>/...
+Layout:
+  skillenv.toml            the one hand-written file
+  skillenv.lock            what each source resolved to; commit this
+  skills/<name>/SKILL.md   skills you write yourself
+  .skillenv/cache/         fetched sources; not committed
 
-Naming rules:
-  - Repository, profile, skill, and managed source names are normalized to kebab-case.
-  - Repo-local generated names: `skillenv-<repo-slug>-<scope>-<skill-slug>`.
-  - Global generated names: `skillenv-<repo-slug>-g<path-hash>-<scope>-<skill-slug>`.
-  - Profile scopes appear as `profile:<name>` in status output and `profile-<name>` in generated names.
+Naming:
+  - A skill id is `[a-z0-9-]`, at most 32 characters, and unique across every source.
+  - Generated directories are `skillenv-<repo>-<id>` in a repo target, and
+    `skillenv-<repo>-g<hash>-<id>` under `$HOME`, where the hash distinguishes repositories
+    sharing one home directory.
 
 Examples:
   skillenv init
-  skillenv link --profile review
   skillenv fetch
+  skillenv link
+  skillenv status
+  skillenv outdated
+  skillenv lint
   skillenv doctor
-  skillenv add vercel-labs/agent-skills --skill frontend-design
-  skillenv update vercel
-  skillenv global status
   skillenv version"#;
 
-const INIT_AFTER_HELP: &str = r#"This command prepares repo-local skill outputs. It creates the layout below when missing
-and updates `.gitignore` with the managed `skillenv` entries needed for generated targets.
+const INIT_AFTER_HELP: &str = r#"Creates, when missing:
+  skillenv.toml   a commented template with one deploy rule
+  skills/         where your own skills go
 
-Created layout:
-  skillenv/
-    default/
-    local/
-    profiles/
+and adds the managed `skillenv` entries to `.gitignore`, so the cache and any generated
+directories stay out of `git status`.
 
-Use `default/` for shared repo skills, `local/` for repo-private skills, and
-`profiles/<profile-name>/` for opt-in groups selected with `--profile`.
+An existing `skillenv.toml` is never overwritten: it is the only hand-written input.
 
-This command does not link skills by itself. Run `skillenv link` after adding skills."#;
+This command does not deploy anything. Run `skillenv link` once you have declared a skill."#;
 
-const ADD_AFTER_HELP: &str = r#"Supported source forms:
-  - GitHub shorthand: `owner/repo`
-  - Git URL: `https://github.com/owner/repo` or `git@github.com:owner/repo.git`
-  - Local checkout path: `../shared-skills`
+const LINK_AFTER_HELP: &str = r#"Deploys every skill each `[[deploy]]` rule selects, into the directory that rule names.
 
-Managed sources install under `skillenv/remote/<source-name>` by default, are recorded in
-`skillenv.lock.json`, and then relink the current repository's default/local scopes."#;
+Rules resolving to the same directory have their selections unioned, so two rules cannot
+take turns removing each other's work. A rule with `when.repo` applies only inside that
+repository, which is what makes running this from a directory-change hook useful.
 
-const LINK_AFTER_HELP: &str = r#"Scope selection:
-  - no flags: link `default/` and `local/`
-  - `--profile name`: link only the named profile scope; repeat for multiple profiles
-  - `--all`: link every discovered scope, including all profiles
+Failure is per skill: a malformed `SKILL.md`, a name collision, or a skill held back by the
+safeguard is reported and skipped, and the rest still deploy. Only a systemic I/O failure
+stops the run.
 
-Generated names follow `skillenv-<repo-slug>-<scope>-<skill-slug>` for repo-local targets."#;
+Warnings go to stderr and the exit code is non-zero on a problem **even under `--quiet`**,
+which is the form the shell hook runs."#;
 
-const GLOBAL_AFTER_HELP: &str = r#"Global targets are fixed to:
-  - `$HOME/.agents/skills`
-  - `$HOME/.claude/skills`
+const STATUS_AFTER_HELP: &str = r#"Reports every `skillenv-` directory in each target this manifest deploys to, including
+directories belonging to a different manifest and directories carrying the prefix but no
+marker. Those are never removed — without a marker there is no evidence skillenv created
+them — and hiding them would make the count disagree with `ls`.
 
-Global commands do not require `skillenv init` and do not edit `.gitignore`.
-Generated names include a stable path hash so multiple repositories can coexist safely."#;
+A skill a rule selects but that is not on disk is listed by name. The usual cause is a
+cache that was never fetched."#;
 
-const UPDATE_AFTER_HELP: &str = r#"When no managed source names are passed, every entry in `skillenv.lock.json` is refreshed.
-Changed sources are reinstalled into their managed roots and default/local scopes are relinked."#;
+const FETCH_AFTER_HELP: &str = r#"Populates `.skillenv/cache/` for every remote source the manifest declares.
 
-const FETCH_AFTER_HELP: &str = r#"This command restores the managed install roots recorded in `skillenv.lock.json`.
+Without `--update`, restores exactly the revisions `skillenv.lock` records. That is what a
+fresh clone needs: the cache is not committed, so a new machine has the manifest and the
+lock and nothing else.
 
-It fetches Git sources at the locked `resolved_revision`, reinstalls the selected skills into
-their managed roots, and relinks default/local scopes without modifying the lock file.
+With `--update`, moves to whatever each ref points at now and rewrites the lock. Run
+`skillenv outdated` first to see what would move.
 
-Use this on a new machine or after cleaning `skillenv/remote/` when only the lock file is
-checked into Git."#;
+The lock is saved after each source rather than once at the end, so an unreachable source
+part-way through cannot leave the installed trees and the recorded revisions disagreeing."#;
 
 const SKILLS_AFTER_HELP: &str = r#"Discovery targets:
   - codex: current repo `.agents/skills`, `$HOME/.agents/skills`, `/etc/codex/skills`
@@ -99,25 +87,28 @@ const SKILLS_AFTER_HELP: &str = r#"Discovery targets:
 Behavior:
   - default mode reports the custom skills visible from the current working directory
   - `--repo-tree` adds repo-wide inventory for nested tool directories that are not currently visible
-  - `--json` prints a stable machine-readable report"#;
+  - `--json` prints a stable machine-readable report
 
-const DOCTOR_AFTER_HELP: &str = r#"This command prints detailed diagnostics for the current repository setup.
+This reports what each tool can see, managed or not. Use `skillenv status` for what this
+manifest put there."#;
 
-It includes:
-  - detected repo root and HOME
-  - the config file path and whether it exists
-  - enabled targets and default strategy
-  - resolved external source directories
-  - managed source metadata from `skillenv.lock.json`, including source and transport URLs
-  - repo-local and global target status"#;
+const DOCTOR_AFTER_HELP: &str = r#"Answers "why did it go there", where `status` answers "what is deployed".
+
+It reports:
+  - which `skillenv.toml` governs this directory, and the repository it resolved
+  - the home directory and the cache path, with how many sources are cached
+  - how many skills and deploy rules the manifest declares, and how many the lock records
+  - each resolved target, its provider, and how many deployments it holds
+
+`--json` prints the same information in a stable shape."#;
 
 #[derive(Debug, Parser)]
 #[command(name = "skillenv")]
 #[command(version)]
 #[command(arg_required_else_help = true)]
-#[command(about = "Manage repo-local and remote AI skills for agent-facing skill directories.")]
+#[command(about = "Declare AI skills once, deploy them to every agent's skill directory.")]
 #[command(
-    long_about = "Manage repo-local skills, managed remote skill sources, and generated links for agent-facing skill directories such as `.agents/skills` and `.claude/skills`."
+    long_about = "Acquire, version, and deploy agent skills from a single `skillenv.toml`. Skills come from your own `skills/` directory, GitHub repositories, gists, or local paths, and are deployed into the directories each agent reads — `.claude/skills`, `.agents/skills`, `$CODEX_HOME/skills`, `.opencode/skills` — with frontmatter rewritten per provider and every skill scanned before it is written."
 )]
 #[command(after_long_help = ROOT_AFTER_HELP)]
 struct Cli {
@@ -128,81 +119,76 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(
-        about = "Install a managed skill source and record it in skillenv.lock.json.",
-        after_long_help = ADD_AFTER_HELP
-    )]
-    Add,
-    #[command(
-        about = "Create the repo-local skillenv layout and managed .gitignore entries.",
+        about = "Create skillenv.toml, skills/, and the managed .gitignore entries.",
         after_long_help = INIT_AFTER_HELP
     )]
-    Init(TargetArgs),
+    Init,
     #[command(
-        about = "Link repo-local skills into this repository's target skill directories.",
+        about = "Deploy the manifest's skills into every target its rules select.",
         after_long_help = LINK_AFTER_HELP
     )]
-    Link(ScopeArgs),
+    Link(QuietArgs),
     #[command(
-        about = "Remove generated skill links for the selected repo-local scopes.",
-        after_long_help = LINK_AFTER_HELP
+        about = "Remove every deployment belonging to this manifest.",
+        long_about = "Removes only directories whose marker names this manifest. A directory \
+                      carrying the prefix without a marker, or with another manifest's, is \
+                      reported and left in place."
     )]
-    Unlink(ScopeArgs),
-    #[command(about = "Show repo-local target status and the number of managed entries.")]
-    Status(TargetArgs),
+    Unlink(QuietArgs),
+    #[command(
+        about = "Drop a skill or source from the manifest and clear its deployments.",
+        long_about = "Edits skillenv.toml in place, keeping every comment and the order of \
+                      what remains, then relinks so the removed entry's directories go with \
+                      it. Naming a [[source]] removes every skill it contributed."
+    )]
+    Remove(RemoveArgs),
+    #[command(
+        about = "Show what this manifest has deployed, in each of its targets.",
+        after_long_help = STATUS_AFTER_HELP
+    )]
+    Status,
     #[command(
         about = "List every skill the manifest declares, with its source and labels.",
-        long_about = "Requires a skillenv.toml manifest. Shows each skill's source, the \
-                      [[source]] entry that contributed it, its labels, and the locked \
-                      revision when there is one."
+        long_about = "Shows each skill's source, the [[source]] entry that contributed it, its \
+                      labels, and the locked revision when there is one."
     )]
     List,
     #[command(
-        about = "Describe how this v0 setup would convert to a skillenv.toml manifest.",
-        long_about = "Reads only. Reports the skills, sources, and deploy rules a v1 \
-                      manifest would carry, the v0 deployments that must be cleared \
-                      first, and the proposed manifest itself. Nothing is written."
+        about = "Convert a v0 skillenv/ layout to a skillenv.toml manifest.",
+        long_about = "Without --apply, reads only: reports the skills, sources, and deploy rules \
+                      a v1 manifest would carry, the v0 deployments that must be cleared first, \
+                      and the proposed manifest itself. Nothing is written."
     )]
     Migrate(MigrateArgs),
     #[command(
         about = "Compare the lock against what each remote ref points at now.",
-        long_about = "Requires a skillenv.toml manifest. Reads only: contacts each remote \
-                      with git ls-remote and touches neither the cache nor the lock."
+        long_about = "Reads only: contacts each remote with git ls-remote and touches neither \
+                      the cache nor the lock. Being out of date is a state, not a failure, so \
+                      this exits 0 either way."
     )]
     Outdated,
     #[command(
         about = "Scan the manifest's skills for hidden instructions and unsafe patterns.",
-        long_about = "Requires a skillenv.toml manifest. Reports findings using Snyk's \
-                      agent-scan codes and exits non-zero when anything is found."
+        long_about = "Reports findings using Snyk's agent-scan codes and exits non-zero when \
+                      anything is found. `link` runs the same checks and blocks on critical \
+                      findings; this is how to see them before deploying."
     )]
     Lint,
     #[command(
-        about = "Manually manage generated skill links under $HOME targets.",
-        after_long_help = GLOBAL_AFTER_HELP
-    )]
-    Global {
-        #[command(subcommand)]
-        command: GlobalCommand,
-    },
-    #[command(
-        about = "Refresh managed sources recorded in skillenv.lock.json and relink them.",
-        after_long_help = UPDATE_AFTER_HELP
-    )]
-    Update(ManagedSourceArgs),
-    #[command(
-        about = "Restore managed sources from skillenv.lock.json using the locked revisions.",
+        about = "Populate the cache for every remote source the manifest declares.",
         after_long_help = FETCH_AFTER_HELP
     )]
-    Fetch(ManagedSourceArgs),
+    Fetch(FetchArgs),
     #[command(
         about = "List tool-visible custom skills across repository and home directories.",
         after_long_help = SKILLS_AFTER_HELP
     )]
     Skills(SkillsArgs),
     #[command(
-        about = "Show detailed diagnostics for config, sources, and targets.",
+        about = "Show how this invocation resolved: manifest, cache, and targets.",
         after_long_help = DOCTOR_AFTER_HELP
     )]
-    Doctor(DoctorArgs),
+    Doctor(JsonArgs),
     #[command(about = "Print a shell hook that runs `skillenv link --quiet` on repo changes.")]
     Hook {
         #[command(subcommand)]
@@ -213,32 +199,18 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
-struct ScopeArgs {
-    #[arg(
-        long = "profile",
-        help = "Profile scope name to operate on. Repeat to select multiple profiles."
-    )]
-    profiles: Vec<String>,
+struct QuietArgs {
     #[arg(
         long,
-        conflicts_with = "profiles",
-        help = "Operate on every discovered scope, including all profiles."
+        help = "Suppress normal output. Warnings still go to stderr. Useful from shell hooks."
     )]
-    all: bool,
-    #[arg(
-        long,
-        conflicts_with = "no_claude",
-        help = "Also target `.claude/skills`."
-    )]
-    claude: bool,
-    #[arg(
-        long,
-        conflicts_with = "claude",
-        help = "Disable `.claude/skills` even if config enables it."
-    )]
-    no_claude: bool,
-    #[arg(long, help = "Suppress normal output. Useful from shell hooks.")]
     quiet: bool,
+}
+
+#[derive(Debug, Args)]
+struct RemoveArgs {
+    #[arg(help = "Name of the [[skill]] or [[source]] entry to remove.")]
+    name: String,
 }
 
 #[derive(Debug, Args)]
@@ -253,41 +225,11 @@ struct MigrateArgs {
 }
 
 #[derive(Debug, Args)]
-struct TargetArgs {
-    #[arg(
-        long,
-        conflicts_with = "no_claude",
-        help = "Also target `.claude/skills`."
-    )]
-    claude: bool,
-    #[arg(
-        long,
-        conflicts_with = "claude",
-        help = "Disable `.claude/skills` even if config enables it."
-    )]
-    no_claude: bool,
-}
-
-#[derive(Debug, Args)]
-struct ManagedSourceArgs {
-    /// With a manifest: move to whatever each ref points at now, instead of
-    /// restoring the locked revision.
+struct FetchArgs {
+    /// Move to whatever each ref points at now, instead of restoring the locked
+    /// revision.
     #[arg(long)]
     update: bool,
-    #[arg(help = "Managed source names to operate on. Defaults to every recorded source.")]
-    names: Vec<String>,
-    #[arg(
-        long,
-        conflicts_with = "no_claude",
-        help = "Also target `.claude/skills` for the follow-up relink."
-    )]
-    claude: bool,
-    #[arg(
-        long,
-        conflicts_with = "claude",
-        help = "Disable `.claude/skills` even if config enables it."
-    )]
-    no_claude: bool,
 }
 
 #[derive(Debug, Args)]
@@ -308,7 +250,7 @@ struct SkillsArgs {
 }
 
 #[derive(Debug, Args)]
-struct DoctorArgs {
+struct JsonArgs {
     #[arg(long, help = "Print a JSON report instead of human-readable text.")]
     json: bool,
 }
@@ -327,16 +269,6 @@ enum HookCommand {
     Zsh,
     #[command(about = "Print a bash hook that uses `PROMPT_COMMAND` and runs on repo changes.")]
     Bash,
-}
-
-#[derive(Debug, Subcommand)]
-enum GlobalCommand {
-    #[command(about = "Link repo-local skills into global `$HOME` targets.")]
-    Link(ScopeArgs),
-    #[command(about = "Remove generated links from global `$HOME` targets.")]
-    Unlink(ScopeArgs),
-    #[command(about = "Show global target status under `$HOME`.")]
-    Status(TargetArgs),
 }
 
 /// What a command produced.
@@ -362,17 +294,7 @@ impl CommandOutput {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    // A repository carrying skillenv.toml uses the v1 engine; one still on the
-    // v0 layout keeps working unchanged. Replacing the binary must not break a
-    // setup that has not migrated yet.
-    let result = match dispatch_manifest(&cli) {
-        Some(result) => result,
-        None => run(cli).map(CommandOutput::text),
-    };
-
-    match result {
+    match run(Cli::parse()) {
         Ok(output) => {
             if !output.stdout.is_empty() {
                 println!("{}", output.stdout);
@@ -393,188 +315,78 @@ fn main() -> ExitCode {
     }
 }
 
-/// Handle a command against a v1 manifest, or `None` to fall through to the v0
-/// path.
-fn dispatch_manifest(cli: &Cli) -> Option<skillenv::Result<CommandOutput>> {
-    match &cli.command {
-        Command::Link(args) if skillenv::has_manifest(".") => {
-            Some(link_manifest_command(args.quiet))
+fn run(cli: Cli) -> skillenv::Result<CommandOutput> {
+    match cli.command {
+        Command::Init => skillenv::init_manifest(".").map(CommandOutput::text),
+        Command::Link(args) => {
+            // Standing outside a managed tree is the normal state for a shell hook,
+            // not a failure. `--quiet` is the form the hook runs, so there it exits
+            // silently; typed by hand it still says what is missing.
+            if args.quiet && !skillenv::has_manifest(".") {
+                return Ok(CommandOutput::text(String::new()));
+            }
+            let report = skillenv::link_manifest(".")?;
+            Ok(CommandOutput {
+                stdout: if args.quiet {
+                    String::new()
+                } else {
+                    skillenv::format_link_manifest_report(&report)
+                },
+                // Deliberately not gated on `quiet`.
+                warnings: report.warnings(),
+                problems: report.has_problems(),
+            })
         }
-        Command::List => Some(skillenv::list_manifest(".").map(CommandOutput::text)),
+        Command::Unlink(args) => {
+            let report = skillenv::unlink_manifest(".")?;
+            Ok(CommandOutput {
+                stdout: if args.quiet {
+                    String::new()
+                } else {
+                    skillenv::format_link_manifest_report(&report)
+                },
+                warnings: report.warnings(),
+                problems: report.has_problems(),
+            })
+        }
+        Command::Remove(args) => {
+            skillenv::remove_from_manifest(".", &args.name).map(|report| CommandOutput {
+                stdout: report.summary,
+                warnings: report.warnings,
+                problems: report.problems,
+            })
+        }
+        Command::Status => skillenv::status_manifest(".").map(|(stdout, problems)| CommandOutput {
+            stdout,
+            warnings: Vec::new(),
+            problems,
+        }),
+        Command::List => skillenv::list_manifest(".").map(CommandOutput::text),
+        Command::Migrate(args) => match (args.apply, args.prune) {
+            (true, prune) => skillenv::apply_migration(".", prune).map(CommandOutput::text),
+            // --prune alone acts on a repository that has already been migrated.
+            (false, true) => skillenv::prune_legacy_layout(".").map(CommandOutput::text),
+            (false, false) => skillenv::plan_migration(".").map(CommandOutput::text),
+        },
         // Being out of date is a state to report, not a failure, so this exits 0
         // either way. A CI job that wants to fail on staleness can match the output.
-        Command::Outdated => Some(
-            skillenv::outdated_manifest(".").map(|(stdout, _stale)| CommandOutput::text(stdout)),
-        ),
-        Command::Fetch(args) if skillenv::has_manifest(".") => Some(
+        Command::Outdated => {
+            skillenv::outdated_manifest(".").map(|(stdout, _stale)| CommandOutput::text(stdout))
+        }
+        Command::Lint => skillenv::lint_manifest(".").map(|(stdout, problems)| CommandOutput {
+            stdout,
+            warnings: Vec::new(),
+            problems,
+        }),
+        Command::Fetch(args) => {
             skillenv::fetch_manifest(".", args.update).map(|(stdout, warnings, problems)| {
                 CommandOutput {
                     stdout,
                     warnings,
                     problems,
                 }
-            }),
-        ),
-        Command::Migrate(args) => Some(match (args.apply, args.prune) {
-            (true, prune) => skillenv::apply_migration(".", prune).map(CommandOutput::text),
-            // --prune alone acts on a repository that has already been migrated.
-            (false, true) => skillenv::prune_legacy_layout(".").map(CommandOutput::text),
-            (false, false) => skillenv::plan_migration(".").map(CommandOutput::text),
-        }),
-        Command::Lint => {
-            Some(
-                skillenv::lint_manifest(".").map(|(stdout, problems)| CommandOutput {
-                    stdout,
-                    warnings: Vec::new(),
-                    problems,
-                }),
-            )
-        }
-        _ => None,
-    }
-}
-
-fn link_manifest_command(quiet: bool) -> skillenv::Result<CommandOutput> {
-    let report = skillenv::link_manifest(".")?;
-    Ok(CommandOutput {
-        stdout: if quiet {
-            String::new()
-        } else {
-            skillenv::format_link_manifest_report(&report)
-        },
-        // Deliberately not gated on `quiet`.
-        warnings: report.warnings(),
-        problems: report.has_problems(),
-    })
-}
-
-fn run(cli: Cli) -> skillenv::Result<String> {
-    match cli.command {
-        // v0 installed sources into skillenv/remote and recorded them in
-        // skillenv.lock.json. In v1 a source is declared in the manifest, which is
-        // a file edit rather than a command, so this points at that instead of
-        // half-doing it.
-        Command::Add => Err(skillenv::SkillenvError::InvalidSource {
-            input: "add".to_string(),
-            message: "v1 declares sources in skillenv.toml. Add a [[source]] entry \
-                      (name, from, skills) and run `skillenv fetch`"
-                .to_string(),
-        }),
-        Command::Init(args) => {
-            let report = init_repo(
-                ".",
-                InitOptions {
-                    claude: target_override(args.claude, args.no_claude),
-                },
-            )?;
-            Ok(format_init_report(&report))
-        }
-        Command::Link(args) => {
-            let report = link_repo(
-                ".",
-                LinkOptions {
-                    selector: scope_selector(&args),
-                    claude: target_override(args.claude, args.no_claude),
-                    quiet: args.quiet,
-                },
-            )?;
-            Ok(if args.quiet {
-                String::new()
-            } else {
-                format_link_report(&report, "linked")
             })
         }
-        Command::Unlink(args) => {
-            let report = unlink_repo(
-                ".",
-                UnlinkOptions {
-                    selector: scope_selector(&args),
-                    claude: target_override(args.claude, args.no_claude),
-                    quiet: args.quiet,
-                },
-            )?;
-            Ok(if args.quiet {
-                String::new()
-            } else {
-                format_link_report(&report, "unlinked")
-            })
-        }
-        Command::Status(args) => {
-            let report = status_repo(
-                ".",
-                StatusOptions {
-                    claude: target_override(args.claude, args.no_claude),
-                },
-            )?;
-            Ok(format_status_report(&report))
-        }
-        // These only exist against a manifest. Reached only when
-        // `dispatch_manifest` declined, i.e. there is no skillenv.toml, so the
-        // error explains what is missing rather than silently doing nothing.
-        Command::Migrate(_) => unreachable!("handled by dispatch_manifest"),
-        Command::Outdated => Err(skillenv::SkillenvError::ManifestNotFound {
-            searched_from: std::path::PathBuf::from("."),
-        }),
-        Command::List | Command::Lint => Err(skillenv::SkillenvError::ManifestNotFound {
-            searched_from: std::path::PathBuf::from("."),
-        }),
-        Command::Global {
-            command: GlobalCommand::Link(args),
-        } => {
-            let report = link_global(
-                ".",
-                LinkOptions {
-                    selector: scope_selector(&args),
-                    claude: target_override(args.claude, args.no_claude),
-                    quiet: args.quiet,
-                },
-            )?;
-            Ok(if args.quiet {
-                String::new()
-            } else {
-                format_link_report(&report, "linked")
-            })
-        }
-        Command::Global {
-            command: GlobalCommand::Unlink(args),
-        } => {
-            let report = unlink_global(
-                ".",
-                UnlinkOptions {
-                    selector: scope_selector(&args),
-                    claude: target_override(args.claude, args.no_claude),
-                    quiet: args.quiet,
-                },
-            )?;
-            Ok(if args.quiet {
-                String::new()
-            } else {
-                format_link_report(&report, "unlinked")
-            })
-        }
-        Command::Global {
-            command: GlobalCommand::Status(args),
-        } => {
-            let report = status_global(
-                ".",
-                StatusOptions {
-                    claude: target_override(args.claude, args.no_claude),
-                },
-            )?;
-            Ok(format_status_report(&report))
-        }
-        Command::Update(_) => Err(skillenv::SkillenvError::InvalidSource {
-            input: "update".to_string(),
-            message: "use `skillenv fetch --update`, or `skillenv outdated` first to \
-                      see what would move"
-                .to_string(),
-        }),
-        // Reached only when dispatch_manifest declined, i.e. there is no manifest.
-        // v0 restored into skillenv/remote from skillenv.lock.json; there is nothing
-        // to restore without a v1 lock.
-        Command::Fetch(_) => Err(skillenv::SkillenvError::ManifestNotFound {
-            searched_from: std::path::PathBuf::from("."),
-        }),
         Command::Skills(args) => {
             let report = skill_inventory(
                 ".",
@@ -583,57 +395,29 @@ fn run(cli: Cli) -> skillenv::Result<String> {
                     repo_tree: args.repo_tree,
                 },
             )?;
-            if args.json {
+            let stdout = if args.json {
                 serde_json::to_string_pretty(&report).map_err(|source| {
                     skillenv::SkillenvError::SerializeLock {
                         path: std::path::PathBuf::from("stdout"),
                         source,
                     }
-                })
+                })?
             } else {
-                Ok(format_skill_inventory_report(&report))
-            }
+                format_skill_inventory_report(&report)
+            };
+            Ok(CommandOutput::text(stdout))
         }
-        Command::Doctor(args) => {
-            let report = doctor(".", DoctorOptions)?;
-            if args.json {
-                serde_json::to_string_pretty(&report).map_err(|source| {
-                    skillenv::SkillenvError::SerializeLock {
-                        path: std::path::PathBuf::from("stdout"),
-                        source,
-                    }
-                })
-            } else {
-                Ok(format_doctor_report(&report))
-            }
-        }
+        Command::Doctor(args) => skillenv::doctor_manifest(".", args.json).map(CommandOutput::text),
         Command::Hook {
             shell: HookCommand::Zsh,
-        } => Ok(hook_script(Shell::Zsh)),
+        } => Ok(CommandOutput::text(hook_script(Shell::Zsh))),
         Command::Hook {
             shell: HookCommand::Bash,
-        } => Ok(hook_script(Shell::Bash)),
-        Command::Version => Ok(format!("skillenv {}", env!("CARGO_PKG_VERSION"))),
-    }
-}
-
-fn scope_selector(args: &ScopeArgs) -> ScopeSelector {
-    if args.all {
-        ScopeSelector::All
-    } else if args.profiles.is_empty() {
-        ScopeSelector::DefaultLocal
-    } else {
-        ScopeSelector::Profiles(args.profiles.clone())
-    }
-}
-
-fn target_override(claude: bool, no_claude: bool) -> TargetOverride {
-    if claude {
-        TargetOverride::ForceEnabled
-    } else if no_claude {
-        TargetOverride::ForceDisabled
-    } else {
-        TargetOverride::UseConfig
+        } => Ok(CommandOutput::text(hook_script(Shell::Bash))),
+        Command::Version => Ok(CommandOutput::text(format!(
+            "skillenv {}",
+            env!("CARGO_PKG_VERSION")
+        ))),
     }
 }
 
@@ -662,9 +446,9 @@ mod tests {
         let mut buffer = Vec::new();
         command.write_long_help(&mut buffer).unwrap();
         let help = String::from_utf8(buffer).unwrap();
-        assert!(help.contains("Manage repo-local skills, managed remote skill sources"));
-        assert!(help.contains("Repo layout:"));
-        assert!(help.contains("skillenv-<repo-slug>-<scope>-<skill-slug>"));
+        assert!(help.contains("Acquire, version, and deploy agent skills"));
+        assert!(help.contains("Layout:"));
+        assert!(help.contains("skillenv-<repo>-g<hash>-<id>"));
         assert!(help.contains("skillenv version"));
     }
 
@@ -675,23 +459,36 @@ mod tests {
         let mut buffer = Vec::new();
         init.write_long_help(&mut buffer).unwrap();
         let help = String::from_utf8(buffer).unwrap();
-        assert!(help.contains("Create the repo-local skillenv layout"));
-        assert!(help.contains("Created layout:"));
-        assert!(help.contains("profiles/<profile-name>/"));
+        assert!(help.contains("Creates, when missing:"));
+        assert!(help.contains("skillenv.toml"));
+        assert!(help.contains("never overwritten"));
         assert!(help.contains("Run `skillenv link`"));
     }
 
+    /// The distinction between the two listing commands is the one users get
+    /// wrong, so each help text has to draw it.
     #[test]
-    fn skills_help_describes_discovery_targets() {
+    fn skills_and_status_help_distinguish_themselves() {
         let mut command = Cli::command();
-        let skills = command.find_subcommand_mut("skills").unwrap();
-        let mut buffer = Vec::new();
-        skills.write_long_help(&mut buffer).unwrap();
-        let help = String::from_utf8(buffer).unwrap();
-        assert!(help.contains("List tool-visible custom skills"));
-        assert!(help.contains("codex: current repo `.agents/skills`"));
-        assert!(help.contains("--repo-tree"));
-        assert!(help.contains("--json"));
+        let mut skills = Vec::new();
+        command
+            .find_subcommand_mut("skills")
+            .unwrap()
+            .write_long_help(&mut skills)
+            .unwrap();
+        let skills = String::from_utf8(skills).unwrap();
+        assert!(skills.contains("managed or not"));
+        assert!(skills.contains("`skillenv status` for what this"));
+
+        let mut status = Vec::new();
+        command
+            .find_subcommand_mut("status")
+            .unwrap()
+            .write_long_help(&mut status)
+            .unwrap();
+        let status = String::from_utf8(status).unwrap();
+        assert!(status.contains("never removed"));
+        assert!(status.contains("selects but that is not on disk"));
     }
 
     #[test]
@@ -701,9 +498,8 @@ mod tests {
         let mut buffer = Vec::new();
         doctor.write_long_help(&mut buffer).unwrap();
         let help = String::from_utf8(buffer).unwrap();
-        assert!(help.contains("Show detailed diagnostics"));
-        assert!(help.contains("config file path"));
-        assert!(help.contains("transport URLs"));
+        assert!(help.contains("why did it go there"));
+        assert!(help.contains("how many sources are cached"));
         assert!(help.contains("--json"));
     }
 
@@ -714,9 +510,36 @@ mod tests {
         let mut buffer = Vec::new();
         fetch.write_long_help(&mut buffer).unwrap();
         let help = String::from_utf8(buffer).unwrap();
-        assert!(help.contains("locked `resolved_revision`"));
-        assert!(help.contains("without modifying the lock file"));
-        assert!(help.contains("new machine"));
+        assert!(help.contains("skillenv.lock` records"));
+        assert!(help.contains("fresh clone"));
+        assert!(help.contains("saved after each source"));
+    }
+
+    /// The hook runs `link --quiet` on every directory change, and most directories
+    /// are not under a manifest. Erroring there would print on every `cd`, and the
+    /// hook would be removed. Typed by hand the same command still explains itself.
+    #[test]
+    fn quiet_link_outside_a_managed_tree_is_a_silent_no_op() {
+        // Mutates process-global cwd, so nothing else in this binary may depend on
+        // it. Everything else here only renders help text.
+        let dir = tempfile::TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let quiet = run(Cli {
+            command: Command::Link(QuietArgs { quiet: true }),
+        });
+        let loud = run(Cli {
+            command: Command::Link(QuietArgs { quiet: false }),
+        });
+
+        std::env::set_current_dir(previous).unwrap();
+
+        let quiet = quiet.expect("quiet link must not fail without a manifest");
+        assert!(quiet.stdout.is_empty());
+        assert!(quiet.warnings.is_empty());
+        assert!(!quiet.problems);
+        assert!(loud.is_err(), "an explicit link should say what is missing");
     }
 
     #[test]
@@ -725,6 +548,9 @@ mod tests {
             command: Command::Version,
         })
         .unwrap();
-        assert_eq!(output, format!("skillenv {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            output.stdout,
+            format!("skillenv {}", env!("CARGO_PKG_VERSION"))
+        );
     }
 }

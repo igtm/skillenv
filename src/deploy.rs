@@ -26,7 +26,6 @@
 //! here and deleting the scope-based path — is deliberately its own change, so the
 //! deletion of the old code and the new command surface land together and can be
 //! reviewed as one thing. The allow goes away then.
-#![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

@@ -14,7 +14,6 @@
 //!
 //! Nothing calls the write side yet — `deploy` is the first consumer, and this
 //! allow goes away with it.
-#![allow(dead_code)]
 
 mod agents;
 mod claude;
@@ -95,8 +94,6 @@ pub struct TargetContext {
 }
 
 pub trait Provider: Send + Sync {
-    fn id(&self) -> ProviderId;
-
     /// Directory this provider reads, relative to the scope root.
     fn relative_root(&self, scope: TargetScope) -> &'static str;
 

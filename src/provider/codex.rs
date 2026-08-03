@@ -19,17 +19,13 @@ use std::path::PathBuf;
 
 use serde_yaml::{Mapping, Value};
 
-use super::{CanonicalSkill, Provider, ProviderId, Sidecar, TargetContext, ToolsStyle};
+use super::{CanonicalSkill, Provider, Sidecar, TargetContext, ToolsStyle};
 use crate::manifest::TargetScope;
 use crate::{Result, SkillenvError};
 
 pub(super) struct Codex;
 
 impl Provider for Codex {
-    fn id(&self) -> ProviderId {
-        ProviderId::Codex
-    }
-
     fn relative_root(&self, _scope: TargetScope) -> &'static str {
         ".codex/skills"
     }

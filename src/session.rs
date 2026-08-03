@@ -14,7 +14,6 @@
 //! Not yet reachable from the CLI; the command surface is the next change, and
 //! this allow goes away with it. The tests below drive the whole sequence, so the
 //! composition is proven before it is wired up.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,7 +21,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::{Catalog, CatalogEntry};
 use crate::deploy::{self, DeployReport, ManifestId};
 use crate::lock::{LockFile, LockedFinding, LockedSkill, SafeguardState, digest_tree};
-use crate::manifest::{MANIFEST_FILE, Manifest, SafeguardConfig, SkillId, SourceSpec, TargetScope};
+use crate::manifest::{MANIFEST_FILE, Manifest, SkillId, SourceSpec, TargetScope};
 use crate::provider::{TargetContext, resolve_targets};
 use crate::safeguard;
 use crate::source;
@@ -120,7 +119,7 @@ impl Session {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
 
         let manifest = Manifest::load(&manifest_path)?;
-        let catalog = Catalog::resolve(&manifest, &root)?;
+        let catalog = Catalog::resolve(&manifest)?;
         let lock = LockFile::load(&root)?;
 
         Ok(Self {
@@ -128,7 +127,10 @@ impl Session {
             manifest,
             catalog,
             lock,
-            repo_root: detect_repo_root(cwd),
+            // Canonicalized so a diagnostic never prints "repo: ." — the point of
+            // reporting it is to say which repository a repo-scoped rule resolved.
+            repo_root: detect_repo_root(cwd)
+                .map(|path| std::fs::canonicalize(&path).unwrap_or(path)),
             home,
         })
     }
@@ -151,7 +153,17 @@ impl Session {
 
         // Prepare content once, not once per target: a skill deployed to four
         // directories should be read, scanned, and digested a single time.
-        let prepared = self.prepare_all(&mut report)?;
+        let (prepared, scanned) = self.prepare_all(&mut report)?;
+        let mut lock_changed = false;
+        for (id, digest, verdict) in &scanned {
+            lock_changed |= self.remember_scan(id, digest, verdict);
+        }
+        // Saved once, and only on a real change. The shell hook runs `link` on every
+        // directory change, and rewriting a committed file each time would put the
+        // lock permanently in `git status`.
+        if lock_changed {
+            self.lock.save(&self.root)?;
+        }
 
         for (target, rule_indices) in resolved {
             let rules: Vec<_> = rule_indices
@@ -180,6 +192,106 @@ impl Session {
                         }
                     })
                 })?;
+            report.targets.push(deployed);
+        }
+
+        Ok(report)
+    }
+
+    /// Report what is deployed in each target this manifest resolves to.
+    ///
+    /// Reads only, and reports every `skillenv-` directory it finds — including the
+    /// ones belonging to a different manifest. Those are exactly the directories
+    /// that would puzzle someone comparing two repositories, and hiding them would
+    /// make the count disagree with `ls`.
+    pub fn status(&self) -> Result<StatusReport> {
+        let context = self.target_context();
+        let resolved = resolve_targets(&self.catalog.deploys, &context)?;
+        let mut report = StatusReport::default();
+
+        for (target, rule_indices) in resolved {
+            let scope = target
+                .refs
+                .first()
+                .map(|reference| reference.scope)
+                .unwrap_or(TargetScope::Home);
+            let id = ManifestId::for_root(&self.root, scope)?;
+
+            let rules: Vec<_> = rule_indices
+                .iter()
+                .map(|index| &self.catalog.deploys[*index])
+                .collect();
+            let expected: Vec<SkillId> = self
+                .catalog
+                .selected_by_any(rules)
+                .into_iter()
+                .map(|entry| entry.id.clone())
+                .collect();
+
+            let mut entries = Vec::new();
+            for existing in deploy::enumerate(&target.path, &id)? {
+                let ownership = match &existing.marker {
+                    None => Ownership::Unmanaged,
+                    Some(_) if existing.belongs_to(&id) => Ownership::Ours,
+                    Some(marker) => Ownership::OtherManifest(marker.manifest.clone()),
+                };
+                entries.push(DeployedEntry {
+                    dir_name: existing.dir_name,
+                    skill: existing.marker.as_ref().map(|marker| marker.skill.clone()),
+                    revision: existing.marker.as_ref().and_then(|m| m.revision.clone()),
+                    ownership,
+                });
+            }
+
+            // A skill the rules select but that is not on disk. Reported by name
+            // because the usual cause is a cache that was never fetched, and a bare
+            // count would not say which one to go looking for.
+            let present: Vec<&str> = entries
+                .iter()
+                .filter(|entry| entry.ownership == Ownership::Ours)
+                .filter_map(|entry| entry.skill.as_deref())
+                .collect();
+            let missing = expected
+                .into_iter()
+                .filter(|id| !present.contains(&id.as_str()))
+                .collect();
+
+            report.targets.push(TargetStatusReport {
+                path: target.path,
+                provider: target.render_with.as_str().to_string(),
+                manifest_id: id.as_str(),
+                entries,
+                missing,
+            });
+        }
+
+        Ok(report)
+    }
+
+    /// Remove every deployment belonging to this manifest, in every target it
+    /// resolves to.
+    ///
+    /// Implemented as a link with nothing selected, so removal follows exactly the
+    /// same ownership rule: a marker naming this manifest. v0 had a second removal
+    /// path with its own predicate, and the two disagreed — `status` counted
+    /// directories that `unlink` then declined to remove.
+    pub fn unlink(&mut self) -> Result<LinkReport> {
+        let mut report = LinkReport::default();
+        let context = self.target_context();
+
+        for (target, _rules) in resolve_targets(&self.catalog.deploys, &context)? {
+            let scope = target
+                .refs
+                .first()
+                .map(|reference| reference.scope)
+                .unwrap_or(TargetScope::Home);
+            let id = ManifestId::for_root(&self.root, scope)?;
+
+            let deployed = deploy::apply(&target.path, &id, target.render_with, &[], |entry| {
+                Err(SkillenvError::MissingSkillFile {
+                    path: self.root.join(entry.id.as_str()),
+                })
+            })?;
             report.targets.push(deployed);
         }
 
@@ -379,11 +491,15 @@ impl Session {
     ///
     /// A skill that cannot be prepared is recorded and omitted rather than
     /// failing the run, so one missing source does not withhold the others.
-    fn prepare_all(
-        &self,
-        report: &mut LinkReport,
-    ) -> Result<BTreeMap<SkillId, deploy::SkillContent>> {
+    /// Resolve, scan, and digest every catalog entry once.
+    ///
+    /// Returns the scan results alongside the content so `link` can write them to
+    /// the lock. They are not written here because this borrows `self` immutably —
+    /// and persisting them matters: `quarantined` is how a blocked skill stays
+    /// blocked, and `scanned_digest` is what lets an unchanged skill skip the scan.
+    fn prepare_all(&self, report: &mut LinkReport) -> Result<Prepared> {
         let mut prepared = BTreeMap::new();
+        let mut scanned = Vec::new();
 
         for entry in self.catalog.iter() {
             let dir = match self.content_dir(entry) {
@@ -396,6 +512,7 @@ impl Session {
 
             let digest = digest_tree(&dir)?;
             let verdict = self.scan(entry, &dir, &digest)?;
+            scanned.push((entry.id.clone(), digest.clone(), verdict.clone()));
             if verdict.blocked {
                 // Deliberately not deployed and deliberately not removed either:
                 // a previously-deployed copy stays where it is, so a compromised
@@ -418,7 +535,7 @@ impl Session {
             );
         }
 
-        Ok(prepared)
+        Ok((prepared, scanned))
     }
 
     /// Where a skill's bytes currently are, or why they are not available.
@@ -481,12 +598,14 @@ impl Session {
     }
 
     /// Record a scan result so a later run can reuse it.
+    ///
+    /// Returns whether this changed anything, so the caller can skip the write.
     pub fn remember_scan(
         &mut self,
         id: &SkillId,
         digest: &str,
         verdict: &safeguard::Verdict,
-    ) -> Result<()> {
+    ) -> bool {
         let mut entry = self.lock.get(id).cloned().unwrap_or_else(|| LockedSkill {
             id: id.clone(),
             source: "local".to_string(),
@@ -510,14 +629,26 @@ impl Session {
                 .collect(),
             quarantined: verdict.blocked,
         };
+        if self.lock.get(id) == Some(&entry) {
+            return false;
+        }
         self.lock.upsert(entry);
-        self.lock.save(&self.root)
+        true
     }
 
-    pub fn safeguard_config(&self) -> &SafeguardConfig {
+    /// Only the tests reach for this; `scan` reads the config directly.
+    #[cfg(test)]
+    pub fn safeguard_config(&self) -> &crate::manifest::SafeguardConfig {
         &self.manifest.safeguard
     }
 }
+
+/// What `prepare_all` produces: the content to deploy, and the scan result for
+/// each skill it looked at so the caller can record them.
+type Prepared = (
+    BTreeMap<SkillId, deploy::SkillContent>,
+    Vec<(SkillId, String, safeguard::Verdict)>,
+);
 
 /// One remote source, with the skills wanted from it.
 #[derive(Debug, Clone)]
@@ -529,6 +660,61 @@ struct RemoteSource {
     git_ref: Option<String>,
     /// `None` means "whatever the source holds", resolved after fetching.
     skills: Option<Vec<SkillId>>,
+}
+
+/// Who a deployed directory belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ownership {
+    /// Marked as this manifest's, so `link` may replace it and `unlink` remove it.
+    Ours,
+    /// Marked as another manifest's — most often the same dotfiles checked out
+    /// twice, or a `$HOME` target shared between repositories.
+    OtherManifest(String),
+    /// Carries the prefix but has no readable marker, so there is no evidence
+    /// skillenv created it. Never removed.
+    Unmanaged,
+}
+
+/// One directory found in a target.
+#[derive(Debug, Clone)]
+pub struct DeployedEntry {
+    pub dir_name: String,
+    /// `None` for an unmanaged directory, which has no marker to read it from.
+    pub skill: Option<String>,
+    pub revision: Option<String>,
+    pub ownership: Ownership,
+}
+
+#[derive(Debug, Clone)]
+pub struct TargetStatusReport {
+    pub path: PathBuf,
+    pub provider: String,
+    pub manifest_id: String,
+    pub entries: Vec<DeployedEntry>,
+    /// Selected by a rule but absent from the target.
+    pub missing: Vec<SkillId>,
+}
+
+impl TargetStatusReport {
+    /// How many of the directories present are this manifest's.
+    pub fn ours(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.ownership == Ownership::Ours)
+            .count()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StatusReport {
+    pub targets: Vec<TargetStatusReport>,
+}
+
+impl StatusReport {
+    /// Whether anything needs a human's attention.
+    pub fn has_problems(&self) -> bool {
+        self.targets.iter().any(|target| !target.missing.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -707,6 +893,121 @@ mod tests {
 
     fn open_session(root: &Path, home: &Path) -> Result<Session> {
         Session::open(root, home.to_path_buf())
+    }
+
+    /// `unlink` removes what this manifest put there and nothing else. Removal is
+    /// decided by the marker, so a directory carrying the prefix without one, or
+    /// with another manifest's, survives — and is reported so the count agrees
+    /// with `ls`. Getting this wrong under `$HOME`, which repositories share,
+    /// means one repository deleting another's deployments.
+    #[test]
+    fn unlink_removes_only_what_this_manifest_marked() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"kinko\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[("kinko", &valid("kinko"))],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        session.link()?;
+
+        let target = home.path().join(".claude/skills");
+        let ours = fs::read_dir(&target)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .find(|name| name.starts_with("skillenv-"))
+            .expect("link should have written one directory");
+
+        // One with no marker at all, and one marked as somebody else's.
+        for (name, marker) in [
+            ("skillenv-by-hand", None),
+            (
+                "skillenv-other-kinko",
+                Some(
+                    r#"{"manifest":"other-000000000000","skill":"kinko",
+                        "generated_name":"skillenv-other-kinko","provider":"claude"}"#,
+                ),
+            ),
+        ] {
+            let dir = target.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), valid(name)).unwrap();
+            if let Some(marker) = marker {
+                fs::write(dir.join(".skillenv-generated.json"), marker).unwrap();
+            }
+        }
+
+        let report = session.unlink()?;
+        let removed: Vec<&String> = report
+            .targets
+            .iter()
+            .flat_map(|deployed| deployed.removed.iter())
+            .collect();
+        assert_eq!(removed, vec![&ours], "only our own may be removed");
+
+        let left: Vec<String> = fs::read_dir(&target)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(left.contains(&"skillenv-by-hand".to_string()));
+        assert!(left.contains(&"skillenv-other-kinko".to_string()));
+        assert!(!left.contains(&ours));
+
+        // The marker-less one is a problem worth an exit code; the other
+        // manifest's is simply not ours.
+        assert!(report.has_problems());
+        Ok(())
+    }
+
+    /// `status` distinguishes the three kinds of directory it can find, and names
+    /// a selected skill that is not on disk — usually a cache that was never
+    /// fetched, which a bare count would not point at.
+    #[test]
+    fn status_separates_ours_from_foreign_and_names_what_is_absent() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"kinko\"\nsource = \"local\"\n\n\
+             [[skill]]\nname = \"handoff\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[("kinko", &valid("kinko"))],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        // `handoff` is declared but has no skills/handoff/SKILL.md.
+        session.link()?;
+
+        let target = home.path().join(".claude/skills");
+        let foreign = target.join("skillenv-elsewhere-kinko");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("SKILL.md"), valid("x")).unwrap();
+        fs::write(
+            foreign.join(".skillenv-generated.json"),
+            r#"{"manifest":"elsewhere-0000","skill":"kinko",
+                "generated_name":"skillenv-elsewhere-kinko","provider":"claude"}"#,
+        )
+        .unwrap();
+
+        let report = session.status()?;
+        let deployed = &report.targets[0];
+        assert_eq!(deployed.ours(), 1);
+        assert!(deployed.entries.iter().any(
+            |entry| matches!(&entry.ownership, Ownership::OtherManifest(id)
+                    if id == "elsewhere-0000")
+        ));
+        assert_eq!(
+            deployed
+                .missing
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["handoff"]
+        );
+        assert!(
+            report.has_problems(),
+            "an absent selected skill is a problem"
+        );
+        Ok(())
     }
 
     #[test]
@@ -989,7 +1290,14 @@ include = ["tools"]
         let id = SkillId::parse("kinko")?;
         let verdict =
             safeguard::apply_policy(Vec::new(), &id, "sha256:abc", session.safeguard_config());
-        session.remember_scan(&id, "sha256:abc", &verdict)?;
+        assert!(
+            session.remember_scan(&id, "sha256:abc", &verdict),
+            "the first scan of a skill is new information"
+        );
+        session.lock.save(&session.root)?;
+        // A second, identical scan reports no change, so `link` from a shell hook
+        // does not rewrite a committed file on every directory change.
+        assert!(!session.remember_scan(&id, "sha256:abc", &verdict));
 
         let reloaded = LockFile::load(&session.root)?;
         let locked = reloaded.get(&id).expect("the skill should be recorded");

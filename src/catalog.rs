@@ -12,7 +12,6 @@
 //!
 //! Nothing walks a catalog yet — `deploy` is the first consumer, and this allow
 //! goes away with it.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,8 +66,6 @@ impl CatalogEntry {
 /// Everything a manifest resolves to, plus the rules that place it.
 #[derive(Debug, Clone)]
 pub struct Catalog {
-    /// Directory holding `skillenv.toml`. Local sources resolve against it.
-    pub root: PathBuf,
     /// Entries in a stable order, keyed by id.
     pub entries: BTreeMap<SkillId, CatalogEntry>,
     /// Sources whose skill set is only known after fetching.
@@ -77,6 +74,13 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    // `admit` and the lookups it needs are not reached from `link` yet: a
+    // `skills = "*"` source is collected into `wildcard_sources` and its members
+    // are resolved by `fetch`, but nothing admits them into `entries`, so a
+    // wildcard source currently deploys nothing. Kept rather than deleted because
+    // the missing step is the call, not the code.
+    #![allow(dead_code)]
+
     /// Resolve a manifest into a catalog.
     ///
     /// Only what the manifest states is resolved here; a `[[source]]` with
@@ -84,7 +88,7 @@ impl Catalog {
     /// the source turns out to contain. They join the catalog after a fetch,
     /// through [`Catalog::admit`], which is also where their ids get checked for
     /// collisions.
-    pub fn resolve(manifest: &Manifest, root: &Path) -> Result<Self> {
+    pub fn resolve(manifest: &Manifest) -> Result<Self> {
         let mut entries: BTreeMap<SkillId, CatalogEntry> = BTreeMap::new();
         let mut folded: BTreeMap<String, SkillId> = BTreeMap::new();
 
@@ -109,7 +113,6 @@ impl Catalog {
         }
 
         Ok(Self {
-            root: root.to_path_buf(),
             entries,
             wildcard_sources,
             deploys: manifest.deploys.clone(),
@@ -243,7 +246,7 @@ mod tests {
 
     fn catalog(toml: &str) -> Result<Catalog> {
         let manifest = Manifest::parse(toml, Path::new("skillenv.toml"))?;
-        Catalog::resolve(&manifest, Path::new("/work/dotfiles"))
+        Catalog::resolve(&manifest)
     }
 
     fn id(raw: &str) -> SkillId {
@@ -334,7 +337,7 @@ labels = ["upstream"]
         let catalog = catalog("[[skill]]\nname = \"draft-pr\"\nsource = \"local\"\n")?;
         let entry = catalog.get(&id("draft-pr")).unwrap();
         assert_eq!(
-            entry.local_dir(&catalog.root),
+            entry.local_dir(Path::new("/work/dotfiles")),
             Some(PathBuf::from("/work/dotfiles/skills/draft-pr"))
         );
         assert!(!entry.needs_fetch());
@@ -348,7 +351,7 @@ labels = ["upstream"]
         let catalog =
             catalog("[[source]]\nname = \"s\"\nfrom = \"github:o/r\"\nskills = [\"kinko\"]\n")?;
         let entry = catalog.get(&id("kinko")).unwrap();
-        assert_eq!(entry.local_dir(&catalog.root), None);
+        assert_eq!(entry.local_dir(Path::new("/work/dotfiles")), None);
         assert!(entry.needs_fetch());
         Ok(())
     }
@@ -357,7 +360,10 @@ labels = ["upstream"]
     fn a_relative_path_source_resolves_against_the_manifest() -> Result<()> {
         let catalog = catalog("[[skill]]\nname = \"shared\"\nsource = \"path:../shared\"\n")?;
         assert_eq!(
-            catalog.get(&id("shared")).unwrap().local_dir(&catalog.root),
+            catalog
+                .get(&id("shared"))
+                .unwrap()
+                .local_dir(Path::new("/work/dotfiles")),
             Some(PathBuf::from("/work/dotfiles/../shared"))
         );
         Ok(())

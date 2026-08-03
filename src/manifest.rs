@@ -8,7 +8,6 @@
 //!
 //! The module has no public entry point yet, so everything in it reads as dead
 //! code until the CLI wires `Manifest::load` up. The allow goes away then.
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 use std::fmt;
