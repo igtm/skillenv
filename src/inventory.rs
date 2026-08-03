@@ -831,11 +831,15 @@ fn detect_skillenv_managed_source(
     skill_dir: &Path,
     source_roots: &[InventorySourceRoot],
 ) -> Result<Option<String>> {
-    if let Some(source_path) = rendered_marker_source(skill_dir)? {
-        return Ok(resolve_skillenv_origin(
-            Path::new(&source_path),
-            source_roots,
-        ));
+    match rendered_marker_origin(skill_dir) {
+        // v1 says which manifest owns it directly, so no path inference is needed.
+        Some(MarkerOrigin::Manifest(manifest)) => {
+            return Ok(Some(format!("manifest:{manifest}")));
+        }
+        Some(MarkerOrigin::SourcePath(path)) => {
+            return Ok(resolve_skillenv_origin(Path::new(&path), source_roots));
+        }
+        None => {}
     }
 
     let metadata = fs::symlink_metadata(skill_dir).map_err(|source| SkillenvError::ReadFile {
@@ -859,22 +863,35 @@ fn detect_skillenv_managed_source(
     Ok(None)
 }
 
-fn rendered_marker_source(skill_dir: &Path) -> Result<Option<String>> {
-    let marker_path = skill_dir.join(GENERATED_MARKER_FILE);
-    if !marker_path.is_file() {
-        return Ok(None);
+/// How a deployed directory identifies itself, if it does.
+///
+/// Two marker formats exist. The v1 marker records the manifest it belongs to and
+/// carries no source path — deliberately, since v0 made removal conditional on that
+/// path still resolving. The v0 marker records the path it was rendered from.
+///
+/// An unreadable or unrecognised marker yields `None` rather than an error. Listing
+/// what a tool can see must not fail because one directory is in a format this
+/// build does not know; before this, a v1 deployment made `skillenv skills` abort
+/// with `missing field 'repo'`.
+enum MarkerOrigin {
+    /// v1: the manifest identifier.
+    Manifest(String),
+    /// v0: the path the skill was rendered from.
+    SourcePath(String),
+}
+
+fn rendered_marker_origin(skill_dir: &Path) -> Option<MarkerOrigin> {
+    let raw = fs::read_to_string(skill_dir.join(GENERATED_MARKER_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+
+    // v1 first: it is the format being written now.
+    if let Some(manifest) = value.get("manifest").and_then(serde_json::Value::as_str) {
+        return Some(MarkerOrigin::Manifest(manifest.to_string()));
     }
-    let marker_raw =
-        fs::read_to_string(&marker_path).map_err(|source| SkillenvError::ReadFile {
-            path: marker_path.clone(),
-            source,
-        })?;
-    let marker: GeneratedMarker =
-        serde_json::from_str(&marker_raw).map_err(|source| SkillenvError::SerializeMarker {
-            path: marker_path,
-            source,
-        })?;
-    Ok(Some(marker.source))
+    if let Ok(marker) = serde_json::from_value::<GeneratedMarker>(value) {
+        return Some(MarkerOrigin::SourcePath(marker.source));
+    }
+    None
 }
 
 fn resolve_skillenv_origin(

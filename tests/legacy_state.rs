@@ -116,3 +116,64 @@ fn a_sweep_for_another_repository_finds_nothing_here() {
         );
     }
 }
+
+/// `skillenv skills` must survive both marker formats.
+///
+/// v1 markers record the manifest they belong to and carry no source path. The v0
+/// reader required `repo`, `scope`, and `source`, so a v1 deployment made the whole
+/// command abort with `missing field 'repo'` — listing what a tool can see must not
+/// fail because one directory is in a newer format.
+#[test]
+fn listing_skills_tolerates_both_marker_formats() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join(".claude/skills");
+    fs::create_dir_all(&target).unwrap();
+
+    let write = |name: &str, marker: &str| {
+        let dir = target.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: A skill\n---\n\nBody\n"),
+        )
+        .unwrap();
+        fs::write(dir.join(".skillenv-generated.json"), marker).unwrap();
+    };
+
+    // v1: no `source`, and a `manifest` field instead.
+    write(
+        "skillenv-dotfiles-g0123456789ab-v1-skill",
+        r#"{"manifest":"dotfiles-g0123456789ab","skill":"v1-skill",
+            "generated_name":"skillenv-dotfiles-g0123456789ab-v1-skill",
+            "provider":"claude","content_digest":"sha256:a","rendered_digest":"b"}"#,
+    );
+    // v0: the original shape.
+    write(
+        "skillenv-dotfiles-default-v0-skill",
+        r#"{"repo":"dotfiles","scope":"default","skill":"v0-skill",
+            "generated_name":"skillenv-dotfiles-default-v0-skill",
+            "source":"/gone/skillenv/default/v0-skill","strategy":"render"}"#,
+    );
+    // Neither: must be tolerated, not fatal.
+    let broken = target.join("skillenv-dotfiles-broken");
+    fs::create_dir_all(&broken).unwrap();
+    fs::write(broken.join("SKILL.md"), "---\nname: x\n---\n\nBody\n").unwrap();
+    fs::write(broken.join(".skillenv-generated.json"), "{ not json").unwrap();
+
+    // The v1 sweep should see all three by prefix and refuse to remove the two it
+    // cannot prove are v0 deployments of this repository.
+    let report = skillenv::sweep_legacy(&target, "dotfiles")
+        .expect("a mixture of formats must not fail the sweep");
+    let v0_only: Vec<_> = report.entries.iter().map(|e| e.skill.as_str()).collect();
+    assert_eq!(
+        v0_only,
+        vec!["v0-skill"],
+        "only the v0 deployment is a legacy entry"
+    );
+    assert_eq!(
+        report.unmarked.len(),
+        2,
+        "the v1 and the unparseable one are reported, not removed: {:?}",
+        report.unmarked
+    );
+}
