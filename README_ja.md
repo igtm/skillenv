@@ -108,6 +108,7 @@ skillenv list
 skillenv remove <name>
 skillenv migrate [--apply] [--prune]
 skillenv outdated
+skillenv diff <name>
 skillenv lint
 skillenv fetch [--update]
 skillenv skills [--tool <claude|codex|opencode|antigravity>]... [--repo-tree] [--json]
@@ -171,6 +172,21 @@ lock は最後に 1 回ではなく source ごとに保存します。途中で�
 読み取り専用です。各 remote に `git ls-remote` で問い合わせるだけで、cache も lock
 も触りません。古いことは失敗ではなく状態なので、どちらでも終了コードは 0 です。
 陳腐化で落としたい CI は出力を突き合わせてください。
+
+### diff
+
+`outdated` は「source が動いた」までを、`diff` は「何が動いたか」を出します。lock の
+revision と remote の現在位置、各展開が cache の現在の内容から来ているか、違う場合は
+`SKILL.md` の差分です。ネットワークが必要なのは remote の revision だけで、内容の
+比較はオフラインで動きます。手を打てるのはそちら側なので、そこが重要です。
+
+**本文だけを比べます。** frontmatter は provider ごとに書き換わり `name` は生成
+ディレクトリ名なので、含めると毎回「変更ではない差分」が出てしまいます。
+
+cache が無い場合、あるいは marker が digest を記録していない場合は、一致を主張せず
+「比較できない」と言います。存在しないことは一致ではありません。この manifest の
+marker を持たないディレクトリは、この skill の展開としては報告しません——`status` と
+`link` が既にそれを自分のものと認めないのと揃えています。
 
 ### lint
 
@@ -353,9 +369,23 @@ skill の label と id の両方に一致するので、1 つの skill を指す
 
 ### `skills = "*"` と明示リスト
 
-`"*"` は source が持つものに追従する指定で、解決結果は `skillenv.lock` に記録される
-ので再現性は保たれます。明示リストは固定で、上流から消えた名前は全体の失敗ではなく
-その skill だけの報告になります。
+`"*"` は source が持つものに追従する指定です。メンバーの決まり方は source によって
+違います。remote は `fetch` が発見して `skillenv.lock` に記録するので、clone 直後は
+`fetch` するまで 0 件です。`path:` のツリーは直接読みます——`fetch` にダウンロードする
+ものが無いためです。
+
+**上流から消えたメンバーは lock からも消えます。** wildcard の「持っているもの全部」
+という定義がツリーそのものなので、消えたものは消えたものです。残すと、毎回 catalog に
+載り直すのに展開はできず、しかも wildcard のメンバーは manifest にエントリを持たない
+ので名前を指定して `remove` することもできません。さらに悪いことに、展開できない状態は
+`link` が展開を消す条件そのものなので、動いていた展開が失われます。
+
+明示リストは逆です。名前を指定したのは利用者なので、消えた名前はその skill だけの報告
+として残し、判断は利用者に委ねます。
+
+id が既に使われている wildcard メンバーは、致命的にせず報告して skip します。2 つの
+上流が同じ名前を採用するのは利用者の落ち度ではありませんし、ここで manifest を
+読み込めなくすると、直す手段である `remove` まで道連れになります。
 
 ## safeguard
 
@@ -409,6 +439,12 @@ zero-width によるステガノグラフィ、閉じていない bidi override 
 です。hash があるのは、`$HOME` がマシン上の全リポジトリで共有される一方、削除は
 名前の prefix を手がかりにしているからです。これが無ければ、あるリポジトリの
 `link` が別のリポジトリのエントリを消してしまいます。
+
+**skill 内の symlink は拒否されます。** walk はリンクを辿らなくても `fs::copy` は
+リンク先を開いて中身を複製するので、`notes.md` という名前で `~/.ssh/id_rsa` を指す
+リンクがあれば、その中身が agent が読むディレクトリに展開されます。`local` と `path:`
+の skill は取得時検査を通らないため、ここが唯一の関門です。該当 skill だけが skip され、
+他は展開されます。
 
 各ディレクトリには `.skillenv-generated.json`（marker）が入り、どの manifest の
 ものか、skill、provider、revision、content digest を記録します。**marker は

@@ -59,6 +59,7 @@ skillenv link             # 展開する
 skillenv status           # 各 target に何が展開されているか
 skillenv doctor           # どの manifest / cache / target に解決されたか
 skillenv outdated         # remote と比べて古いか（読み取り専用、書き込みなし）
+skillenv diff <name>      # cache / 展開済み / remote の 3 者を比較する
 skillenv remove <name>    # manifest と lock から外し、展開先も掃除する
 skillenv unlink           # この manifest の展開をすべて削除する
 skillenv skills           # 各 tool から見える skill（管理外も含む）
@@ -67,6 +68,10 @@ skillenv skills           # 各 tool から見える skill（管理外も含む�
 `status` と `skills` は役割が違います。**`status` は「この manifest が置いたもの」**、**`skills` は「各 tool から見えるもの全部」**です。手で置いた skill は後者にしか出ません。
 
 `doctor` は「なぜそこに行ったのか」に答えます。展開先が想定と違うとき、あるいはどこにも展開されないときはこれを見ます。
+
+`outdated` は「この source が動いた」まで、**`diff` は「何が動いたか」**を出します。lock と remote の revision、展開済みが cache と同じ内容から来ているか、違う場合は SKILL.md の差分です。内容の比較はネットワーク無しで動き、remote の revision だけが通信を要します。
+
+差分は**本文だけ**を比べます。frontmatter は provider ごとに書き換わり `name` は生成ディレクトリ名なので、含めると毎回「変更ではない差分」が出てしまいます。
 
 **新しいマシンでは先に `fetch` が必要です。** cache（`.skillenv/cache/`）は git 管理外なので、clone 直後は manifest と lock だけがあります。`fetch` 無しで `link` すると、remote skill が「cache に無い」と名指しで報告されます。
 
@@ -135,9 +140,9 @@ allow = ["W012:figma-to-code:sha256:abc123..."]
 | 形式 | 意味 |
 |---|---|
 | `local` | `skills/<name>/` |
+| `path:../shared` | ローカルのツリー。`fetch` 不要で、その中から skill を探します |
 | `gist:<id>` | gist（git repo として clone される） |
 | `github:owner/repo` | GitHub |
-| `path:../shared` | ローカルパス |
 | `git@...` / `https://...` | 任意の git remote |
 
 ### target の書き方
@@ -164,7 +169,16 @@ provider ごとに frontmatter が変わります。Claude 系は `compatibility
 
 ### `skills = "*"` を使うかどうか
 
-`"*"` は「この source が持つ skill すべてに追従する」意味で、解決結果は `skillenv.lock` に記録されます。明示リストは固定です。
+`"*"` は「この source が持つ skill すべてに追従する」意味です。メンバーの決まり方は source の種類で違います。
+
+- **remote**（github/gist/git URL）は `fetch` が発見して `skillenv.lock` に記録します。**新しいマシンでは `fetch` の前は 0 件**です
+- **`path:`** はツリーがディスク上にあるので、`fetch` を待たず直接読みます（`fetch` は `path:` を何もしません）
+
+`"*"` のメンバーが既存の id と衝突した場合、**その skill だけを報告して残りは展開します**。上流が他所と同じ名前を採用するのは利用者の落ち度ではないので致命的にはしません（ここで manifest を開けなくすると、直す手段である `remove` まで道連れになります）。
+
+**`"*"` のメンバーが上流から消えたら lock からも消えます。** 「この source が持つもの全部」の定義がツリーそのものなので、消えたものは消えたものです。残すと展開できないのに毎回 catalog に載り、`link` が「unavailable」を出し続け、**しかも unavailable なので既存の展開が削除されます**。`remove` でも直せません（wildcard のメンバーは manifest にエントリを持たないため）。明示リストは逆で、名前を指定したのは利用者なので**消えても報告するだけ**です。
+
+明示リストは固定です。
 
 移行では**明示リストが選ばれます**。v0 は「全件追従」と「手書きの列挙」を同じ形で記録していたため区別できず、`"*"` にすると移行直後に未レビューの skill が一気に入ってしまうからです。追従したい source だけ手で `"*"` に変えてください。
 
@@ -195,6 +209,8 @@ skill は agent の文脈に直接読み込まれる指示文なので、供給�
 生成されるディレクトリは `skillenv-<repo>-<id>`（repo scope）または `skillenv-<repo>-g<hash>-<id>`（home scope）です。`$HOME` はマシン全体で共有されるので、hash が repo を区別します。
 
 各ディレクトリには `.skillenv-generated.json`（marker）が入ります。**marker が「skillenv が作った」ことの唯一の証拠**で、これが無いディレクトリは決して削除されず、報告されるだけです。手で置いたものは安全です。
+
+**skill 内の symlink は拒否されます。** `fs::copy` は walk がリンクを辿らなくてもリンク先を開いて複製するので、`notes.md` という名前で `~/.ssh/id_rsa` を指すリンクがあると、その中身が agent が読むディレクトリに展開されてしまいます。`local` と `path:` の skill は取得時検査を通らないため、展開直前が唯一の関門です。該当 skill だけ skip され、他は展開されます。
 
 `skillenv link` は marker を**最初に**書きます。生成が途中で失敗しても残骸は自分のものと認識され、次回の実行で置き換わります。
 

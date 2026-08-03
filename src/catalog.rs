@@ -48,11 +48,19 @@ impl CatalogEntry {
     pub fn local_dir(&self, manifest_root: &Path) -> Option<PathBuf> {
         match &self.source {
             SourceSpec::Local => Some(manifest_root.join(LOCAL_SKILLS_DIR).join(self.id.as_str())),
-            SourceSpec::Path(path) => Some(if path.is_absolute() {
-                path.clone()
-            } else {
-                manifest_root.join(path)
-            }),
+            _ => None,
+        }
+    }
+
+    /// The tree a `path:` source points at, which may hold several skills.
+    ///
+    /// Distinct from `local_dir`: that names one skill's own directory, while this
+    /// names a tree to search. Returning the tree here and resolving inside it is
+    /// what makes `path:` behave like the checkout it usually is.
+    pub fn source_tree(&self, manifest_root: &Path) -> Option<PathBuf> {
+        match &self.source {
+            SourceSpec::Path(path) if path.is_absolute() => Some(path.clone()),
+            SourceSpec::Path(path) => Some(manifest_root.join(path)),
             _ => None,
         }
     }
@@ -356,14 +364,17 @@ labels = ["upstream"]
         Ok(())
     }
 
+    /// A `path:` source names a tree to search, not one skill's directory — the tree
+    /// usually holds several, laid out like any checkout. Returning it from
+    /// `local_dir` made the caller look for SKILL.md at the tree's root, so a
+    /// `path:` source could not be used at all.
     #[test]
     fn a_relative_path_source_resolves_against_the_manifest() -> Result<()> {
         let catalog = catalog("[[skill]]\nname = \"shared\"\nsource = \"path:../shared\"\n")?;
+        let entry = catalog.get(&id("shared")).unwrap();
+        assert_eq!(entry.local_dir(Path::new("/work/dotfiles")), None);
         assert_eq!(
-            catalog
-                .get(&id("shared"))
-                .unwrap()
-                .local_dir(Path::new("/work/dotfiles")),
+            entry.source_tree(Path::new("/work/dotfiles")),
             Some(PathBuf::from("/work/dotfiles/../shared"))
         );
         Ok(())

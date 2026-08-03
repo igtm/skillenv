@@ -110,6 +110,7 @@ skillenv list
 skillenv remove <name>
 skillenv migrate [--apply] [--prune]
 skillenv outdated
+skillenv diff <name>
 skillenv lint
 skillenv fetch [--update]
 skillenv skills [--tool <claude|codex|opencode|antigravity>]... [--repo-tree] [--json]
@@ -174,6 +175,23 @@ hostile or accidentally-huge source cannot fill the disk or stall a shell hook.
 Reads only: contacts each remote with `git ls-remote` and touches neither the
 cache nor the lock. Being out of date is a state, not a failure, so this exits 0
 either way. A CI job that wants to fail on staleness can match the output.
+
+### diff
+
+`outdated` says a source moved; this says what moved in it. Reports the locked
+revision against what the remote points at now, whether each deployment came from
+the bytes the cache currently holds, and a unified diff of `SKILL.md` where it did
+not. Only the remote revision needs a network; the content comparison works
+offline, and that is the half you can act on.
+
+Bodies only. Frontmatter is rewritten per provider and the `name` is the generated
+directory, so including it would put a difference in every diff that is not a
+change to anything.
+
+With no cache, or a marker that recorded no digest, it says it cannot compare
+rather than claiming a match — absence is not agreement. A directory carrying the
+prefix without this manifest's marker is not reported as this skill's deployment,
+matching what `status` and `link` already refuse to claim.
 
 ### lint
 
@@ -358,9 +376,23 @@ skill that would still overflow.
 
 ### `skills = "*"` versus a list
 
-`"*"` follows whatever the source offers, and the resolved set is recorded in
-`skillenv.lock`, so it stays reproducible. An explicit list is fixed; a name that
-disappears upstream is reported per skill rather than failing the whole command.
+`"*"` follows whatever the source offers. Where the members come from depends on
+the source: `fetch` discovers a remote's and records them in `skillenv.lock`, so a
+fresh clone has none until you run it; a `path:` tree is read directly, since
+`fetch` has nothing to download for it.
+
+A member that disappears upstream leaves the lock, because a wildcard's membership
+*is* the tree — keeping it would mean a skill that is re-admitted on every run,
+can never be deployed, and cannot be removed by name, since a wildcard member
+appears in no manifest entry. Worse, being undeployable is what makes `link` clear
+a deployment, so the one that was working would go.
+
+An explicit list is the opposite case: you named it, so a name that disappears is
+reported per skill and left for you to decide about.
+
+A wildcard member whose id is already taken is reported and skipped, not fatal.
+Two upstreams adopting one name is not your mistake, and refusing to load the
+manifest would take `remove` — the way out — with it.
 
 ## The safeguard
 
@@ -421,6 +453,12 @@ directory's name, slugified; `<hash>` is the first twelve hex digits of a sha256
 over its canonical path, and it exists because `$HOME` is shared by every
 repository on the machine while removal keys on a name prefix — without it one
 repository's `link` would delete another's entries.
+
+**A symlink inside a skill is refused.** The walk does not follow one, but `fs::copy`
+opens the path normally and so copies what it points at — a link named `notes.md`
+aimed at an SSH key would be deployed as that key's contents, into a directory an
+agent reads. A `local` or `path:` skill never passes the fetch-time checks, so this
+is its only gate. Refused per skill, so the others still deploy.
 
 Each directory holds a `.skillenv-generated.json` marker recording which manifest
 owns it, the skill, the provider, the revision, and content digests.

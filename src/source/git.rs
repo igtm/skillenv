@@ -103,7 +103,30 @@ pub(super) fn remote_revision(transport: &str, git_ref: Option<&str>) -> Result<
 }
 
 /// Run `git` with prompting disabled and a deadline.
+/// Run git and take its output, whatever it exits with.
+///
+/// For commands where a non-zero exit is an answer rather than a failure — `git
+/// diff` returns 1 to mean "they differ" — so treating it as an error would discard
+/// the very output that was wanted.
+pub(crate) fn run_reporting_status(args: &[&str], cwd: Option<&Path>) -> Result<String> {
+    run_raw(args, cwd).map(|(_success, stdout, _stderr)| stdout)
+}
+
 fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
+    let (success, stdout, stderr) = run_raw(args, cwd)?;
+    if success {
+        Ok(stdout)
+    } else {
+        Err(SkillenvError::CommandFailed {
+            program: "git".to_string(),
+            cwd: cwd.map(Path::to_path_buf),
+            stderr: stderr.trim().to_string(),
+        })
+    }
+}
+
+/// Spawn git with everything interactive disabled, and a timeout.
+fn run_raw(args: &[&str], cwd: Option<&Path>) -> Result<(bool, String, String)> {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -139,6 +162,27 @@ fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
             source,
         })?;
 
+    // Drained on their own threads, started before the wait loop. Reading only after
+    // the process exits deadlocks as soon as output exceeds the pipe buffer: git
+    // blocks writing, never exits, and the timeout below turns a fast command into a
+    // two-minute failure. `git diff` output is unbounded, so this is reachable.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    });
+
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
@@ -166,24 +210,11 @@ fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
         }
     };
 
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    // The readers end when the pipes close, which the exit above guarantees.
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
 
-    if status.success() {
-        Ok(stdout)
-    } else {
-        Err(SkillenvError::CommandFailed {
-            program: "git".to_string(),
-            cwd: cwd.map(Path::to_path_buf),
-            stderr: stderr.trim().to_string(),
-        })
-    }
+    Ok((status.success(), stdout, stderr))
 }
 
 /// A binary that exits successfully and prints nothing, if one is where we expect.

@@ -44,6 +44,14 @@ pub struct Session {
     /// deploys into whatever repository the user is standing in.
     pub repo_root: Option<PathBuf>,
     pub home: PathBuf,
+    /// Why a `skills = "*"` source contributed less than it should have.
+    ///
+    /// Reported rather than fatal. A wildcard genuinely can collide — one upstream
+    /// adopting a name another already uses is not the user's mistake — and failing
+    /// to open the manifest would take `remove`, the way out, down with everything
+    /// else. Complete messages rather than ids, because the cause is sometimes the
+    /// source rather than any one skill.
+    pub wildcard_conflicts: Vec<String>,
 }
 
 /// What a `link` did, across every target.
@@ -55,6 +63,8 @@ pub struct LinkReport {
     pub unavailable: Vec<(SkillId, String)>,
     /// Skills held back by the safeguard.
     pub blocked: Vec<(SkillId, Vec<safeguard::Finding>)>,
+    /// Why a wildcard source contributed less than its tree holds.
+    pub wildcard_conflicts: Vec<String>,
     /// Skills deployed despite a finding, because its severity's policy is `warn`.
     ///
     /// Separate from `blocked` because these did deploy. Reporting them is the whole
@@ -71,6 +81,7 @@ impl LinkReport {
     pub fn has_problems(&self) -> bool {
         !self.unavailable.is_empty()
             || !self.blocked.is_empty()
+            || !self.wildcard_conflicts.is_empty()
             || self.targets.iter().any(DeployReport::has_problems)
     }
 
@@ -79,6 +90,9 @@ impl LinkReport {
         let mut lines = Vec::new();
         for (id, reason) in &self.unavailable {
             lines.push(format!("warning: {id} is unavailable: {reason}"));
+        }
+        for reason in &self.wildcard_conflicts {
+            lines.push(format!("warning: {reason}"));
         }
         for (id, findings) in &self.blocked {
             for finding in findings {
@@ -130,13 +144,20 @@ impl Session {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
 
         let manifest = Manifest::load(&manifest_path)?;
-        let catalog = Catalog::resolve(&manifest)?;
+        let mut catalog = Catalog::resolve(&manifest)?;
         let lock = LockFile::load(&root)?;
+        // A `skills = "*"` source's membership is only knowable after fetching, so
+        // the manifest cannot name it and `Catalog::resolve` sets the source aside.
+        // The lock is where `fetch` records what it found, so this is where intent
+        // and result meet — without it a wildcard source cached its skills and then
+        // deployed none of them.
+        let conflicts = admit_wildcard_members(&mut catalog, &lock, &root);
 
         Ok(Self {
             root,
             manifest,
             catalog,
+            wildcard_conflicts: conflicts,
             lock,
             // Canonicalized so a diagnostic never prints "repo: ." — the point of
             // reporting it is to say which repository a repo-scoped rule resolved.
@@ -164,6 +185,7 @@ impl Session {
 
         // Prepare content once, not once per target: a skill deployed to four
         // directories should be read, scanned, and digested a single time.
+        report.wildcard_conflicts = self.wildcard_conflicts.clone();
         let (prepared, scanned) = self.prepare_all(&mut report)?;
         let mut lock_changed = false;
         for (id, digest, verdict) in &scanned {
@@ -279,6 +301,99 @@ impl Session {
         Ok(report)
     }
 
+    /// Compare a skill's three states: what the cache holds, what is deployed, and
+    /// what the remote points at now.
+    ///
+    /// `outdated` says a source has moved; this says what moved. Reads only, and
+    /// contacts the remote only for the revision — the content comparison is between
+    /// what is already on disk, so it still answers something without a network.
+    pub fn diff(&self, id: &SkillId) -> Result<SkillDiff> {
+        let entry = self
+            .catalog
+            .get(id)
+            .ok_or_else(|| SkillenvError::UnknownEntry {
+                name: id.to_string(),
+                path: self.root.join(MANIFEST_FILE),
+            })?;
+
+        let locked = self.lock.get(id);
+        let cached = self.content_dir(entry).ok();
+        let mut report = SkillDiff {
+            id: id.clone(),
+            locked_revision: locked.and_then(|l| l.resolved_revision.clone()),
+            latest_revision: None,
+            cached_digest: cached.as_deref().map(digest_tree).transpose()?,
+            deployments: Vec::new(),
+        };
+
+        // Only for a source that has a remote to ask. A local or `path:` skill has no
+        // revision, and inventing a "latest" for it would be noise.
+        if requires_fetch(&entry.source) {
+            let git_ref = self
+                .manifest
+                .sources
+                .iter()
+                .find(|source| Some(source.name.as_str()) == entry.source_name.as_deref())
+                .and_then(|source| source.git_ref.clone());
+            report.latest_revision =
+                source::peek_revision(&entry.source, git_ref.as_deref()).unwrap_or(None);
+        }
+
+        let context = self.target_context();
+        for (target, _rules) in resolve_targets(&self.catalog.deploys, &context)? {
+            let scope = target
+                .refs
+                .first()
+                .map(|reference| reference.scope)
+                .unwrap_or(TargetScope::Home);
+            let manifest_id = ManifestId::for_root(&self.root, scope)?;
+            let generated = manifest_id.generated_name(id);
+
+            // The name alone is not evidence: a directory with our prefix but no
+            // marker, or another manifest's, is one `status` and `link` both refuse to
+            // claim, and reporting it here as this skill's deployment contradicted
+            // them — with a digest of "none" that could not match anything.
+            let Some(existing) = deploy::enumerate(&target.path, &manifest_id)?
+                .into_iter()
+                .find(|entry| entry.dir_name == generated && entry.belongs_to(&manifest_id))
+            else {
+                continue;
+            };
+            let deployed_digest = existing
+                .marker
+                .as_ref()
+                .and_then(|marker| marker.content_digest.clone());
+            // The rendered SKILL.md differs from the source's by design — the
+            // frontmatter is rewritten per provider — so the useful comparison is
+            // whether the content digest the marker recorded still matches the cache.
+            // Absence is not agreement. With no cache to compare against, or a marker
+            // that recorded no digest, the honest answer is that we cannot tell —
+            // reporting `false` printed "matches the cache" directly beneath
+            // "cached: none".
+            let comparison = match (&report.cached_digest, &deployed_digest) {
+                (Some(cache), Some(deployed)) if cache == deployed => Comparison::Same,
+                (Some(_), Some(_)) => Comparison::Differs,
+                _ => Comparison::Unknown,
+            };
+            // Bodies only. The frontmatter is rewritten per provider — the `name` is
+            // the generated directory name, not the skill's — so including it would put
+            // a difference in every diff that is not a change to anything.
+            let body = match (comparison, &cached) {
+                (Comparison::Differs, Some(cache)) => body_diff(&existing.path, cache)?,
+                _ => BodyDiff::Same,
+            };
+            report.deployments.push(DeploymentDiff {
+                target: target.path.clone(),
+                provider: target.render_with.as_str().to_string(),
+                deployed_digest,
+                comparison,
+                body,
+            });
+        }
+
+        Ok(report)
+    }
+
     /// Remove every deployment belonging to this manifest, in every target it
     /// resolves to.
     ///
@@ -375,6 +490,17 @@ impl Session {
             if fetched.reused {
                 report.reused.push(source.name.clone());
             }
+            // A wildcard source's membership *is* whatever the tree now holds, so a
+            // member that is gone from it is gone, full stop. Kept, its lock entry
+            // would be re-admitted to the catalog on every open while nothing ever
+            // re-copied it — `link` would report it unavailable forever and, being
+            // unavailable, delete the deployment that was working. An explicit list
+            // is different: the user asked for that name, so a missing one is
+            // reported and left for them to decide about.
+            if source.skills.is_none() {
+                let gone = self.forget_absent_wildcard_members(&source.name, &report.fetched);
+                report.dropped.extend(gone);
+            }
             // A revision belongs to the source, not to each skill in it. A skill that
             // went missing upstream would otherwise keep the revision it was last
             // seen at, leaving one source with two revisions in the lock — and the
@@ -384,6 +510,33 @@ impl Session {
         }
 
         Ok(report)
+    }
+
+    /// Drop lock entries for a wildcard source's members that are no longer in it.
+    ///
+    /// A wildcard source's membership *is* whatever its tree now holds, so a member
+    /// gone from the tree is gone. Kept, its entry was re-admitted to the catalog on
+    /// every open while nothing ever re-copied it: `link` reported it unavailable
+    /// forever and, being unavailable, deleted the deployment that still worked — and
+    /// `remove` could not undo it, because a wildcard member is named in no manifest
+    /// entry.
+    fn forget_absent_wildcard_members(
+        &mut self,
+        source_name: &str,
+        present: &[SkillId],
+    ) -> Vec<SkillId> {
+        let gone: Vec<SkillId> = self
+            .lock
+            .skills
+            .iter()
+            .filter(|locked| locked.source_name.as_deref() == Some(source_name))
+            .filter(|locked| !present.contains(&locked.id))
+            .map(|locked| locked.id.clone())
+            .collect();
+        for id in &gone {
+            self.lock.remove(id);
+        }
+        gone
     }
 
     /// Record `revision` for every lock entry belonging to `source_name`.
@@ -519,6 +672,12 @@ impl Session {
         let mut grouped: BTreeMap<String, RemoteSource> = BTreeMap::new();
 
         for source in &self.manifest.sources {
+            // A `path:` source is read where it lies; there is nothing to fetch. Left
+            // in, git would be asked to clone a directory and the whole `fetch` would
+            // exit non-zero over a source that was never remote.
+            if !requires_fetch(&source.from) {
+                continue;
+            }
             grouped.insert(
                 source.name.clone(),
                 RemoteSource {
@@ -630,6 +789,16 @@ impl Session {
     /// Nothing is fetched here. `link` works from what the cache already holds so
     /// it stays offline and fast; populating the cache is `fetch`'s job.
     fn content_dir(&self, entry: &CatalogEntry) -> std::result::Result<PathBuf, String> {
+        // A `path:` source names a tree that may hold many skills, so the skill has
+        // to be located inside it — by the same rules as a fetched tree, since it is
+        // usually a checkout of one. `skills/<id>` is what these actually look like;
+        // treating the root as the skill only works when the tree holds exactly one.
+        if let Some(root) = entry.source_tree(&self.root) {
+            return match source::locate_skill(&root, entry.id.as_str()) {
+                Some(dir) => Ok(dir),
+                None => Err(format!("not found under {}", root.display())),
+            };
+        }
         if let Some(dir) = entry.local_dir(&self.root) {
             return if dir.join("SKILL.md").is_file() {
                 Ok(dir)
@@ -728,6 +897,95 @@ impl Session {
     pub fn safeguard_config(&self) -> &crate::manifest::SafeguardConfig {
         &self.manifest.safeguard
     }
+}
+
+/// Unified diff of two skills' bodies, or `None` when only frontmatter differs.
+///
+/// A file that cannot be read yields no diff rather than an error: `diff` is a
+/// read-only report, and failing the whole command because one deployment is
+/// unreadable would withhold the rest of the answer.
+fn body_diff(deployed_dir: &Path, cached_dir: &Path) -> Result<BodyDiff> {
+    let read_body = |dir: &Path| -> Option<String> {
+        let path = dir.join("SKILL.md");
+        // Not UTF-8, or unreadable, is reported rather than silently treated as an
+        // empty body — a skill from a local tree never passes through the fetch-time
+        // checks, so this really can be arbitrary bytes.
+        let raw = std::fs::read_to_string(&path).ok()?;
+        match crate::render::parse_frontmatter(&path, &raw) {
+            Ok((_meta, body)) => Some(body),
+            // No parseable frontmatter: the whole file is the body.
+            Err(_) => Some(raw),
+        }
+    };
+    let Some(deployed) = read_body(deployed_dir) else {
+        return Ok(BodyDiff::Unreadable(deployed_dir.join("SKILL.md")));
+    };
+    let Some(cached) = read_body(cached_dir) else {
+        return Ok(BodyDiff::Unreadable(cached_dir.join("SKILL.md")));
+    };
+    if deployed == cached {
+        return Ok(BodyDiff::Same);
+    }
+    let diff = source::diff_text(&deployed, &cached, "deployed", "cached")?;
+    Ok(if diff.is_empty() {
+        BodyDiff::Same
+    } else {
+        BodyDiff::Changed(diff)
+    })
+}
+
+/// How a deployment stands against the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    /// Deployed from the bytes the cache currently holds.
+    Same,
+    Differs,
+    /// Not answerable: the skill is not cached, or the marker recorded no digest.
+    /// A distinct answer because reporting it as `Same` said "matches the cache"
+    /// directly beneath "cached: none".
+    Unknown,
+}
+
+/// The body comparison, which can fail independently of the digest comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyDiff {
+    /// Bodies agree; the digests differ only in frontmatter or assets.
+    Same,
+    Changed(String),
+    /// One side could not be read. Distinct from `Same` because "no diff shown"
+    /// otherwise looked like "nothing changed" under a heading saying it differs.
+    Unreadable(PathBuf),
+}
+
+/// One skill's cache, deployments, and remote revision, side by side.
+#[derive(Debug, Clone)]
+pub struct SkillDiff {
+    pub id: SkillId,
+    pub locked_revision: Option<String>,
+    /// `None` when the source has no remote, or the remote could not be reached.
+    pub latest_revision: Option<String>,
+    /// `None` when the skill is not in the cache at all.
+    pub cached_digest: Option<String>,
+    pub deployments: Vec<DeploymentDiff>,
+}
+
+impl SkillDiff {
+    /// Whether the remote has moved past what the lock records.
+    pub fn is_behind(&self) -> bool {
+        match (&self.locked_revision, &self.latest_revision) {
+            (Some(locked), Some(latest)) => locked != latest,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DeploymentDiff {
+    pub target: PathBuf,
+    pub provider: String,
+    pub deployed_digest: Option<String>,
+    pub comparison: Comparison,
+    pub body: BodyDiff,
 }
 
 /// What `prepare_all` produces: the content to deploy, and the scan result for
@@ -954,6 +1212,54 @@ fn detect_repo_root(cwd: &Path) -> Option<PathBuf> {
 }
 
 /// Whether a source needs the network before it can be deployed.
+/// Put every wildcard source's recorded members into the catalog.
+///
+/// Returns the ones that could not be admitted because the id was already taken.
+/// The flat namespace is the point — two sources must not both supply `handoff` —
+/// but a collision arriving from a wildcard is a thing to report, not to die on.
+fn admit_wildcard_members(catalog: &mut Catalog, lock: &LockFile, root: &Path) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    for source in catalog.wildcard_sources.clone() {
+        // Where the members come from depends on whether the tree is already here.
+        // A `path:` source is on disk, so waiting for `fetch` to record it would mean
+        // waiting forever: `fetch` skips it, correctly, as there is nothing to
+        // download. A remote source's membership is whatever the last fetch found.
+        let members: Vec<SkillId> = match &source.from {
+            SourceSpec::Path(path) => {
+                let tree = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                };
+                if !tree.is_dir() {
+                    // Reported rather than silently yielding nothing, which is what a
+                    // mistyped path used to do.
+                    conflicts.push(format!(
+                        "source {} tracks every skill under {}, which is not a directory",
+                        source.name,
+                        tree.display()
+                    ));
+                    continue;
+                }
+                discover_skills(&tree)
+            }
+            _ => lock
+                .skills
+                .iter()
+                .filter(|locked| locked.source_name.as_deref() == Some(source.name.as_str()))
+                .map(|locked| locked.id.clone())
+                .collect(),
+        };
+
+        for id in members {
+            if let Err(error) = catalog.admit(&source, id.clone()) {
+                conflicts.push(format!("{id} from source {}: {error}", source.name));
+            }
+        }
+    }
+    conflicts
+}
+
 pub fn requires_fetch(source: &SourceSpec) -> bool {
     !matches!(source, SourceSpec::Local | SourceSpec::Path(_))
 }
@@ -982,6 +1288,390 @@ mod tests {
 
     fn open_session(root: &Path, home: &Path) -> Result<Session> {
         Session::open(root, home.to_path_buf())
+    }
+
+    /// A wildcard source's membership *is* its tree, so a member that vanishes from it
+    /// must leave the lock. Kept, it was re-admitted to the catalog on every open while
+    /// nothing re-copied it, so `link` reported it unavailable forever — and being
+    /// unavailable, deleted the deployment that was still working. `remove` could not
+    /// undo it either: a wildcard member is named in no manifest entry.
+    #[test]
+    fn a_wildcard_member_that_vanished_upstream_leaves_the_lock() -> Result<()> {
+        let root = workspace(
+            "[[source]]\nname = \"up\"\nfrom = \"github:me/up\"\nskills = \"*\"\n",
+            &[],
+        );
+        // As an earlier fetch left it, with both members recorded.
+        fs::write(
+            root.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"stayed","source":"github:me/up","source_name":"up",
+                 "resolved_revision":"rev0","content_digest":"sha256:aa","safeguard":{}},
+                {"id":"vanished","source":"github:me/up","source_name":"up",
+                 "resolved_revision":"rev0","content_digest":"sha256:bb","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        // Both reach the catalog to begin with, which is what made the phantom
+        // permanent.
+        assert!(session.catalog.get(&SkillId::parse("vanished")?).is_some());
+
+        // This fetch found only `stayed` in the tree.
+        let gone = session.forget_absent_wildcard_members("up", &[SkillId::parse("stayed")?]);
+        assert_eq!(
+            gone.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["vanished"]
+        );
+        session.lock.save(&session.root)?;
+
+        // And it does not come back on the next open to haunt `link`.
+        let session = open_session(root.path(), home.path())?;
+        assert!(session.lock.get(&SkillId::parse("vanished")?).is_none());
+        assert!(session.catalog.get(&SkillId::parse("vanished")?).is_none());
+        assert!(session.catalog.get(&SkillId::parse("stayed")?).is_some());
+        Ok(())
+    }
+
+    /// An explicit list is the opposite case: the user asked for that name, so a
+    /// missing one is reported by name for them to decide about, never dropped.
+    #[test]
+    fn an_explicitly_listed_skill_is_reported_not_dropped_when_missing() -> Result<()> {
+        let root = workspace(
+            "[[source]]\nname = \"up\"\nfrom = \"path:./tree\"\n\
+             skills = [\"stayed\", \"vanished\"]\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[],
+        );
+        let tree = root.path().join("tree/skills");
+        fs::create_dir_all(tree.join("stayed")).unwrap();
+        fs::write(tree.join("stayed").join("SKILL.md"), valid("stayed")).unwrap();
+
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.link()?;
+
+        assert!(
+            report
+                .unavailable
+                .iter()
+                .any(|(id, _)| id.as_str() == "vanished"),
+            "it must be named: got {:?}",
+            report.unavailable
+        );
+        // The one that is there still deploys.
+        assert_eq!(
+            report.targets[0]
+                .written
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["stayed"]
+        );
+        Ok(())
+    }
+
+    /// `diff` must not claim a directory it cannot attribute to this manifest.
+    /// Reporting one said "matches the cache" about a directory `status` and `link`
+    /// both refuse to touch, with a digest of "none" that matched nothing.
+    #[test]
+    fn diff_ignores_a_deployment_without_our_marker() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"kinko\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[("kinko", &valid("kinko"))],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        session.link()?;
+
+        let target = home.path().join(".claude/skills");
+        let deployed = fs::read_dir(&target)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.is_dir())
+            .expect("one deployment");
+        fs::remove_file(deployed.join(".skillenv-generated.json")).unwrap();
+
+        let report = session.diff(&SkillId::parse("kinko")?)?;
+        assert!(
+            report.deployments.is_empty(),
+            "an unmarked directory is not ours to report on"
+        );
+        Ok(())
+    }
+
+    /// With nothing cached there is no comparison to make, and saying "matches" printed
+    /// that directly beneath "cached: none".
+    #[test]
+    fn diff_says_it_cannot_compare_when_the_cache_is_gone() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"kinko\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[("kinko", &valid("kinko"))],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        session.link()?;
+        fs::remove_dir_all(root.path().join("skills/kinko")).unwrap();
+
+        let session = open_session(root.path(), home.path())?;
+        let report = session.diff(&SkillId::parse("kinko")?)?;
+        assert!(report.cached_digest.is_none());
+        assert_eq!(report.deployments[0].comparison, Comparison::Unknown);
+        Ok(())
+    }
+
+    /// A skill from a local tree never meets the fetch-time checks, so `copy_assets` is
+    /// the only gate it passes. `fs::copy` follows a symlink even when the walk does
+    /// not, so a link named `notes.md` pointing at an SSH key was deployed as that
+    /// key's contents, into a directory an agent reads.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_in_a_local_skill_is_refused_rather_than_dereferenced() -> Result<()> {
+        let secret = TempDir::new().unwrap();
+        let secret_file = secret.path().join("private.txt");
+        fs::write(&secret_file, "SENSITIVE").unwrap();
+
+        let root = workspace(
+            "[[skill]]\nname = \"leaky\"\nsource = \"local\"\n\n\
+             [[skill]]\nname = \"clean\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[("leaky", &valid("leaky")), ("clean", &valid("clean"))],
+        );
+        std::os::unix::fs::symlink(&secret_file, root.path().join("skills/leaky/notes.md"))
+            .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.link()?;
+
+        let skipped: Vec<&str> = report.targets[0]
+            .skipped
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(skipped, vec!["leaky"]);
+        // One bad skill does not withhold the others.
+        assert_eq!(
+            report.targets[0]
+                .written
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["clean"]
+        );
+
+        let leaked = walkdir::WalkDir::new(home.path())
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry.file_type().is_file()
+                    && fs::read_to_string(entry.path())
+                        .map(|text| text.contains("SENSITIVE"))
+                        .unwrap_or(false)
+            });
+        assert!(!leaked, "the symlink target's contents must not be copied");
+        Ok(())
+    }
+
+    /// `diff` answers what `outdated` cannot: which of a skill's three states — cache,
+    /// deployment, remote — disagree. The content half must work without a network,
+    /// since that is the half you can act on offline.
+    #[test]
+    fn diff_sees_a_deployment_left_behind_by_an_edited_source() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"kinko\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[(
+                "kinko",
+                "---\nname: kinko\ndescription: A skill for testing\n---\n\nFirst.\n",
+            )],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        session.link()?;
+
+        // Matches immediately after deploying, even though the rendered frontmatter
+        // differs — the generated name is not a change to the skill.
+        let before = session.diff(&SkillId::parse("kinko")?)?;
+        assert_eq!(before.deployments.len(), 1);
+        assert_eq!(before.deployments[0].comparison, Comparison::Same);
+        assert_eq!(before.deployments[0].body, BodyDiff::Same);
+
+        fs::write(
+            root.path().join("skills/kinko/SKILL.md"),
+            "---\nname: kinko\ndescription: A skill for testing\n---\n\nSecond.\n",
+        )
+        .unwrap();
+
+        let session = open_session(root.path(), home.path())?;
+        let after = session.diff(&SkillId::parse("kinko")?)?;
+        assert_eq!(
+            after.deployments[0].comparison,
+            Comparison::Differs,
+            "the edit must show"
+        );
+        let BodyDiff::Changed(body) = &after.deployments[0].body else {
+            panic!(
+                "a body change should produce a diff: {:?}",
+                after.deployments[0].body
+            );
+        };
+        assert!(body.contains("-First."), "got: {body}");
+        assert!(body.contains("+Second."), "got: {body}");
+        // Short labels, not absolute paths: git echoes whatever it was given, and the
+        // real locations buried the change.
+        assert!(body.contains("deployed/SKILL.md"), "got: {body}");
+        assert!(!body.contains(root.path().to_str().unwrap()), "got: {body}");
+        Ok(())
+    }
+
+    /// A skill nobody declared is an error naming the manifest, not an empty report
+    /// that reads as "nothing differs".
+    #[test]
+    fn diff_refuses_an_unknown_skill() -> Result<()> {
+        let root = workspace("[[skill]]\nname = \"kinko\"\nsource = \"local\"\n", &[]);
+        let home = TempDir::new().unwrap();
+        let session = open_session(root.path(), home.path())?;
+        assert!(session.diff(&SkillId::parse("absent")?).is_err());
+        Ok(())
+    }
+
+    /// A local skill has no revision, so `diff` must not claim it is behind.
+    #[test]
+    fn a_local_skill_is_never_behind() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"kinko\"\nsource = \"local\"\n",
+            &[("kinko", &valid("kinko"))],
+        );
+        let home = TempDir::new().unwrap();
+        let session = open_session(root.path(), home.path())?;
+        let report = session.diff(&SkillId::parse("kinko")?)?;
+        assert!(report.latest_revision.is_none());
+        assert!(!report.is_behind());
+        Ok(())
+    }
+
+    /// `skills = "*"` has to reach `link`, not just `fetch`. The members are only
+    /// knowable after fetching, so the manifest cannot name them and the catalog sets
+    /// the source aside — which meant a wildcard source cached its skills and then
+    /// deployed none of them, silently.
+    #[test]
+    fn a_wildcard_sources_recorded_members_are_deployed() -> Result<()> {
+        let root = workspace(
+            "[[source]]\nname = \"up\"\nfrom = \"github:me/up\"\nskills = \"*\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[],
+        );
+        // As `fetch` leaves it after discovering the tree's contents.
+        fs::write(
+            root.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"alpha","source":"github:me/up","source_name":"up",
+                 "resolved_revision":"rev0","content_digest":"sha256:aa","safeguard":{}},
+                {"id":"beta","source":"github:me/up","source_name":"up",
+                 "resolved_revision":"rev0","content_digest":"sha256:bb","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let session = open_session(root.path(), home.path())?;
+        let ids: Vec<String> = session.catalog.iter().map(|e| e.id.to_string()).collect();
+        assert_eq!(ids, vec!["alpha", "beta"], "both must reach the catalog");
+        assert!(session.wildcard_conflicts.is_empty());
+        Ok(())
+    }
+
+    /// A `path:` wildcard's tree is already on disk, and `fetch` skips it because there
+    /// is nothing to download — so waiting for `fetch` to record its members would
+    /// wait forever. They are read from the tree instead.
+    #[test]
+    fn a_path_wildcard_reads_its_members_from_disk() -> Result<()> {
+        let upstream = TempDir::new().unwrap();
+        for id in ["alpha", "beta"] {
+            let dir = upstream.path().join("skills").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), valid(id)).unwrap();
+        }
+        let root = workspace(
+            &format!(
+                "[[source]]\nname = \"up\"\nfrom = \"path:{}\"\nskills = \"*\"\n",
+                upstream.path().display()
+            ),
+            &[],
+        );
+
+        let home = TempDir::new().unwrap();
+        let session = open_session(root.path(), home.path())?;
+        let ids: Vec<String> = session.catalog.iter().map(|e| e.id.to_string()).collect();
+        assert_eq!(ids, vec!["alpha", "beta"]);
+        // And `fetch` must not try to git-clone a directory.
+        let mut session = session;
+        let report = session.fetch(false)?;
+        assert!(report.failed.is_empty(), "got: {:?}", report.failed);
+        Ok(())
+    }
+
+    /// A wildcard can genuinely collide: one upstream adopting a name another already
+    /// uses is not the user's mistake. The flat namespace still refuses it, but as a
+    /// report — failing to open the manifest would take `remove`, the way out, with it.
+    #[test]
+    fn a_colliding_wildcard_member_is_reported_not_fatal() -> Result<()> {
+        let root = workspace(
+            "[[skill]]\nname = \"alpha\"\nsource = \"local\"\n\n\
+             [[source]]\nname = \"up\"\nfrom = \"github:me/up\"\nskills = \"*\"\n",
+            &[("alpha", &valid("alpha"))],
+        );
+        fs::write(
+            root.path().join("skillenv.lock"),
+            r#"{"version":1,"skills":[
+                {"id":"alpha","source":"github:me/up","source_name":"up",
+                 "resolved_revision":"rev0","content_digest":"sha256:aa","safeguard":{}}]}"#,
+        )
+        .unwrap();
+
+        let home = TempDir::new().unwrap();
+        let session = open_session(root.path(), home.path())?;
+        assert_eq!(session.wildcard_conflicts.len(), 1);
+        assert!(
+            session.wildcard_conflicts[0].contains("alpha"),
+            "got: {:?}",
+            session.wildcard_conflicts
+        );
+        // The declared skill keeps the name.
+        assert!(session.catalog.get(&SkillId::parse("alpha")?).is_some());
+        Ok(())
+    }
+
+    /// A mistyped path used to yield nothing at all. It must say so.
+    #[test]
+    fn a_path_wildcard_pointing_nowhere_is_reported() -> Result<()> {
+        let root = workspace(
+            "[[source]]\nname = \"up\"\nfrom = \"path:./nope\"\nskills = \"*\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+            &[],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        assert_eq!(session.wildcard_conflicts.len(), 1);
+
+        let report = session.link()?;
+        assert!(
+            report.has_problems(),
+            "a source contributing nothing is a problem"
+        );
+        assert!(
+            report
+                .warnings()
+                .iter()
+                .any(|line| line.contains("not a directory")),
+            "got: {:?}",
+            report.warnings()
+        );
+        Ok(())
     }
 
     /// One source must never hold two revisions in the lock.
