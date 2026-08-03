@@ -476,6 +476,36 @@ pub fn apply(plan: &MigrationPlan, options: &ApplyOptions) -> Result<MigrationRe
     Ok(report)
 }
 
+/// Remove the v0 layout from a repository that has already been migrated.
+///
+/// Separate from `apply` because the recommended order is to migrate, check the
+/// result, and only then discard the old tree — which is a second invocation.
+/// `--prune` used to require `--apply`, and `--apply` refuses an already-migrated
+/// repository, so that order was impossible to carry out.
+pub fn prune(root: &Path) -> Result<PathBuf> {
+    if !root.join(MANIFEST_FILE).is_file() {
+        return Err(SkillenvError::InvalidManifest {
+            path: root.join(MANIFEST_FILE),
+            message: format!(
+                "refusing to remove {V0_DIR}/ before migrating; run `skillenv migrate --apply` \
+                 first so there is something to fall back to"
+            ),
+        });
+    }
+    let v0 = root.join(V0_DIR);
+    if !v0.is_dir() {
+        return Err(SkillenvError::InvalidManifest {
+            path: v0,
+            message: format!("no {V0_DIR}/ to remove; it is already gone"),
+        });
+    }
+    fs::remove_dir_all(&v0).map_err(|source| SkillenvError::WriteFile {
+        path: v0.clone(),
+        source,
+    })?;
+    Ok(v0)
+}
+
 /// Where v0 installed one skill of a managed source.
 ///
 /// Both scopes are probed independently, since a source may have used either.
@@ -1057,6 +1087,43 @@ mod tests {
             "the seeded managed skill should deploy without a fetch: {deployed_after:?}"
         );
         assert!(linked.unavailable.is_empty(), "{:?}", linked.unavailable);
+        Ok(())
+    }
+
+    /// The order that makes sense is migrate, check, then discard — which is two
+    /// invocations. `--prune` used to require `--apply`, and `--apply` refuses an
+    /// already-migrated repository, so the documented order could not be followed.
+    #[test]
+    fn prune_works_on_its_own_after_migrating() -> Result<()> {
+        let (root, home) = v0_setup();
+        apply(&plan(root.path(), home.path())?, &ApplyOptions::default())?;
+        assert!(root.path().join(V0_DIR).is_dir(), "kept until asked");
+
+        let removed = prune(root.path())?;
+        assert_eq!(removed, root.path().join(V0_DIR));
+        assert!(!root.path().join(V0_DIR).exists());
+        // The migrated files are untouched.
+        assert!(root.path().join(MANIFEST_FILE).is_file());
+        assert!(root.path().join("skills/draft-pr/SKILL.md").is_file());
+        Ok(())
+    }
+
+    /// Pruning before migrating would delete the only copy of the skills.
+    #[test]
+    fn prune_refuses_before_a_migration_has_happened() {
+        let (root, _home) = v0_setup();
+        let error = prune(root.path()).unwrap_err().to_string();
+        assert!(error.contains("before migrating"), "unexpected: {error}");
+        assert!(root.path().join(V0_DIR).is_dir(), "nothing was removed");
+    }
+
+    #[test]
+    fn pruning_twice_says_it_is_already_gone() -> Result<()> {
+        let (root, home) = v0_setup();
+        apply(&plan(root.path(), home.path())?, &ApplyOptions::default())?;
+        prune(root.path())?;
+        let error = prune(root.path()).unwrap_err().to_string();
+        assert!(error.contains("already gone"), "unexpected: {error}");
         Ok(())
     }
 

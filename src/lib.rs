@@ -112,6 +112,16 @@ pub fn outdated_manifest(cwd: impl AsRef<Path>) -> Result<(String, bool)> {
     Ok((lines.join("\n"), true))
 }
 
+/// Remove the v0 layout from an already-migrated repository.
+///
+/// Its own entry point rather than a flag on the conversion, because the order that
+/// makes sense — migrate, check, then discard — is two invocations.
+pub fn prune_legacy_layout(cwd: impl AsRef<Path>) -> Result<String> {
+    let root = fs::canonicalize(cwd.as_ref()).unwrap_or_else(|_| cwd.as_ref().to_path_buf());
+    let removed = migrate::prune(&root)?;
+    Ok(format!("removed {}", removed.display()))
+}
+
 /// Whether a v1 manifest governs `cwd`.
 ///
 /// Callers use this to decide which engine to run. While both exist, a repository

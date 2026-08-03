@@ -246,8 +246,9 @@ struct MigrateArgs {
     /// Carry out the conversion. Without this, nothing is written.
     #[arg(long)]
     apply: bool,
-    /// With --apply, also remove the old skillenv/ layout.
-    #[arg(long, requires = "apply")]
+    /// Remove the old skillenv/ layout. Usable on its own after migrating, which
+    /// is the order that makes sense: migrate, check the result, then discard.
+    #[arg(long)]
     prune: bool,
 }
 
@@ -414,10 +415,11 @@ fn dispatch_manifest(cli: &Cli) -> Option<skillenv::Result<CommandOutput>> {
                 }
             }),
         ),
-        Command::Migrate(args) => Some(if args.apply {
-            skillenv::apply_migration(".", args.prune).map(CommandOutput::text)
-        } else {
-            skillenv::plan_migration(".").map(CommandOutput::text)
+        Command::Migrate(args) => Some(match (args.apply, args.prune) {
+            (true, prune) => skillenv::apply_migration(".", prune).map(CommandOutput::text),
+            // --prune alone acts on a repository that has already been migrated.
+            (false, true) => skillenv::prune_legacy_layout(".").map(CommandOutput::text),
+            (false, false) => skillenv::plan_migration(".").map(CommandOutput::text),
         }),
         Command::Lint => {
             Some(
