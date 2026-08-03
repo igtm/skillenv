@@ -15,6 +15,79 @@ It provides:
 
 The current version is `0.3.1`.
 
+## Two layouts
+
+There are two generations, and which one runs depends on whether a `skillenv.toml`
+is present. A repository still on the older layout keeps working exactly as it did.
+
+**v1 — `skillenv.toml`.** One manifest declares every skill, where it comes from,
+and where it goes. The skill namespace is flat, frontmatter is rewritten per
+provider, sources include gists, and every skill is scanned before it is deployed.
+
+**v0 — `skillenv/{default,local,profiles}/`.** Scopes expressed as directories.
+Everything below this section describes v0, and remains accurate for a repository
+that has not migrated.
+
+### Migrating
+
+The first step writes nothing:
+
+```bash
+skillenv migrate                   # show the plan; read-only
+skillenv migrate --apply           # carry it out
+skillenv migrate --apply --prune   # once confirmed, remove the old skillenv/
+```
+
+`--apply` leaves `skillenv/` in place, and seeds the new cache from v0's own
+vendored copies, so `link` works offline immediately afterwards. To undo, delete
+`skillenv.toml` and `skillenv.lock`.
+
+It refuses to guess: profiles in use, or the same id under both `default/` and
+`local/`, stop the migration and are reported by name rather than collapsed
+automatically.
+
+### v1 commands
+
+```bash
+skillenv list             # declared skills, with source and labels
+skillenv lint             # frontmatter validity and the safety checks
+skillenv link             # deploy
+skillenv outdated         # compare the lock against each remote; reads only
+skillenv fetch            # restore the cache at the locked revisions
+skillenv fetch --update   # move to whatever each ref points at now
+```
+
+`fetch` is required on a new machine: the cache is gitignored, so a fresh clone
+has only the manifest and the lock.
+
+`link` writes warnings to stderr and exits non-zero on a problem **even under
+`--quiet`**, which is what the shell hook runs. A skill that failed to deploy is
+never silent.
+
+### What v1 adds
+
+- **A flat skill namespace.** One id per skill across every source, compared
+  case-insensitively so a case-insensitive filesystem cannot produce a collision
+  that appears only at write time.
+- **Per-provider frontmatter.** The two official validators on this machine
+  disagree about which keys are allowed — Claude accepts `compatibility`, Codex
+  rejects it — and `allowed-tools` appears in four incompatible serializations.
+  Keys a provider cannot accept are reported rather than silently dropped, and
+  Codex gets an `agents/openai.yaml` sidecar.
+- **`codex` resolves to `$CODEX_HOME/skills`.** v0 treated `.agents/skills` as the
+  Codex target; that directory is the Agent Skills open standard, read by many
+  tools, and is now its own `agents` provider.
+- **Safety checks, on by default.** Skills are instruction material read straight
+  into an agent's context. Hidden-Unicode instruction smuggling, injection
+  phrasing, and credential exfiltration are detected using Snyk's `agent-scan`
+  codes, and `critical` blocks deployment. A blocked skill is not removed either,
+  so a compromised upstream cannot delete a skill by deliberately tripping the
+  scanner.
+- **Non-mutating staleness.** `outdated` uses `git ls-remote` and touches neither
+  the cache nor the lock.
+- **Failures are per skill.** One malformed `SKILL.md` no longer withholds the
+  others; only systemic I/O errors stop the run.
+
 ## Install
 
 Install the latest GitHub Release on Linux or macOS:

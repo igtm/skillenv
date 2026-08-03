@@ -15,6 +15,52 @@
 
 現在のバージョンは `0.3.1` です。
 
+## 2 つのレイアウト
+
+skillenv には 2 世代あり、**`skillenv.toml` があるかどうか**でどちらが動くかが決まります。旧レイアウトのままのリポジトリは、これまでと変わらず動きます。
+
+**v1 — `skillenv.toml`。** 1 つの manifest に、どの skill がどこから来てどこへ行くかをすべて宣言します。skill の名前空間は平坦で、frontmatter は provider ごとに書き換えられ、source には gist を含められ、展開前にすべての skill が検査されます。
+
+**v0 — `skillenv/{default,local,profiles}/`。** scope をディレクトリで表現します。この節より下はすべて v0 の説明で、移行していないリポジトリでは現在も正確です。
+
+### 移行する
+
+1 段階目は何も書き込みません。
+
+```bash
+skillenv migrate                   # 計画を表示するだけ。読み取り専用
+skillenv migrate --apply           # 実行する
+skillenv migrate --apply --prune   # 確認後、旧 skillenv/ を削除
+```
+
+`--apply` は `skillenv/` を残し、v0 の vendored コピーから新しい cache を種付けするので、直後にネットワーク無しで `link` が通ります。取り消したいときは `skillenv.toml` と `skillenv.lock` を削除してください。
+
+推測はしません。`profiles/` が使われている場合、あるいは `default/` と `local/` に同じ id がある場合は、勝手にまとめずに名前を挙げて移行を止めます。
+
+### v1 のコマンド
+
+```bash
+skillenv list             # 宣言されている skill を source・label つきで一覧
+skillenv lint             # frontmatter の妥当性と安全性検査
+skillenv link             # 展開する
+skillenv outdated         # lock と remote を比較する。読み取り専用
+skillenv fetch            # lock の revision で cache を復元する
+skillenv fetch --update   # remote の最新に移動する
+```
+
+新しいマシンでは `fetch` が必要です。cache は git 管理外なので、clone 直後は manifest と lock だけがあります。
+
+`link` は **`--quiet` でも**警告を stderr に出し、問題があれば非 0 で終了します。shell hook が実行するのはこの形なので、展開できなかった skill が無音になることはありません。
+
+### v1 で加わるもの
+
+- **平坦な skill 名前空間。** 全 source 横断で id が一意。大文字小文字を区別せず比較するので、case-insensitive なファイルシステムで「書き込み時にだけ現れる衝突」が起きません。
+- **provider ごとの frontmatter。** 実機にある 2 つの公式バリデータは許可キーが異なり（Claude は `compatibility` を受け、Codex は拒否）、`allowed-tools` には互換性のない 4 種の書式が実在します。provider が受け付けないキーは黙って捨てず報告し、Codex には `agents/openai.yaml` サイドカーを出します。
+- **`codex` は `$CODEX_HOME/skills` に解決される。** v0 は `.agents/skills` を Codex の宛先として扱っていましたが、あのディレクトリは多くの tool が読む Agent Skills open standard であり、独立した `agents` provider になりました。
+- **安全性検査を既定で有効化。** skill は agent の文脈に直接読み込まれる指示文です。隠し Unicode による命令の埋め込み、注入的な言い回し、資格情報の持ち出しを Snyk の `agent-scan` コード体系で検出し、`critical` は展開をブロックします。ブロックされた skill は削除もされません — そうしないと、上流を乗っ取った側が意図的に検査を踏ませて skill を消せてしまいます。
+- **非破壊の陳腐化チェック。** `outdated` は `git ls-remote` を使い、cache も lock も触りません。
+- **失敗は skill 単位。** 壊れた `SKILL.md` 1 つが他を止めることはなく、全体を止めるのは systemic な I/O 障害だけです。
+
 ## インストール
 
 Linux または macOS で最新の GitHub Release をインストールします。
