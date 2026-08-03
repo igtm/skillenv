@@ -1549,10 +1549,35 @@ mod tests {
         Ok(())
     }
 
-    fn repo_fixture() -> Result<TempDir> {
+    /// A repository fixture that also owns a private `HOME`.
+    ///
+    /// These tests reach `load_config`, which reads `HOME`, so they must hold the
+    /// same guard as the tests that redirect it. Without this the suite passed
+    /// serially and failed about two runs in three in parallel: one test would
+    /// point `HOME` at its own temporary directory while another read that value
+    /// and loaded a configuration that was not its own.
+    struct RepoFixture {
+        dir: TempDir,
+        _home_dir: TempDir,
+        _home: crate::test_support::HomeEnvGuard,
+    }
+
+    impl RepoFixture {
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+    }
+
+    fn repo_fixture() -> Result<RepoFixture> {
+        let home_dir = TempDir::new().unwrap();
+        let home = crate::test_support::set_home_for_test(Some(home_dir.path()));
         let dir = TempDir::new().unwrap();
         ensure_dir(&dir.path().join(".git"))?;
-        Ok(dir)
+        Ok(RepoFixture {
+            dir,
+            _home_dir: home_dir,
+            _home: home,
+        })
     }
 
     fn git_fixture(name: &str) -> Result<TempDir> {

@@ -17,6 +17,7 @@ mod inventory;
 mod legacy_sweep;
 mod lock;
 mod manifest;
+mod migrate;
 mod paths;
 mod provider;
 mod remote;
@@ -24,11 +25,29 @@ mod render;
 mod safeguard;
 mod session;
 mod source;
+#[cfg(test)]
+mod test_support;
 
 pub use inventory::format_skill_inventory_report;
 pub use legacy_sweep::{LegacyEntry, SweepReport};
 pub use safeguard::{Finding, Severity};
 pub use session::LinkReport;
+
+/// Inspect a v0 setup and describe the conversion, without writing anything.
+///
+/// Read-only on purpose. The whole plan is inspectable before a single file is
+/// touched, and the markers the plan depends on are destroyed by the conversion
+/// itself, so there is no second chance to read them.
+pub fn plan_migration(cwd: impl AsRef<Path>) -> Result<String> {
+    let root = fs::canonicalize(cwd.as_ref()).unwrap_or_else(|_| cwd.as_ref().to_path_buf());
+    let plan = migrate::plan(&root, &home_dir()?)?;
+    let mut out = migrate::format_plan(&plan);
+    if plan.can_apply() {
+        out.push_str("\n\n--- proposed skillenv.toml ---\n");
+        out.push_str(&migrate::render_manifest(&plan));
+    }
+    Ok(out)
+}
 
 /// Whether a v1 manifest governs `cwd`.
 ///
@@ -2328,9 +2347,8 @@ impl fmt::Display for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use crate::test_support::set_home_for_test;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn frontmatter_string<'a>(metadata: &'a Mapping, key: &str) -> Option<&'a str> {
@@ -4255,44 +4273,5 @@ path = "../shared/{repo}"
                 .unwrap_or("repo"),
             "repo",
         )
-    }
-
-    fn set_home_for_test(home: Option<&Path>) -> HomeEnvGuard {
-        let _lock = home_env_lock()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let previous = env::var_os("HOME");
-        match home {
-            Some(path) => unsafe {
-                env::set_var("HOME", path);
-            },
-            None => unsafe {
-                env::remove_var("HOME");
-            },
-        }
-        HomeEnvGuard { previous, _lock }
-    }
-
-    fn home_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct HomeEnvGuard {
-        previous: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => unsafe {
-                    env::set_var("HOME", value);
-                },
-                None => unsafe {
-                    env::remove_var("HOME");
-                },
-            }
-        }
     }
 }

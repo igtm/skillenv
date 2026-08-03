@@ -159,6 +159,13 @@ enum Command {
     )]
     List,
     #[command(
+        about = "Describe how this v0 setup would convert to a skillenv.toml manifest.",
+        long_about = "Reads only. Reports the skills, sources, and deploy rules a v1 \
+                      manifest would carry, the v0 deployments that must be cleared \
+                      first, and the proposed manifest itself. Nothing is written."
+    )]
+    Migrate,
+    #[command(
         about = "Scan the manifest's skills for hidden instructions and unsafe patterns.",
         long_about = "Requires a skillenv.toml manifest. Reports findings using Snyk's \
                       agent-scan codes and exits non-zero when anything is found."
@@ -410,6 +417,7 @@ fn dispatch_manifest(cli: &Cli) -> Option<skillenv::Result<CommandOutput>> {
             Some(link_manifest_command(args.quiet))
         }
         Command::List => Some(skillenv::list_manifest(".").map(CommandOutput::text)),
+        Command::Migrate => Some(skillenv::plan_migration(".").map(CommandOutput::text)),
         Command::Lint => {
             Some(
                 skillenv::lint_manifest(".").map(|(stdout, problems)| CommandOutput {
@@ -504,6 +512,7 @@ fn run(cli: Cli) -> skillenv::Result<String> {
         // These only exist against a manifest. Reached only when
         // `dispatch_manifest` declined, i.e. there is no skillenv.toml, so the
         // error explains what is missing rather than silently doing nothing.
+        Command::Migrate => unreachable!("handled by dispatch_manifest"),
         Command::List | Command::Lint => Err(skillenv::SkillenvError::ManifestNotFound {
             searched_from: std::path::PathBuf::from("."),
         }),
