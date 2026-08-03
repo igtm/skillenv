@@ -1,0 +1,714 @@
+{
+  "$HOME/.agents/skills": [
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-draft-pr",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-draft-pr",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "draft-pr",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/draft-pr",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-easy-worktree",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-easy-worktree",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "easy-worktree",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/easy-worktree-rs/default/easy-worktree",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-figma-to-code",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-figma-to-code",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "figma-to-code",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/figma-code-dl/default/figma-to-code",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-frontend-skill",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-frontend-skill",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "frontend-skill",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/frontend-skill",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gnome-terminal",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gnome-terminal",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gnome-terminal",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gnome-terminal",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gof-design-patterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gof-design-patterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gof-design-patterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gof-design-patterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-handoff",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-handoff",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "handoff",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/openclaw-agent-skills/default/handoff",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-intent-spec",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-intent-spec",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "intent-spec",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/intent-spec",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-japanese-tech-writing",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-japanese-tech-writing",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "japanese-tech-writing",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/japanese-tech-writing",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-kinko",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-kinko",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "kinko",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/kinko/default/kinko",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-plan-visualizer",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-plan-visualizer",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "plan-visualizer",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/plan-visualizer",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-react-antipatterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-react-antipatterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "react-antipatterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/react-antipatterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-skillenv",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-skillenv",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "skillenv",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skillenv/default/skillenv",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-spec-implementation-loop",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-spec-implementation-loop",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "spec-implementation-loop",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/spec-implementation-loop",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-user-context",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-user-context",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "user-context",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/user-context",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-worktree-port",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-worktree-port",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "worktree-port",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/worktree-port/default/worktree-port",
+        "strategy": "render"
+      }
+    }
+  ],
+  "$HOME/.claude/skills": [
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-draft-pr",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-draft-pr",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "draft-pr",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/draft-pr",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-easy-worktree",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-easy-worktree",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "easy-worktree",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/easy-worktree-rs/default/easy-worktree",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-figma-to-code",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-figma-to-code",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "figma-to-code",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/figma-code-dl/default/figma-to-code",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-frontend-skill",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-frontend-skill",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "frontend-skill",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/frontend-skill",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gnome-terminal",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gnome-terminal",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gnome-terminal",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gnome-terminal",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gof-design-patterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-gof-design-patterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gof-design-patterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gof-design-patterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-handoff",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-handoff",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "handoff",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/openclaw-agent-skills/default/handoff",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-intent-spec",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-intent-spec",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "intent-spec",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/intent-spec",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-japanese-tech-writing",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-japanese-tech-writing",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "japanese-tech-writing",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/japanese-tech-writing",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-kinko",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-kinko",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "kinko",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/kinko/default/kinko",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-plan-visualizer",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-plan-visualizer",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "plan-visualizer",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/plan-visualizer",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-react-antipatterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-react-antipatterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "react-antipatterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/react-antipatterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-skillenv",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-skillenv",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "skillenv",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skillenv/default/skillenv",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-spec-implementation-loop",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-spec-implementation-loop",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "spec-implementation-loop",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/spec-implementation-loop",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-user-context",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-user-context",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "user-context",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/user-context",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-gd3c434ebf0ec-default-worktree-port",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-gd3c434ebf0ec-default-worktree-port",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "worktree-port",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/worktree-port/default/worktree-port",
+        "strategy": "render"
+      }
+    }
+  ],
+  "$HOME/tmp/dotfiles/.agents/skills": [
+    {
+      "dir_name": "skillenv-dotfiles-default-draft-pr",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-draft-pr",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "draft-pr",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/draft-pr",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-easy-worktree",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-easy-worktree",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "easy-worktree",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/easy-worktree-rs/default/easy-worktree",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-figma-to-code",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-figma-to-code",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "figma-to-code",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/figma-code-dl/default/figma-to-code",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-frontend-skill",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-frontend-skill",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "frontend-skill",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/frontend-skill",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-gnome-terminal",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-gnome-terminal",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gnome-terminal",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gnome-terminal",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-gof-design-patterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-gof-design-patterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gof-design-patterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gof-design-patterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-handoff",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-handoff",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "handoff",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/openclaw-agent-skills/default/handoff",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-intent-spec",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-intent-spec",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "intent-spec",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/intent-spec",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-japanese-tech-writing",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-japanese-tech-writing",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "japanese-tech-writing",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/japanese-tech-writing",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-kinko",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-kinko",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "kinko",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/kinko/default/kinko",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-plan-visualizer",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-plan-visualizer",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "plan-visualizer",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/plan-visualizer",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-react-antipatterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-react-antipatterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "react-antipatterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/react-antipatterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-skillenv",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-skillenv",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "skillenv",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skillenv/default/skillenv",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-spec-implementation-loop",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-spec-implementation-loop",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "spec-implementation-loop",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/spec-implementation-loop",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-user-context",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-user-context",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "user-context",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/user-context",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-worktree-port",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-worktree-port",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "worktree-port",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/worktree-port/default/worktree-port",
+        "strategy": "render"
+      }
+    }
+  ],
+  "$HOME/tmp/dotfiles/.claude/skills": [
+    {
+      "dir_name": "skillenv-dotfiles-default-draft-pr",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-draft-pr",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "draft-pr",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/draft-pr",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-easy-worktree",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-easy-worktree",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "easy-worktree",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/easy-worktree-rs/default/easy-worktree",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-figma-to-code",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-figma-to-code",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "figma-to-code",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/figma-code-dl/default/figma-to-code",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-frontend-skill",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-frontend-skill",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "frontend-skill",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/frontend-skill",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-gnome-terminal",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-gnome-terminal",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gnome-terminal",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gnome-terminal",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-gof-design-patterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-gof-design-patterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "gof-design-patterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/gof-design-patterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-handoff",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-handoff",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "handoff",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/openclaw-agent-skills/default/handoff",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-intent-spec",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-intent-spec",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "intent-spec",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/intent-spec",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-japanese-tech-writing",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-japanese-tech-writing",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "japanese-tech-writing",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/japanese-tech-writing",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-kinko",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-kinko",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "kinko",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/kinko/default/kinko",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-plan-visualizer",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-plan-visualizer",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "plan-visualizer",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/plan-visualizer",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-react-antipatterns",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-react-antipatterns",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "react-antipatterns",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/react-antipatterns",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-skillenv",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-skillenv",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "skillenv",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skillenv/default/skillenv",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-spec-implementation-loop",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-spec-implementation-loop",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "spec-implementation-loop",
+        "source": "$HOME/tmp/dotfiles/skillenv/default/spec-implementation-loop",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-user-context",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-user-context",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "user-context",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/skills/default/user-context",
+        "strategy": "render"
+      }
+    },
+    {
+      "dir_name": "skillenv-dotfiles-default-worktree-port",
+      "marker": {
+        "generated_name": "skillenv-dotfiles-default-worktree-port",
+        "repo": "dotfiles",
+        "scope": "default",
+        "skill": "worktree-port",
+        "source": "$HOME/tmp/dotfiles/skillenv/remote/worktree-port/default/worktree-port",
+        "strategy": "render"
+      }
+    }
+  ]
+}
