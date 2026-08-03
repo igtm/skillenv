@@ -18,7 +18,7 @@ It provides:
 - shell hooks that relink when you change repositories
 - a reusable Rust library exposing the same operations
 
-The current version is `1.0.0`.
+The current version is `1.1.0`.
 
 ## 1.0 is a breaking release
 
@@ -49,7 +49,7 @@ curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh 
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v1.0.0
+curl -fsSL https://raw.githubusercontent.com/igtm/skillenv/main/install.sh | sh -s -- -v=v1.1.0
 ```
 
 Install from GitHub with Cargo:
@@ -232,9 +232,37 @@ reports which `skillenv.toml` governs this directory and the repository it
 resolved, the home directory and the cache path with how many sources are cached,
 how many skills and deploy rules the manifest declares against how many the lock
 records, and each resolved target with its provider and how many deployments it
-holds. `--json` prints the same information in a stable shape.
+holds. The text form is shaped like YAML — one fact per line, and parseable, so it can be
+piped somewhere without asking for `--json`. `--json` remains the stable
+machine-readable shape. `list` uses the same shape.
 
 ## skillenv.toml
+
+### The short form
+
+When all a source needs is a list of skills, `[skills]` says it in one line each — the
+key is the source, the value is what to take from it.
+
+```toml
+[skills]
+local = ["draft-pr", "japanese-tech-writing"]
+"github:igtm/skills" = ["visual-explainer", "user-context"]
+"gist:fd287c31" = ["jp-writing"]
+"github:igtm/kinko" = ["*"]        # every skill the source holds
+```
+
+The source's **name is derived from the key** — the repository or the gist id — since
+the table has nowhere to write one. That name is what `via=` reports and what names the
+cache directory, so check it lines up with an existing lock:
+`https://github.com/openclaw/agent-skills` becomes `agent-skills`. A source that needs
+a fixed name, a `ref`, or labels is written as a `[[source]]` entry, and the two
+spellings mix freely in one manifest.
+
+`local` cannot take `["*"]`. There is no tree to enumerate — it would mean whatever
+happens to be sitting in `skills/`, which is a different thing to mean. Use a `path:`
+source to follow a directory.
+
+### The long form
 
 ```toml
 [skillenv]
@@ -393,6 +421,38 @@ reported per skill and left for you to decide about.
 A wildcard member whose id is already taken is reported and skipped, not fatal.
 Two upstreams adopting one name is not your mistake, and refusing to load the
 manifest would take `remove` — the way out — with it.
+
+## Holding back new revisions
+
+In the spirit of uv's release-age setting. A compromised upstream is usually noticed
+within hours or days, so this puts a delay between publication and the moment the
+content reaches an agent's context.
+
+```toml
+[fetch]
+minimum_revision_age = "7d"   # s, m, h, d, w
+```
+
+`fetch --update` then takes the newest revision at least that old rather than the tip,
+and says when that changed the answer:
+
+```
+note: up took 9cb236b3c034 rather than f3aa484bf5fc: nothing newer is 7d old yet
+```
+
+Judged on committer date. Three things worth knowing:
+
+- **A pinned revision is exempt.** `fetch` without `--update` restores what the lock
+  records, and re-judging its age would refuse to restore a machine from a lock that
+  was fine when it was written.
+- **No eligible revision is an error.** Falling back to the tip would make the setting
+  look effective while doing nothing.
+- **`outdated` cannot see dates.** `ls-remote` returns a sha and nothing else, so it
+  reports that the tip moved and notes that `fetch --update` may not take it.
+
+`local` and `path:` sources have no revisions, so the limit does not apply. To get one
+for a repository on this machine, name it with `file://` so it is reached as a git
+remote rather than read as a tree.
 
 ## The safeguard
 

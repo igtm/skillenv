@@ -40,6 +40,24 @@ pub struct Manifest {
     pub sources: Vec<SourceEntry>,
     pub deploys: Vec<DeployRule>,
     pub safeguard: SafeguardConfig,
+    pub fetch: FetchConfig,
+}
+
+/// What `fetch` will accept from a remote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchConfig {
+    /// Exactly as written in the manifest, so a message about the setting quotes the
+    /// user's own spelling. `7d` and `1w` are the same duration, and echoing back the
+    /// one they did not write reads as the tool having decided something.
+    pub minimum_revision_age_text: Option<String>,
+    /// Refuse a revision younger than this, taking the newest one that is old
+    /// enough instead.
+    ///
+    /// A supply-chain delay, in the spirit of uv's release-age setting: a
+    /// compromised upstream is usually noticed within hours or days, and waiting
+    /// puts that window between publication and the moment the content reaches an
+    /// agent's context. `None` means take whatever the ref points at.
+    pub minimum_revision_age: Option<std::time::Duration>,
 }
 
 /// One directly-declared skill.
@@ -434,12 +452,23 @@ struct RawManifest {
     skillenv: RawMeta,
     #[serde(default, rename = "skill")]
     skills: Vec<RawSkill>,
+    /// The compact spelling: source spec → the skills to take from it.
+    #[serde(default, rename = "skills")]
+    skill_lists: BTreeMap<String, RawSelection>,
     #[serde(default, rename = "source")]
     sources: Vec<RawSource>,
     #[serde(default, rename = "deploy")]
     deploys: Vec<RawDeploy>,
     #[serde(default)]
     safeguard: RawSafeguard,
+    #[serde(default)]
+    fetch: RawFetch,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFetch {
+    minimum_revision_age: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,7 +576,50 @@ impl RawManifest {
             )));
         }
 
+        // `[skills]` is the same model in fewer lines: each key is a source and each
+        // value the skills to take from it. Converted here rather than carried through,
+        // so everything downstream — fetch, the wildcard path, the lock, `diff` — sees
+        // one shape regardless of which spelling produced it.
         let mut skills = Vec::new();
+        let mut listed_sources = Vec::new();
+        for (spec_text, selection) in &self.skill_lists {
+            let spec = parse_source_spec(spec_text)?;
+            let selection = read_selection(selection, spec_text).map_err(invalid)?;
+
+            if matches!(spec, SourceSpec::Local) {
+                let SkillSelection::Explicit(ids) = selection else {
+                    // There is no tree to enumerate: a local skill is a directory the
+                    // user created, so "all of them" would mean whatever happens to be
+                    // in `skills/`, which is a different and surprising thing to mean.
+                    return Err(invalid(
+                        "skills.local cannot be \"*\"; name each local skill, or use \
+                         a path: source to follow a directory"
+                            .to_string(),
+                    ));
+                };
+                for id in ids {
+                    skills.push(SkillEntry {
+                        id,
+                        source: SourceSpec::Local,
+                        description: None,
+                        labels: Vec::new(),
+                    });
+                }
+                continue;
+            }
+
+            listed_sources.push(SourceEntry {
+                // Derived, because this spelling has nowhere to put a name. It is what
+                // `via=` reports and what names the cache directory, so it has to be
+                // stable and recognisable — the repository or gist is both.
+                name: derived_source_name(&spec),
+                from: spec,
+                git_ref: None,
+                skills: selection,
+                labels: Vec::new(),
+            });
+        }
+
         for raw in self.skills {
             skills.push(SkillEntry {
                 id: SkillId::parse(&raw.name)?,
@@ -557,24 +629,10 @@ impl RawManifest {
             });
         }
 
-        let mut sources = Vec::new();
+        let mut sources = listed_sources;
         for raw in self.sources {
-            let skills = match raw.skills {
-                RawSelection::Wildcard(value) if value == "*" => SkillSelection::All,
-                RawSelection::Wildcard(value) => {
-                    return Err(invalid(format!(
-                        "source '{}' has skills = {value:?}; use \"*\" for every skill \
-                         or a list of names",
-                        raw.name
-                    )));
-                }
-                RawSelection::Explicit(names) => SkillSelection::Explicit(
-                    names
-                        .iter()
-                        .map(|name| SkillId::parse(name))
-                        .collect::<Result<Vec<_>>>()?,
-                ),
-            };
+            let skills = read_selection(&raw.skills, &format!("source '{}' skills", raw.name))
+                .map_err(invalid)?;
             sources.push(SourceEntry {
                 name: raw.name,
                 from: parse_source_spec(&raw.from)?,
@@ -619,15 +677,113 @@ impl RawManifest {
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         };
 
+        let fetch = FetchConfig {
+            minimum_revision_age_text: self
+                .fetch
+                .minimum_revision_age
+                .as_deref()
+                .map(|raw| raw.trim().to_string()),
+            minimum_revision_age: self
+                .fetch
+                .minimum_revision_age
+                .as_deref()
+                .map(parse_duration)
+                .transpose()
+                .map_err(invalid)?,
+        };
+
         let manifest = Manifest {
             version: self.skillenv.version,
             skills,
             sources,
             deploys,
             safeguard,
+            fetch,
         };
         check_duplicate_ids(&manifest, path)?;
         Ok(manifest)
+    }
+}
+
+/// Parse a duration written the way a person would: `30m`, `72h`, `3d`, `2w`.
+///
+/// A bare number is rejected rather than assumed to be seconds. `minimum_revision_age
+/// = 3` could reasonably mean seconds, hours, or days, and picking one silently would
+/// give a supply-chain delay three orders of magnitude off what was intended.
+fn parse_duration(raw: &str) -> std::result::Result<std::time::Duration, String> {
+    let trimmed = raw.trim();
+    let (digits, unit) = trimmed.split_at(
+        trimmed
+            .find(|c: char| !c.is_ascii_digit())
+            .ok_or_else(|| format!("minimum_revision_age = {raw:?} needs a unit, e.g. \"3d\""))?,
+    );
+    let amount: u64 = digits
+        .parse()
+        .map_err(|_| format!("minimum_revision_age = {raw:?} does not start with a number"))?;
+    let seconds = match unit.trim() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        "w" => 7 * 24 * 60 * 60,
+        other => {
+            return Err(format!(
+                "minimum_revision_age = {raw:?} has unknown unit {other:?}; use s, m, h, d or w"
+            ));
+        }
+    };
+    Ok(std::time::Duration::from_secs(amount * seconds))
+}
+
+/// Turn a raw selection into the model's, used by both spellings.
+///
+/// A list may hold `"*"` on its own; an id can never be `*`, so there is nothing
+/// ambiguous about it, and `["*"]` reads more naturally in a table of lists than a
+/// bare string would.
+fn read_selection(
+    raw: &RawSelection,
+    context: &str,
+) -> std::result::Result<SkillSelection, String> {
+    let names = match raw {
+        RawSelection::Wildcard(value) if value == "*" => return Ok(SkillSelection::All),
+        RawSelection::Wildcard(value) => {
+            return Err(format!(
+                "{context} = {value:?}; use \"*\" for every skill or a list of names"
+            ));
+        }
+        RawSelection::Explicit(names) => names,
+    };
+    if names.len() == 1 && names[0] == "*" {
+        return Ok(SkillSelection::All);
+    }
+    names
+        .iter()
+        .map(|name| SkillId::parse(name).map_err(|error| error.to_string()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map(SkillSelection::Explicit)
+}
+
+/// A name for a source that had nowhere to write one.
+///
+/// The repository or gist it came from, which is what makes `via=` and the cache
+/// directory recognisable. Two sources that would derive the same name are caught by
+/// the duplicate check, so this does not have to be clever.
+fn derived_source_name(spec: &SourceSpec) -> String {
+    match spec {
+        SourceSpec::GitHub { repo, .. } => repo.clone(),
+        SourceSpec::Gist(id) => id.clone(),
+        SourceSpec::Git(url) => url
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .rsplit(['/', ':'])
+            .next()
+            .unwrap_or(url)
+            .to_string(),
+        SourceSpec::Path(path) => path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "path".to_string()),
+        SourceSpec::Local => "local".to_string(),
     }
 }
 
@@ -636,6 +792,25 @@ impl RawManifest {
 /// v0 keyed this on `(scope, id)` and only discovered a clash during `link`,
 /// after the source had already been installed and the lock file written.
 fn check_duplicate_ids(manifest: &Manifest, path: &Path) -> Result<()> {
+    // Source names too, not only skill ids. A name is the cache directory and what
+    // `via=` reports, and `remote_sources` groups on it — so two sources sharing one
+    // would quietly become a single source, with one of them simply gone. The
+    // `[skills]` spelling derives its names, which is what makes this reachable.
+    let mut names: BTreeMap<&str, ()> = BTreeMap::new();
+    for source in &manifest.sources {
+        if names.insert(source.name.as_str(), ()).is_some() {
+            return Err(SkillenvError::InvalidManifest {
+                path: path.to_path_buf(),
+                message: format!(
+                    "two sources are both named '{}'; a [skills] key takes its name from \
+                     the repository or gist, so give one of them an explicit [[source]] \
+                     entry with a different name",
+                    source.name
+                ),
+            });
+        }
+    }
+
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for id in manifest.declared_ids() {
         if let Some(first) = seen.insert(id.fold(), id.to_string()) {
@@ -690,6 +865,11 @@ fn parse_source_spec(raw: &str) -> Result<SourceSpec> {
     if raw.starts_with("git@")
         || raw.starts_with("ssh://")
         || raw.starts_with("https://")
+        // A local clone reached as a git remote, so its history is available.
+        // `path:` reads a working tree and has no revisions at all, which means no
+        // `minimum_revision_age` and no `outdated` — this is how you get those for a
+        // repository that happens to be on the same machine.
+        || raw.starts_with("file://")
         || raw.ends_with(".git")
     {
         return Ok(SourceSpec::Git(raw.to_string()));
@@ -765,6 +945,126 @@ mod tests {
 
     fn id(raw: &str) -> SkillId {
         SkillId::parse(raw).expect("test id should be valid")
+    }
+
+    /// The compact spelling has to produce exactly the model the long one does, or the
+    /// two forms would behave differently for the same intent.
+    #[test]
+    fn a_skills_table_becomes_the_same_model_as_the_long_form() -> Result<()> {
+        let compact = parse(
+            "[skillenv]\nversion = 1\n\n[skills]\n\
+             local = [\"draft-pr\", \"handoff\"]\n\
+             \"github:igtm/skills\" = [\"user-context\"]\n\
+             \"gist:fd287c31\" = [\"jp-writing\"]\n",
+        )?;
+
+        assert_eq!(
+            compact
+                .skills
+                .iter()
+                .map(|entry| entry.id.to_string())
+                .collect::<Vec<_>>(),
+            vec!["draft-pr", "handoff"]
+        );
+        // A remote key becomes a source, named after the repository or gist, since the
+        // table has nowhere to write a name.
+        let names: Vec<&str> = compact.sources.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["fd287c31", "skills"]);
+        assert_eq!(
+            compact.sources[1].skills,
+            SkillSelection::Explicit(vec![id("user-context")])
+        );
+        Ok(())
+    }
+
+    /// Both spellings in one manifest, which is the point: the table for the simple
+    /// majority, an entry for the source that needs a ref or labels.
+    #[test]
+    fn both_spellings_coexist() -> Result<()> {
+        let manifest = parse(
+            "[skillenv]\nversion = 1\n\n\
+             [skills]\nlocal = [\"draft-pr\"]\n\n\
+             [[source]]\nname = \"kinko\"\nfrom = \"github:igtm/kinko\"\n\
+             ref = \"v2\"\nlabels = [\"secrets\"]\nskills = [\"kinko\"]\n",
+        )?;
+        assert_eq!(manifest.skills.len(), 1);
+        assert_eq!(manifest.sources.len(), 1);
+        assert_eq!(manifest.sources[0].git_ref.as_deref(), Some("v2"));
+        assert_eq!(manifest.sources[0].labels, vec!["secrets".to_string()]);
+        Ok(())
+    }
+
+    /// `["*"]` follows the whole source. A skill id can never be `*`, so a
+    /// single-element list saying so is unambiguous.
+    #[test]
+    fn a_wildcard_works_in_either_spelling() -> Result<()> {
+        let table = parse("[skillenv]\nversion = 1\n\n[skills]\n\"github:o/r\" = [\"*\"]\n")?;
+        assert_eq!(table.sources[0].skills, SkillSelection::All);
+
+        let long = parse(
+            "[skillenv]\nversion = 1\n\n[[source]]\nname = \"r\"\n\
+             from = \"github:o/r\"\nskills = \"*\"\n",
+        )?;
+        assert_eq!(long.sources[0].skills, SkillSelection::All);
+        Ok(())
+    }
+
+    /// `local` has no tree to enumerate — "every local skill" would mean whatever
+    /// happens to be in `skills/`, which is a different thing to mean.
+    #[test]
+    fn a_local_wildcard_is_refused() {
+        let error = parse("[skillenv]\nversion = 1\n\n[skills]\nlocal = [\"*\"]\n").unwrap_err();
+        assert!(error.to_string().contains("cannot be"), "got: {error}");
+    }
+
+    /// A derived name can collide with a declared one. Left alone, the two sources
+    /// would share a cache directory and one would silently disappear when they were
+    /// grouped by name.
+    #[test]
+    fn a_derived_source_name_colliding_with_a_declared_one_is_refused() {
+        let error = parse(
+            "[skillenv]\nversion = 1\n\n\
+             [skills]\n\"github:someone/tools\" = [\"alpha\"]\n\n\
+             [[source]]\nname = \"tools\"\nfrom = \"github:other/thing\"\n\
+             skills = [\"beta\"]\n",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("both named 'tools'"),
+            "got: {error}"
+        );
+    }
+
+    /// A bare number is rejected rather than guessed at: `minimum_revision_age = 3`
+    /// could mean seconds, hours or days, and picking one silently would give a
+    /// supply-chain delay orders of magnitude off what was meant.
+    #[test]
+    fn a_revision_age_needs_a_unit() {
+        use std::time::Duration;
+        assert_eq!(parse_duration("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_duration("15m"), Ok(Duration::from_secs(900)));
+        assert_eq!(parse_duration("72h"), Ok(Duration::from_secs(259_200)));
+        assert_eq!(parse_duration("3d"), Ok(Duration::from_secs(259_200)));
+        assert_eq!(parse_duration("2w"), Ok(Duration::from_secs(1_209_600)));
+        assert_eq!(parse_duration(" 7d "), Ok(Duration::from_secs(604_800)));
+
+        for bad in ["3", "", "d", "3y", "-1d", "3 days"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    /// The table is optional, and absent means no limit rather than a zero one.
+    #[test]
+    fn a_manifest_without_a_fetch_table_has_no_limit() -> Result<()> {
+        let manifest = parse("[skillenv]\nversion = 1\n")?;
+        assert_eq!(manifest.fetch.minimum_revision_age, None);
+
+        let limited = parse("[skillenv]\nversion = 1\n\n[fetch]\nminimum_revision_age = \"3d\"\n")?;
+        assert_eq!(
+            limited.fetch.minimum_revision_age,
+            Some(std::time::Duration::from_secs(259_200))
+        );
+        Ok(())
     }
 
     #[test]

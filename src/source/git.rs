@@ -48,11 +48,15 @@ pub(super) fn fetch_into(
     transport: &str,
     git_ref: Option<&str>,
     destination: &Path,
+    not_after: Option<&str>,
 ) -> Result<String> {
     let dir = destination.display().to_string();
     run(&["init", "--quiet", &dir], None)?;
     run(&["-C", &dir, "remote", "add", "origin", transport], None)?;
-    // --depth 1 keeps this to the one commit we are about to check out.
+    // --depth 1 keeps this to the one commit we are about to check out. When an age
+    // limit applies and the tip turns out to be too new, `eligible_revision` deepens
+    // from here — so the common case, a tip that is already old enough, costs the
+    // same as before.
     run(
         &[
             "-C",
@@ -66,12 +70,75 @@ pub(super) fn fetch_into(
         ],
         None,
     )?;
+
+    let wanted = match not_after {
+        None => "FETCH_HEAD".to_string(),
+        Some(cutoff) => eligible_revision(&dir, git_ref, cutoff, transport)?,
+    };
     run(
-        &["-C", &dir, "checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        &["-C", &dir, "checkout", "--quiet", "--detach", &wanted],
         None,
     )?;
     let revision = run(&["-C", &dir, "rev-parse", "HEAD"], None)?;
     Ok(revision.trim().to_string())
+}
+
+/// How far back to reach when the tip is too new, and how many times.
+///
+/// Deepening is a round trip each time, so it doubles rather than creeping. The cap
+/// exists so a repository whose whole history is newer than the cutoff reports that
+/// instead of walking to the root commit over many fetches.
+const DEEPEN_STEPS: [&str; 4] = ["16", "64", "256", "1024"];
+
+/// The newest revision at or before `cutoff`, deepening history until one is found.
+///
+/// `--shallow-since` cannot do this: it fetches commits *newer* than a date and stops
+/// short of the boundary, so the one commit we are looking for is exactly the one it
+/// leaves out.
+fn eligible_revision(
+    dir: &str,
+    git_ref: Option<&str>,
+    cutoff: &str,
+    transport: &str,
+) -> Result<String> {
+    let reference = git_ref.unwrap_or("HEAD");
+    let before = format!("--before={cutoff}");
+
+    for depth in DEEPEN_STEPS {
+        let found = run(&["-C", dir, "rev-list", "-1", &before, "FETCH_HEAD"], None)?;
+        let found = found.trim();
+        if !found.is_empty() {
+            return Ok(found.to_string());
+        }
+
+        let before_deepen = count_commits(dir)?;
+        run(
+            &[
+                "-C", dir, "fetch", "--quiet", "--deepen", depth, "origin", reference,
+            ],
+            None,
+        )?;
+        // Nothing new arrived, so the history is exhausted and no commit is old
+        // enough. Deepening again would be the same round trip for the same answer.
+        if count_commits(dir)? == before_deepen {
+            break;
+        }
+    }
+
+    Err(SkillenvError::NoRevisionOldEnough {
+        transport: transport.to_string(),
+        reference: reference.to_string(),
+        cutoff: cutoff.to_string(),
+    })
+}
+
+fn count_commits(dir: &str) -> Result<usize> {
+    Ok(
+        run(&["-C", dir, "rev-list", "--count", "FETCH_HEAD"], None)?
+            .trim()
+            .parse()
+            .unwrap_or(0),
+    )
 }
 
 /// The revision `git_ref` currently points at on the remote, without fetching.
@@ -112,7 +179,7 @@ pub(crate) fn run_reporting_status(args: &[&str], cwd: Option<&Path>) -> Result<
     run_raw(args, cwd).map(|(_success, stdout, _stderr)| stdout)
 }
 
-fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
+pub(super) fn run(args: &[&str], cwd: Option<&Path>) -> Result<String> {
     let (success, stdout, stderr) = run_raw(args, cwd)?;
     if success {
         Ok(stdout)
@@ -362,7 +429,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let destination = work.path().join("checkout");
         std::fs::create_dir_all(&destination).unwrap();
-        assert_eq!(fetch_into(&dir, Some("main"), &destination)?, head);
+        assert_eq!(fetch_into(&dir, Some("main"), &destination, None)?, head);
         assert_eq!(
             std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),
             "body\n"

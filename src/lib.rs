@@ -113,6 +113,16 @@ pub fn outdated_manifest(cwd: impl AsRef<Path>) -> Result<(String, bool)> {
         }
     }
     lines.push("run `skillenv fetch --update` to move to these revisions".to_string());
+    // `ls-remote` returns a sha and no date, so this cannot tell whether the tip has
+    // aged enough — only that it moved. Saying so beats reporting an "available"
+    // revision that `fetch --update` will then decline without explanation.
+    if let Some(age) = &session.manifest.fetch.minimum_revision_age_text {
+        lines.push(format!(
+            "note: minimum_revision_age is set, so `fetch --update` will take the \
+             newest revision at least {} old, which may not be the one above",
+            age
+        ));
+    }
     Ok((lines.join("\n"), true))
 }
 
@@ -267,46 +277,83 @@ pub fn doctor_manifest(cwd: impl AsRef<Path>, json: bool) -> Result<String> {
         });
     }
 
+    // Shaped like YAML, one fact per line. The previous form put three facts on the
+    // `declared:` line and two on `cache:`, so the interesting number was never where
+    // the eye landed, and long paths wrapped and broke what alignment there was.
+    // `--json` is the machine-readable form; this one is for reading.
     let mut lines = vec![
         format!(
             "manifest: {}",
-            session.root.join(manifest::MANIFEST_FILE).display()
+            yaml_scalar(
+                &session
+                    .root
+                    .join(manifest::MANIFEST_FILE)
+                    .display()
+                    .to_string()
+            )
         ),
         format!(
             "repo: {}",
-            session
-                .repo_root
-                .as_deref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "none — repo-scoped rules will not apply".to_string())
+            match session.repo_root.as_deref() {
+                Some(path) => yaml_scalar(&path.display().to_string()),
+                // Said as a consequence, not just as absence: it is why a
+                // `<provider>:repo` rule would appear to do nothing.
+                None => "null              # no repository here; repo-scoped rules will not apply"
+                    .to_string(),
+            }
         ),
-        format!("home: {}", session.home.display()),
-        format!("cache: {} ({cached} source(s))", cache.display()),
-        format!(
-            "declared: {} skill(s), {} deploy rule(s); lock records {}",
-            session.catalog.entries.len(),
-            session.catalog.deploys.len(),
-            session.lock.skills.len()
-        ),
+        format!("home: {}", yaml_scalar(&session.home.display().to_string())),
+        "cache:".to_string(),
+        format!("  path: {}", yaml_scalar(&cache.display().to_string())),
+        format!("  sources: {cached}"),
+        "declared:".to_string(),
+        format!("  skills: {}", session.catalog.entries.len()),
+        format!("  deploy_rules: {}", session.catalog.deploys.len()),
+        format!("lock:\n  skills: {}", session.lock.skills.len()),
     ];
+
     lines.push("targets:".to_string());
     if status.targets.is_empty() {
-        lines.push("  none — no deploy rule applies from here".to_string());
+        lines.push("  []                  # no deploy rule applies from here".to_string());
     }
     for target in &status.targets {
         lines.push(format!(
-            "  {} [{}] {} deployed{}",
-            target.path.display(),
-            target.provider,
-            target.ours(),
-            if target.missing.is_empty() {
-                String::new()
-            } else {
-                format!(", {} missing", target.missing.len())
-            }
+            "  - path: {}",
+            yaml_scalar(&target.path.display().to_string())
         ));
+        lines.push(format!("    provider: {}", target.provider));
+        lines.push(format!("    deployed: {}", target.ours()));
+        // Only when there is something to say. A `missing: 0` on every target would
+        // be four lines of nothing, which is what made the old output hard to scan.
+        if !target.missing.is_empty() {
+            lines.push(format!("    missing: {}", target.missing.len()));
+            for id in &target.missing {
+                lines.push(format!("      - {id}"));
+            }
+        }
     }
     Ok(lines.join("\n"))
+}
+
+/// Quote a value only when leaving it bare would misread.
+///
+/// Paths are usually plain, and quoting every one of them would add noise to the
+/// thing being made easier to read. A value holding `: ` or `#`, or starting with a
+/// character YAML gives meaning to, is quoted so the output stays unambiguous.
+fn yaml_scalar(value: &str) -> String {
+    let needs_quoting = value.is_empty()
+        || value.contains(": ")
+        || value.contains('#')
+        || value.contains('"')
+        || value.starts_with([
+            '-', '?', ':', ',', '[', ']', '{', '}', '&', '*', '!', '|', '>', '%', '@', '`', '\'',
+            '"', ' ',
+        ]);
+    if needs_quoting {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
 }
 
 /// How many source directories the cache holds. Absent cache counts as zero
@@ -541,52 +588,79 @@ pub fn link_manifest(cwd: impl AsRef<Path>) -> Result<LinkReport> {
 /// One line per skill: what it is, where it comes from, how it is labelled.
 pub fn list_manifest(cwd: impl AsRef<Path>) -> Result<String> {
     let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
-    let mut lines = vec![format!("manifest: {}", session.root.display())];
+    // Same shape as `doctor`. The previous form put `source=`, `via=`, `labels=` and
+    // `revision=` on one line, which wrapped on any real source URL — and once it
+    // wraps, the columns it was pretending to have are gone.
+    let mut lines = vec![
+        format!(
+            "manifest: {}",
+            yaml_scalar(&session.root.display().to_string())
+        ),
+        "skills:".to_string(),
+    ];
 
     for entry in session.catalog.iter() {
-        let mut parts = vec![format!("{}", entry.id)];
-        parts.push(format!("source={}", describe_source(&entry.source)));
+        lines.push(format!("  - id: {}", entry.id));
+        lines.push(format!(
+            "    source: {}",
+            yaml_scalar(&describe_source(&entry.source))
+        ));
+        // Only the fields that say something. A `via: null` on every local skill would
+        // be noise in the thing being made readable.
         if let Some(name) = &entry.source_name {
-            parts.push(format!("via={name}"));
+            lines.push(format!("    via: {}", yaml_scalar(name)));
         }
         if !entry.labels.is_empty() {
-            parts.push(format!("labels={}", entry.labels.join(",")));
+            lines.push(format!("    labels: [{}]", entry.labels.join(", ")));
         }
         match session.lock.get(&entry.id) {
             Some(locked) => match &locked.resolved_revision {
-                Some(revision) => {
-                    parts.push(format!("revision={}", &revision[..12.min(revision.len())]))
-                }
-                None => parts.push("revision=unversioned".to_string()),
+                Some(revision) => lines.push(format!(
+                    "    revision: {}",
+                    &revision[..12.min(revision.len())]
+                )),
+                None => lines.push("    revision: unversioned".to_string()),
             },
             // A `path:` source needs no fetch, so "unfetched" would be wrong: there is
             // simply no revision to have. `needs_fetch` is true for it only because it
             // is not the `local` source.
             None if entry.needs_fetch() && session::requires_fetch(&entry.source) => {
-                parts.push("revision=unfetched".to_string())
+                lines.push("    revision: unfetched      # run `skillenv fetch`".to_string())
             }
             None => {}
         }
-        lines.push(format!("  {}", parts.join(" ")));
+    }
+    if session.catalog.entries.is_empty() {
+        lines.push("  []".to_string());
     }
 
-    for source in &session.catalog.wildcard_sources {
+    let unresolved: Vec<_> = session
+        .catalog
+        .wildcard_sources
+        .iter()
         // Only worth saying while it is still unresolved. Once `fetch` has run, the
         // members are listed above like any other skill, and repeating the
         // instruction would suggest they are not.
-        let resolved = session
-            .catalog
-            .entries
-            .values()
-            .any(|entry| entry.source_name.as_deref() == Some(source.name.as_str()));
-        if resolved {
-            continue;
+        .filter(|source| {
+            !session
+                .catalog
+                .entries
+                .values()
+                .any(|entry| entry.source_name.as_deref() == Some(source.name.as_str()))
+        })
+        .collect();
+    if !unresolved.is_empty() {
+        lines.push("unresolved:".to_string());
+        for source in unresolved {
+            lines.push(format!("  - source: {}", yaml_scalar(&source.name)));
+            lines.push(format!(
+                "    from: {}",
+                yaml_scalar(&describe_source(&source.from))
+            ));
+            lines.push(
+                "    tracks: every skill      # run `skillenv fetch` to resolve them".to_string(),
+            );
         }
-        lines.push(format!(
-            "  ({} tracks every skill from {}; run `skillenv fetch` to resolve them)",
-            source.name,
-            describe_source(&source.from)
-        ));
     }
     Ok(lines.join("\n"))
 }
@@ -817,6 +891,15 @@ pub enum SkillenvError {
     UnknownRemoteRef {
         transport: String,
         reference: String,
+    },
+    #[error(
+        "remote {transport} has no revision of '{reference}' from {cutoff} or earlier; \
+         every commit is newer than the configured minimum_revision_age"
+    )]
+    NoRevisionOldEnough {
+        transport: String,
+        reference: String,
+        cutoff: String,
     },
     #[error("no SKILL.md at {path}")]
     MissingSkillFile { path: PathBuf },
@@ -1598,6 +1681,69 @@ description: repo agent
         Ok(())
     }
 
+    /// `doctor` and `list` are read by people, but being real YAML is what keeps them
+    /// honest: a line that packs three facts, or a path that wrapped, stops parsing.
+    /// It also means the output can be piped somewhere without a second format.
+    #[test]
+    fn doctor_and_list_emit_parseable_yaml() -> Result<()> {
+        let repo = repo_fixture()?;
+        let home = TempDir::new().unwrap();
+        let _home = set_home_for_test(Some(home.path()));
+
+        for id in ["kinko", "handoff"] {
+            let dir = repo.path().join("skills").join(id);
+            ensure_dir(&dir)?;
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: A skill for testing.\n---\n\nBody\n"),
+            )
+            .unwrap();
+        }
+        fs::write(
+            repo.path().join("skillenv.toml"),
+            "[skillenv]\nversion = 1\n\n\
+             [[skill]]\nname = \"kinko\"\nsource = \"local\"\nlabels = [\"tools\"]\n\n\
+             [[skill]]\nname = \"handoff\"\nsource = \"local\"\n\n\
+             [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n",
+        )
+        .unwrap();
+        link_manifest(repo.path())?;
+
+        let doctor: serde_yaml::Value =
+            serde_yaml::from_str(&doctor_manifest(repo.path(), false)?).expect("doctor is yaml");
+        assert_eq!(doctor["declared"]["skills"], 2);
+        assert_eq!(doctor["cache"]["sources"], 0);
+        assert_eq!(doctor["targets"][0]["deployed"], 2);
+        assert_eq!(doctor["targets"][0]["provider"], "claude");
+
+        let list: serde_yaml::Value =
+            serde_yaml::from_str(&list_manifest(repo.path())?).expect("list is yaml");
+        let skills = list["skills"].as_sequence().expect("a sequence");
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["id"], "handoff");
+        assert_eq!(skills[0]["source"], "local");
+        // Absent fields are omitted rather than emitted as null: a `via: null` on every
+        // local skill is noise in the thing being made readable.
+        assert!(skills[0].get("via").is_none());
+        assert_eq!(skills[1]["id"], "kinko");
+        assert_eq!(skills[1]["labels"][0], "tools");
+        Ok(())
+    }
+
+    /// A path that YAML would read as something else has to be quoted, or the output
+    /// silently means something different from what is on disk.
+    #[test]
+    fn a_path_needing_quotes_gets_them() {
+        assert_eq!(yaml_scalar("/home/me/dotfiles"), "/home/me/dotfiles");
+        // `: ` ends a key in YAML; `#` starts a comment; a leading `-` starts an item.
+        assert_eq!(yaml_scalar("/tmp/a: b"), "\"/tmp/a: b\"");
+        assert_eq!(yaml_scalar("/tmp/c#d"), "\"/tmp/c#d\"");
+        assert_eq!(yaml_scalar("-leading"), "\"-leading\"");
+        assert_eq!(yaml_scalar(""), "\"\"");
+        // Quotes and backslashes inside a quoted scalar have to be escaped.
+        assert_eq!(yaml_scalar("a\"b"), "\"a\\\"b\"");
+    }
+
     /// Write a generated directory with a marker, the way `link` would, without
     /// going through a deployment. The point is to fix the two marker shapes the
     /// inventory has to read: v0 wrote one, v1 writes the other, and both exist on
@@ -1808,7 +1954,7 @@ description: repo agent
         assert!(text.contains("manifest:"));
         assert!(text.contains("skillenv.toml"));
         assert!(text.contains("cache:"));
-        assert!(text.contains("0 source(s)"));
+        assert!(text.contains("sources: 0"));
 
         let json: serde_json::Value =
             serde_json::from_str(&doctor_manifest(repo.path(), true)?).unwrap();

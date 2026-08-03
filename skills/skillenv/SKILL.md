@@ -94,6 +94,35 @@ eval "$(skillenv hook zsh)"
 
 ## skillenv.toml
 
+### 短い書き方（source ごとのリスト）
+
+skill を並べるだけなら `[skills]` が最短です。キーが source、値がそこから取る skill です。
+
+```toml
+[skillenv]
+version = 1
+
+[skills]
+local = [
+  "draft-pr", "japanese-tech-writing", "gof-design-patterns",
+]
+"github:igtm/skills" = ["visual-explainer", "user-context"]
+"gist:fd287c31" = ["jp-writing"]
+"github:igtm/kinko" = ["*"]        # その source の全 skill
+
+[[deploy]]
+target = "claude:home"
+include = ["*"]
+```
+
+**source 名はキーから導出されます**（repository 名か gist id）。`via=` の表示と cache ディレクトリ名になるので、既存の lock と揃うかは確認してください。`https://github.com/openclaw/agent-skills` は `agent-skills` になります。名前を固定したい、あるいは `ref` や `labels` が必要な source は、従来の `[[source]]` で書けば併用できます。
+
+`local` に `["*"]` は書けません。`skills/` に置いてあるもの全部という意味になり、意図と違うものを拾うためです。追従したいなら `path:` を使ってください。
+
+### 詳しい書き方（1 つずつ）
+
+`description` や `labels` を skill 単位で付けるならこちらです。
+
 ```toml
 [skillenv]
 version = 1
@@ -181,6 +210,29 @@ provider ごとに frontmatter が変わります。Claude 系は `compatibility
 明示リストは固定です。
 
 移行では**明示リストが選ばれます**。v0 は「全件追従」と「手書きの列挙」を同じ形で記録していたため区別できず、`"*"` にすると移行直後に未レビューの skill が一気に入ってしまうからです。追従したい source だけ手で `"*"` に変えてください。
+
+## 新しすぎる revision を取らない
+
+`uv` のリリース経過時間の設定と同じ考え方です。上流が乗っ取られても数時間から数日で気づかれるのが普通なので、公開から agent の文脈に入るまでに待ち時間を挟みます。
+
+```toml
+[fetch]
+minimum_revision_age = "7d"   # s / m / h / d / w
+```
+
+`fetch --update` は tip ではなく**その時間以上経過した最新の revision**を取ります。動いたことは黙らず報告します。
+
+```
+note: up took 9cb236b3c034 rather than f3aa484bf5fc: nothing newer is 7d old yet
+```
+
+判定は committer 日付です。挙動で押さえておく点が 3 つあります。
+
+- **pin された revision には適用されません。** `fetch`（`--update` なし）は lock の revision を復元するので、そこで年齢を再判定すると「書いた時点では問題なかった lock からの復元」を拒否してしまいます
+- **該当する revision が無ければエラーです。** tip に黙って落とすと、設定が効いているように見えて何もしていない状態になります
+- **`outdated` は日付を見ません。** `ls-remote` は sha しか返さないので、「tip は動いたが `fetch --update` はそれを取らないかもしれない」と明示します
+
+`path:` と `local` には revision が無いので対象外です。ローカルの git repo を history 込みで参照したい場合は `file://` で書けます。
 
 ## safeguard
 
