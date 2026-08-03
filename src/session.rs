@@ -114,6 +114,10 @@ impl Session {
                 source: std::io::Error::other("manifest has no parent directory"),
             })?
             .to_path_buf();
+        // Canonicalized because the generated name is derived from the root's
+        // final component. A caller passing "." would otherwise leave that
+        // component empty, and every repository would deploy as "skillenv-repo-".
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
 
         let manifest = Manifest::load(&manifest_path)?;
         let catalog = Catalog::resolve(&manifest, &root)?;
@@ -351,7 +355,7 @@ fn revive_finding(locked: &LockedFinding) -> Option<safeguard::Finding> {
 /// `$SKILLENV_MANIFEST` wins, then the nearest `skillenv.toml` walking up. Git is
 /// not consulted: a manifest in `dotfiles/` must be usable from a repository that
 /// has nothing to do with it.
-fn locate_manifest(cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn locate_manifest(cwd: &Path) -> Result<PathBuf> {
     if let Some(explicit) = std::env::var_os(MANIFEST_ENV) {
         let path = PathBuf::from(explicit);
         return if path.is_file() {

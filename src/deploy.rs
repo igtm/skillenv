@@ -200,14 +200,22 @@ impl DeployReport {
     }
 }
 
-/// Enumerate every directory in `target` carrying `id`'s prefix.
+/// Enumerate every skillenv-generated directory in `target`.
 ///
 /// The single walk both removal and counting use, so the two cannot disagree.
-pub fn enumerate(target: &Path, id: &ManifestId) -> Result<Vec<ExistingEntry>> {
+///
+/// Scans the shared `skillenv-` prefix rather than this manifest's own, and lets
+/// the marker decide ownership. Keying the scan on the full prefix would make a
+/// deployment invisible the moment the repository directory were renamed: the slug
+/// would change, the prefix with it, and the previous directories would be
+/// unreachable — the same shape of orphaning that made the v0 migration dangerous.
+/// Nothing is removed unless its marker says it is ours, so being able to see them
+/// only means they can be reported.
+pub fn enumerate(target: &Path, _id: &ManifestId) -> Result<Vec<ExistingEntry>> {
     if !target.is_dir() {
         return Ok(Vec::new());
     }
-    let prefix = id.prefix();
+    let prefix = NAME_PREFIX;
     let mut found = Vec::new();
 
     let mut entries: Vec<_> = fs::read_dir(target)
@@ -221,7 +229,7 @@ pub fn enumerate(target: &Path, id: &ManifestId) -> Result<Vec<ExistingEntry>> {
 
     for entry in entries {
         let dir_name = entry.file_name().to_string_lossy().to_string();
-        if !dir_name.starts_with(&prefix) {
+        if !dir_name.starts_with(prefix) {
             continue;
         }
         let path = entry.path();

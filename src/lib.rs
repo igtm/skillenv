@@ -28,6 +28,132 @@ mod source;
 pub use inventory::format_skill_inventory_report;
 pub use legacy_sweep::{LegacyEntry, SweepReport};
 pub use safeguard::{Finding, Severity};
+pub use session::LinkReport;
+
+/// Whether a v1 manifest governs `cwd`.
+///
+/// Callers use this to decide which engine to run. While both exist, a repository
+/// still on the v0 layout keeps working untouched — a hard cutover would break a
+/// live setup the moment the binary was replaced.
+pub fn has_manifest(cwd: impl AsRef<Path>) -> bool {
+    session::locate_manifest(cwd.as_ref()).is_ok()
+}
+
+/// Deploy every skill the manifest selects, to every target it names.
+pub fn link_manifest(cwd: impl AsRef<Path>) -> Result<LinkReport> {
+    let mut session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    session.link()
+}
+
+/// One line per skill: what it is, where it comes from, how it is labelled.
+pub fn list_manifest(cwd: impl AsRef<Path>) -> Result<String> {
+    let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let mut lines = vec![format!("manifest: {}", session.root.display())];
+
+    for entry in session.catalog.iter() {
+        let mut parts = vec![format!("{}", entry.id)];
+        parts.push(format!("source={}", describe_source(&entry.source)));
+        if let Some(name) = &entry.source_name {
+            parts.push(format!("via={name}"));
+        }
+        if !entry.labels.is_empty() {
+            parts.push(format!("labels={}", entry.labels.join(",")));
+        }
+        match session.lock.get(&entry.id) {
+            Some(locked) => match &locked.resolved_revision {
+                Some(revision) => {
+                    parts.push(format!("revision={}", &revision[..12.min(revision.len())]))
+                }
+                None => parts.push("revision=unversioned".to_string()),
+            },
+            None if entry.needs_fetch() => parts.push("revision=unfetched".to_string()),
+            None => {}
+        }
+        lines.push(format!("  {}", parts.join(" ")));
+    }
+
+    for source in &session.catalog.wildcard_sources {
+        lines.push(format!(
+            "  ({} tracks every skill from {}; run `skillenv fetch` to resolve them)",
+            source.name,
+            describe_source(&source.from)
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Scan every skill the manifest declares and report what the checks found.
+pub fn lint_manifest(cwd: impl AsRef<Path>) -> Result<(String, bool)> {
+    let session = session::Session::open(cwd.as_ref(), home_dir()?)?;
+    let mut lines = Vec::new();
+    let mut problems = false;
+
+    for entry in session.catalog.iter() {
+        let Some(dir) = entry.local_dir(&session.root) else {
+            continue;
+        };
+        let skill_md = dir.join("SKILL.md");
+        if !skill_md.is_file() {
+            lines.push(format!(
+                "{}: W014 [low]: no SKILL.md at {}",
+                entry.id,
+                skill_md.display()
+            ));
+            problems = true;
+            continue;
+        }
+        let raw = fs::read_to_string(&skill_md).map_err(|source| SkillenvError::ReadFile {
+            path: skill_md.clone(),
+            source,
+        })?;
+
+        // Checked first and reported rather than propagated: unparseable
+        // frontmatter is the single most common way a skill fails to deploy, and
+        // the whole point of `lint` is to find it before `link` does.
+        if let Err(error) = render::parse_frontmatter(&skill_md, &raw) {
+            problems = true;
+            lines.push(format!("{}: {error}", entry.id));
+        }
+
+        for finding in safeguard::scan_text(&raw) {
+            problems = true;
+            lines.push(format!("{}: {finding}", entry.id));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("no findings".to_string());
+    }
+    Ok((lines.join("\n"), problems))
+}
+
+fn describe_source(spec: &manifest::SourceSpec) -> String {
+    match spec {
+        manifest::SourceSpec::Local => "local".to_string(),
+        manifest::SourceSpec::Gist(id) => format!("gist:{id}"),
+        manifest::SourceSpec::GitHub { owner, repo } => format!("github:{owner}/{repo}"),
+        manifest::SourceSpec::Git(url) => url.clone(),
+        manifest::SourceSpec::Path(path) => format!("path:{}", path.display()),
+    }
+}
+
+/// Human-readable summary of a `link`, for stdout.
+pub fn format_link_manifest_report(report: &LinkReport) -> String {
+    let mut lines = Vec::new();
+    for target in &report.targets {
+        lines.push(format!(
+            "{}: {} written, {} unchanged, {} removed",
+            target.target.display(),
+            target.written.len(),
+            target.unchanged.len(),
+            target.removed.len()
+        ));
+    }
+    if lines.is_empty() {
+        lines.push("no targets matched; check the [[deploy]] rules".to_string());
+    }
+    lines.join("\n")
+}
 
 /// Find what v0 deployed for `repo_slug` in `target`.
 ///

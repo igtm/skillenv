@@ -152,6 +152,19 @@ enum Command {
     #[command(about = "Show repo-local target status and the number of managed entries.")]
     Status(TargetArgs),
     #[command(
+        about = "List every skill the manifest declares, with its source and labels.",
+        long_about = "Requires a skillenv.toml manifest. Shows each skill's source, the \
+                      [[source]] entry that contributed it, its labels, and the locked \
+                      revision when there is one."
+    )]
+    List,
+    #[command(
+        about = "Scan the manifest's skills for hidden instructions and unsafe patterns.",
+        long_about = "Requires a skillenv.toml manifest. Reports findings using Snyk's \
+                      agent-scan codes and exits non-zero when anything is found."
+    )]
+    Lint,
+    #[command(
         about = "Manually manage generated skill links under $HOME targets.",
         after_long_help = GLOBAL_AFTER_HELP
     )]
@@ -335,20 +348,93 @@ enum GlobalCommand {
     Status(TargetArgs),
 }
 
+/// What a command produced.
+///
+/// `warnings` is separate from `stdout` on purpose: it goes to stderr even when
+/// the caller asked for silence. `skillenv link --quiet` is what the shell hook
+/// runs, and a skill that failed to deploy must not be invisible there — that
+/// silence is how the original outage went unnoticed for six weeks.
+struct CommandOutput {
+    stdout: String,
+    warnings: Vec<String>,
+    problems: bool,
+}
+
+impl CommandOutput {
+    fn text(stdout: String) -> Self {
+        Self {
+            stdout,
+            warnings: Vec::new(),
+            problems: false,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(cli) {
+
+    // A repository carrying skillenv.toml uses the v1 engine; one still on the
+    // v0 layout keeps working unchanged. Replacing the binary must not break a
+    // setup that has not migrated yet.
+    let result = match dispatch_manifest(&cli) {
+        Some(result) => result,
+        None => run(cli).map(CommandOutput::text),
+    };
+
+    match result {
         Ok(output) => {
-            if !output.is_empty() {
-                println!("{output}");
+            if !output.stdout.is_empty() {
+                println!("{}", output.stdout);
             }
-            ExitCode::SUCCESS
+            for warning in &output.warnings {
+                eprintln!("{warning}");
+            }
+            if output.problems {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => {
             eprintln!("{error}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// Handle a command against a v1 manifest, or `None` to fall through to the v0
+/// path.
+fn dispatch_manifest(cli: &Cli) -> Option<skillenv::Result<CommandOutput>> {
+    match &cli.command {
+        Command::Link(args) if skillenv::has_manifest(".") => {
+            Some(link_manifest_command(args.quiet))
+        }
+        Command::List => Some(skillenv::list_manifest(".").map(CommandOutput::text)),
+        Command::Lint => {
+            Some(
+                skillenv::lint_manifest(".").map(|(stdout, problems)| CommandOutput {
+                    stdout,
+                    warnings: Vec::new(),
+                    problems,
+                }),
+            )
+        }
+        _ => None,
+    }
+}
+
+fn link_manifest_command(quiet: bool) -> skillenv::Result<CommandOutput> {
+    let report = skillenv::link_manifest(".")?;
+    Ok(CommandOutput {
+        stdout: if quiet {
+            String::new()
+        } else {
+            skillenv::format_link_manifest_report(&report)
+        },
+        // Deliberately not gated on `quiet`.
+        warnings: report.warnings(),
+        problems: report.has_problems(),
+    })
 }
 
 fn run(cli: Cli) -> skillenv::Result<String> {
@@ -415,6 +501,12 @@ fn run(cli: Cli) -> skillenv::Result<String> {
             )?;
             Ok(format_status_report(&report))
         }
+        // These only exist against a manifest. Reached only when
+        // `dispatch_manifest` declined, i.e. there is no skillenv.toml, so the
+        // error explains what is missing rather than silently doing nothing.
+        Command::List | Command::Lint => Err(skillenv::SkillenvError::ManifestNotFound {
+            searched_from: std::path::PathBuf::from("."),
+        }),
         Command::Global {
             command: GlobalCommand::Link(args),
         } => {
