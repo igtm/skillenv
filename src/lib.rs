@@ -653,6 +653,8 @@ pub enum SkillenvError {
     },
     #[error("invalid manifest at {path}: {message}")]
     InvalidManifest { path: PathBuf, message: String },
+    #[error("no [[skill]] or [[source]] named '{name}' in {path}")]
+    UnknownEntry { name: String, path: PathBuf },
     #[error("invalid skill id '{input}': {reason}")]
     InvalidSkillId { input: String, reason: String },
     #[error("unknown provider '{name}'; known providers are {known}")]

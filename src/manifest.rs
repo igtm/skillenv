@@ -340,6 +340,80 @@ impl fmt::Display for TargetScope {
     }
 }
 
+/// What a removal took out of the manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovedKind {
+    /// A `[[skill]]` entry.
+    Skill,
+    /// A `[[source]]` entry, and with it every skill it contributed.
+    Source,
+}
+
+/// Delete a `[[skill]]` or `[[source]]` entry by name, in place.
+///
+/// Edited with `toml_edit` rather than serialized from a struct, because the
+/// manifest is written by hand: a round-trip through serde would discard every
+/// comment and reorder what is left. v0 had no removal at all — a lock entry could
+/// only be taken out by hand.
+///
+/// A comment directly above the removed entry goes with it, since it belongs to
+/// that entry; leaving it behind would orphan an explanation above something else.
+/// Every other entry keeps its comments and its formatting verbatim.
+pub fn remove_entry(path: &Path, name: &str) -> Result<RemovedKind> {
+    let raw = fs::read_to_string(path).map_err(|source| SkillenvError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut document =
+        raw.parse::<toml_edit::DocumentMut>()
+            .map_err(|error| SkillenvError::InvalidManifest {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+
+    // `[[skill]]` is keyed on `name`; `[[source]]` likewise, so one helper serves
+    // both. Skills are tried first: a name is far more likely to be a skill, and
+    // removing a source takes its whole contribution with it.
+    let removed = match take_named(&mut document, "skill", name) {
+        true => RemovedKind::Skill,
+        false => match take_named(&mut document, "source", name) {
+            true => RemovedKind::Source,
+            false => {
+                return Err(SkillenvError::UnknownEntry {
+                    name: name.to_string(),
+                    path: path.to_path_buf(),
+                });
+            }
+        },
+    };
+
+    fs::write(path, document.to_string()).map_err(|source| SkillenvError::WriteFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(removed)
+}
+
+/// Drop the first element of the `key` array-of-tables whose `name` matches.
+fn take_named(document: &mut toml_edit::DocumentMut, key: &str, name: &str) -> bool {
+    let Some(array) = document
+        .get_mut(key)
+        .and_then(|item| item.as_array_of_tables_mut())
+    else {
+        return false;
+    };
+    let Some(index) = array.iter().position(|table| {
+        table
+            .get("name")
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value == name)
+    }) else {
+        return false;
+    };
+    array.remove(index);
+    true
+}
+
 // --- wire format -----------------------------------------------------------
 //
 // Kept separate from the validated types above so parsing and validation are
@@ -939,6 +1013,90 @@ skills = ["foo"]
         assert!(parse_source_spec("gist:").is_err());
         assert!(parse_source_spec("github:igtm").is_err());
         Ok(())
+    }
+
+    /// The manifest is written by hand, so an edit must keep the comments a
+    /// serde round-trip would destroy.
+    ///
+    /// A comment sitting directly above an entry belongs to that entry, so
+    /// removing the entry takes it too — which is what a reader would expect, and
+    /// avoids leaving an explanation orphaned above something else. Comments
+    /// belonging to other entries are untouched.
+    #[test]
+    fn removing_an_entry_keeps_the_comments_that_belong_to_others() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skillenv.toml");
+        std::fs::write(
+            &path,
+            r#"[skillenv]
+version = 1
+
+# explains draft-pr, and goes with it
+[[skill]]
+name = "draft-pr"
+source = "local"
+
+# explains writing, and must stay
+[[skill]]
+name = "writing"
+source = "local"
+labels = ["prose"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(remove_entry(&path, "draft-pr")?, RemovedKind::Skill);
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        assert!(!after.contains("draft-pr"), "got:\n{after}");
+        assert!(
+            !after.contains("explains draft-pr"),
+            "its own comment should go with it:\n{after}"
+        );
+        assert!(
+            after.contains("# explains writing, and must stay"),
+            "another entry's comment must survive:\n{after}"
+        );
+        // Formatting the other entry kept is preserved verbatim, not re-emitted.
+        assert!(after.contains("labels = [\"prose\"]"), "got:\n{after}");
+        // And the result is still a valid manifest.
+        let reparsed = Manifest::parse(&after, &path)?;
+        assert_eq!(reparsed.skills.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_source_is_distinguished_from_removing_a_skill() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skillenv.toml");
+        std::fs::write(
+            &path,
+            "[[source]]\nname = \"igtm-skills\"\nfrom = \"github:igtm/skills\"\n\
+             skills = [\"user-context\"]\n",
+        )
+        .unwrap();
+        assert_eq!(remove_entry(&path, "igtm-skills")?, RemovedKind::Source);
+        assert!(
+            Manifest::parse(&std::fs::read_to_string(&path).unwrap(), &path)?
+                .sources
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_name_that_is_not_there_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skillenv.toml");
+        std::fs::write(&path, "[[skill]]\nname = \"a\"\nsource = \"local\"\n").unwrap();
+        let error = remove_entry(&path, "missing").unwrap_err().to_string();
+        assert!(error.contains("missing"), "unexpected: {error}");
+        // The file is untouched when nothing matched.
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("name = \"a\"")
+        );
     }
 
     #[test]
