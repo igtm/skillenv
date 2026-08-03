@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 use thiserror::Error;
 
+mod catalog;
 mod inventory;
 mod lock;
 mod manifest;
@@ -427,6 +428,14 @@ pub enum SkillenvError {
     InvalidSkillId { input: String, reason: String },
     #[error("unknown provider '{name}'; known providers are {known}")]
     UnknownProvider { name: String, known: String },
+    #[error(
+        "skill id '{id}' is declared twice, by {first} and {second}; ids are unique across every source"
+    )]
+    DuplicateSkillId {
+        id: String,
+        first: String,
+        second: String,
+    },
     #[error(
         "lock file at {path} is version {found}, but this build understands only version {supported}; upgrade skillenv"
     )]

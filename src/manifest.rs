@@ -6,9 +6,8 @@
 //! indistinguishable from "these exact skills", and a source that renamed a
 //! skill upstream could never be followed again.
 //!
-//! Nothing reads a manifest yet — `catalog` becomes the first consumer, and this
-//! allow goes away with it. Landing the parser and its tests on their own keeps
-//! the change reviewable.
+//! The module has no public entry point yet, so everything in it reads as dead
+//! code until the CLI wires `Manifest::load` up. The allow goes away then.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
