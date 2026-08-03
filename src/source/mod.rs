@@ -430,6 +430,29 @@ fn sanitize_component(value: &str) -> String {
     }
 }
 
+/// The committer date of `revision`, as seconds since the epoch.
+///
+/// Read from the cache, where the revision was checked out. `None` when it is not
+/// cached, which is the same as not knowing.
+pub fn cached_commit_time(manifest_root: &Path, source_name: &str, revision: &str) -> Option<u64> {
+    let dir = cache_dir(manifest_root, source_name, revision);
+    if !dir.join(".git").is_dir() {
+        return None;
+    }
+    let dir = dir.to_string_lossy().to_string();
+    git::run(&["-C", &dir, "log", "-1", "--format=%ct", revision], None)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Run a git command, for tests in sibling modules that need to build a fixture repo.
+#[cfg(test)]
+pub(crate) fn run_git_for_test(args: &[&str]) -> Result<String> {
+    git::run(args, None)
+}
+
 /// Whether `path` stays inside `root` once both are normalized.
 ///
 /// Used before writing, so a crafted relative path cannot place a file outside
