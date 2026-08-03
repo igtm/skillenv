@@ -13,6 +13,7 @@ use thiserror::Error;
 
 mod catalog;
 mod inventory;
+mod legacy_sweep;
 mod lock;
 mod manifest;
 mod paths;
@@ -23,7 +24,23 @@ mod safeguard;
 mod source;
 
 pub use inventory::format_skill_inventory_report;
+pub use legacy_sweep::{LegacyEntry, SweepReport};
 pub use safeguard::{Finding, Severity};
+
+/// Find what v0 deployed for `repo_slug` in `target`.
+///
+/// Matching keys on the marker's `repo` and the generated-name prefix, never on
+/// its `source`, because migration moves the files that path refers to. v0's own
+/// removal predicate required a live `source`, which is why a migrated setup would
+/// otherwise be unable to clean up after itself.
+pub fn sweep_legacy(target: &std::path::Path, repo_slug: &str) -> Result<SweepReport> {
+    legacy_sweep::sweep(target, repo_slug)
+}
+
+/// Remove the v0 deployments a sweep found, leaving unmarked directories alone.
+pub fn remove_legacy(report: &SweepReport) -> Result<usize> {
+    legacy_sweep::remove(report)
+}
 
 /// Scan one `SKILL.md` for hidden instructions and unsafe patterns.
 ///
