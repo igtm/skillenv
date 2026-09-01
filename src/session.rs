@@ -475,7 +475,7 @@ impl Session {
                 &source.name,
                 &source.spec,
                 source.git_ref.as_deref(),
-                None,
+                source.subdir.as_deref(),
                 pin.as_deref(),
                 cutoff.as_deref(),
             ) {
@@ -665,9 +665,17 @@ impl Session {
             crate::source::cache_dir(&self.root, &source.name, &fetched.revision).join(id.as_str());
         // Nothing to copy when the skill is already where it belongs — either
         // accepted at this revision on an earlier run, or found directly at the
-        // destination because the cache root is itself the skill. The revision is
-        // part of the path, so present means current.
-        let already_in_place = from == destination || destination.join("SKILL.md").is_file();
+        // destination because the cache root is itself the skill.
+        //
+        // "Present" is not enough on its own to mean "current". The destination is
+        // keyed on `(source, revision, id)`, and `subdir` is in none of the three, so
+        // moving a manifest from one bucket to another at the same revision — the same
+        // id living under two of them — finds the earlier bucket's bytes sitting there
+        // and would keep serving them, reporting success. Compared by digest instead,
+        // which costs one read of a directory that is capped at 500 files.
+        let already_in_place = from == destination
+            || (destination.join("SKILL.md").is_file()
+                && digest_tree(&from)? == digest_tree(&destination)?);
         let accepted = if already_in_place {
             crate::source::FetchedSkill {
                 content_digest: digest_tree(&destination)?,
@@ -676,6 +684,21 @@ impl Session {
                 notes: Vec::new(),
             }
         } else {
+            // Cleared first, because `accept_skill` creates the directory and writes
+            // into it without removing what is there. Re-accepting over a populated
+            // destination would otherwise leave behind whatever the previous bucket
+            // had that this one does not, and the digest would then describe a
+            // directory neither source ever contained. `from == destination` is the
+            // one case where this would delete the thing being copied, and that case
+            // has already been taken above.
+            if destination.is_dir() {
+                std::fs::remove_dir_all(&destination).map_err(|source| {
+                    SkillenvError::WriteFile {
+                        path: destination.clone(),
+                        source,
+                    }
+                })?;
+            }
             crate::source::accept_skill(&from, &destination, Some(fetched.revision.clone()))?
         };
 
@@ -758,6 +781,7 @@ impl Session {
                     display: describe(&source.from),
                     spec: source.from.clone(),
                     git_ref: source.git_ref.clone(),
+                    subdir: source.subdir.clone(),
                     skills: match &source.skills {
                         crate::manifest::SkillSelection::All => None,
                         crate::manifest::SkillSelection::Explicit(ids) => Some(ids.clone()),
@@ -778,6 +802,7 @@ impl Session {
                     display: describe(&skill.source),
                     spec: skill.source.clone(),
                     git_ref: None,
+                    subdir: None,
                     skills: Some(vec![skill.id.clone()]),
                 });
         }
@@ -866,7 +891,14 @@ impl Session {
         // to be located inside it — by the same rules as a fetched tree, since it is
         // usually a checkout of one. `skills/<id>` is what these actually look like;
         // treating the root as the skill only works when the tree holds exactly one.
-        if let Some(root) = entry.source_tree(&self.root) {
+        if let Some(tree) = entry.source_tree(&self.root) {
+            // Through the same re-rooting a fetched source gets, so `subdir` means one
+            // thing whichever kind of source carries it — the missing-directory report
+            // and the check that the path does not leave the tree included. This one
+            // matters more, not less: a `path:` skill is deployed from where it lies,
+            // never through `accept_skill`, so nothing downstream screens it.
+            let root = source::resolve_subdir(&tree, entry.subdir.as_deref())
+                .map_err(|error| error.to_string())?;
             return match source::locate_skill(&root, entry.id.as_str()) {
                 Some(dir) => Ok(dir),
                 None => Err(format!("not found under {}", root.display())),
@@ -1083,6 +1115,9 @@ struct RemoteSource {
     display: String,
     spec: SourceSpec,
     git_ref: Option<String>,
+    /// Re-roots the fetched tree, for a repository that files its skills under
+    /// buckets rather than at a layout `locate_skill` recognises.
+    subdir: Option<PathBuf>,
     /// `None` means "whatever the source holds", resolved after fetching.
     skills: Option<Vec<SkillId>>,
 }
@@ -1333,7 +1368,17 @@ fn admit_wildcard_members(catalog: &mut Catalog, lock: &LockFile, root: &Path) -
                     ));
                     continue;
                 }
-                discover_skills(&tree)
+                // Through the shared re-rooting, so a `path:` source is screened the
+                // way a fetched one is rather than by a second, weaker copy of the
+                // rule. A subdirectory that is absent or leaves the tree is reported
+                // here and the source contributes nothing, as with any other conflict.
+                match crate::source::resolve_subdir(&tree, source.subdir.as_deref()) {
+                    Ok(tree) => discover_skills(&tree),
+                    Err(error) => {
+                        conflicts.push(format!("source {}: {error}", source.name));
+                        continue;
+                    }
+                }
             }
             _ => lock
                 .skills
@@ -2158,6 +2203,197 @@ mod tests {
             recorded,
             "an unchanged fetch discarded the scan"
         );
+        Ok(())
+    }
+
+    /// A repository is free to file its skills under buckets, and nothing about that
+    /// layout is visible from outside. `locate_skill` knows four shapes, none of them
+    /// two deep, so `mattpocock/skills` — `skills/engineering/<id>/` — fetched as a
+    /// source with no members at all: the wildcard found nothing and every named
+    /// skill was reported as removed upstream. `subdir` re-roots the tree so the
+    /// ordinary shape is what discovery sees.
+    #[test]
+    fn a_subdir_re_roots_a_source_that_files_skills_under_a_bucket() -> Result<()> {
+        let upstream = TempDir::new().unwrap();
+        let path = upstream.path().to_string_lossy().to_string();
+        for id in ["codebase-design", "domain-modeling"] {
+            let dir = upstream.path().join("skills/engineering").join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("SKILL.md"), valid(id)).unwrap();
+        }
+        commit_all(&path, "one")?;
+
+        // A wildcard's membership is the bucket's contents, not the repository's.
+        let root = workspace(
+            &format!(
+                "[[source]]\nname = \"up\"\nfrom = \"file://{path}\"\nref = \"main\"\n\
+                 subdir = \"skills/engineering\"\nskills = \"*\"\n\n\
+                 [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n"
+            ),
+            &[],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.fetch(true)?;
+        let mut found: Vec<_> = report.fetched.iter().map(|id| id.to_string()).collect();
+        found.sort();
+        assert_eq!(found, ["codebase-design", "domain-modeling"]);
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+
+        // And a named skill is found at the re-rooted tree, not reported missing.
+        let root = workspace(
+            &format!(
+                "[[source]]\nname = \"up\"\nfrom = \"file://{path}\"\nref = \"main\"\n\
+                 subdir = \"skills/engineering\"\nskills = [\"codebase-design\"]\n\n\
+                 [[deploy]]\ntarget = \"claude:home\"\ninclude = [\"*\"]\n"
+            ),
+            &[],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.fetch(true)?;
+        assert_eq!(
+            report
+                .fetched
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            ["codebase-design"]
+        );
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+
+        // Deploying it proves the bytes were copied, not merely listed.
+        session.link()?;
+        assert!(
+            home.path()
+                .join(".claude/skills")
+                .read_dir()
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.path().join("SKILL.md").is_file()),
+            "the skill should have reached the target"
+        );
+        Ok(())
+    }
+
+    /// A subdirectory the source does not have is a mistake in the manifest, and has
+    /// to read as one. Left to discovery it comes back empty, and the skills wanted
+    /// from it are then reported as renamed or removed upstream — which sends the
+    /// reader to the wrong repository.
+    #[test]
+    fn a_subdir_missing_from_the_tree_names_the_source() -> Result<()> {
+        let upstream = TempDir::new().unwrap();
+        let path = upstream.path().to_string_lossy().to_string();
+        let dir = upstream.path().join("skills/kinko");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), valid("kinko")).unwrap();
+        commit_all(&path, "one")?;
+
+        let root = workspace(
+            &format!(
+                "[[source]]\nname = \"up\"\nfrom = \"file://{path}\"\nref = \"main\"\n\
+                 subdir = \"skills/engineering\"\nskills = [\"kinko\"]\n"
+            ),
+            &[],
+        );
+        let home = TempDir::new().unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.fetch(true)?;
+        assert!(report.missing.is_empty(), "{:?}", report.missing);
+        let (name, reason) = report
+            .failed
+            .first()
+            .expect("the source should have failed");
+        assert_eq!(name, "up");
+        assert!(
+            reason.contains("skills/engineering"),
+            "unexpected: {reason}"
+        );
+        Ok(())
+    }
+
+    /// The cache is keyed on `(source, revision, id)`, and `subdir` is in none of the
+    /// three. Moving a manifest from one bucket to another at the same revision — the
+    /// same id living under both, which is how a repository files a skill it has moved
+    /// — therefore found the earlier bucket's bytes already sitting at the destination
+    /// and kept serving them, reporting success the whole way.
+    #[test]
+    fn moving_a_subdir_at_one_revision_replaces_the_cached_bytes() -> Result<()> {
+        let upstream = TempDir::new().unwrap();
+        let path = upstream.path().to_string_lossy().to_string();
+        for (bucket, body) in [("engineering", "FROM-ENGINEERING"), ("misc", "FROM-MISC")] {
+            let dir = upstream.path().join("skills").join(bucket).join("kinko");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("SKILL.md"),
+                format!("{}\n{body}\n", valid("kinko")),
+            )
+            .unwrap();
+            // Only in the first bucket, so a stale copy keeps a file the second never had.
+            if bucket == "engineering" {
+                fs::write(dir.join("only-here.md"), "left over\n").unwrap();
+            }
+        }
+        commit_all(&path, "one")?;
+
+        let manifest = |bucket: &str| {
+            format!(
+                "[[source]]\nname = \"up\"\nfrom = \"file://{path}\"\nref = \"main\"\n\
+                 subdir = \"skills/{bucket}\"\nskills = [\"kinko\"]\n"
+            )
+        };
+        let home = TempDir::new().unwrap();
+        let root = workspace(&manifest("engineering"), &[]);
+        let mut session = open_session(root.path(), home.path())?;
+        session.fetch(true)?;
+
+        fs::write(root.path().join(MANIFEST_FILE), manifest("misc")).unwrap();
+        let mut session = open_session(root.path(), home.path())?;
+        let report = session.fetch(true)?;
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+
+        let entry = session
+            .catalog
+            .get(&SkillId::parse("kinko")?)
+            .expect("the skill should be in the catalog")
+            .clone();
+        let dir = session.content_dir(&entry).expect("bytes should be cached");
+        let body = fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert!(
+            body.contains("FROM-MISC"),
+            "the cache still holds the old bucket's bytes: {body}"
+        );
+        assert!(
+            !dir.join("only-here.md").exists(),
+            "a file from the old bucket survived the replacement"
+        );
+        Ok(())
+    }
+
+    /// Commit everything in a directory, initialising the repository on first use.
+    fn commit_all(path: &str, message: &str) -> Result<()> {
+        if !Path::new(path).join(".git").is_dir() {
+            crate::source::run_git_for_test(&[
+                "init",
+                "--quiet",
+                "--initial-branch",
+                "main",
+                path,
+            ])?;
+        }
+        crate::source::run_git_for_test(&["-C", path, "add", "-A"])?;
+        crate::source::run_git_for_test(&[
+            "-C",
+            path,
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ])?;
         Ok(())
     }
 

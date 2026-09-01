@@ -34,6 +34,8 @@ pub struct CatalogEntry {
     pub source_name: Option<String>,
     /// Set on a source, so every skill it contributes inherits it.
     pub git_ref: Option<String>,
+    /// Set on a source, so every skill it contributes is looked for under it.
+    pub subdir: Option<PathBuf>,
     /// Supplied in the manifest for sources that carry no frontmatter, e.g. a
     /// gist. `None` means "take it from the skill's own frontmatter".
     pub description: Option<String>,
@@ -57,6 +59,11 @@ impl CatalogEntry {
     /// Distinct from `local_dir`: that names one skill's own directory, while this
     /// names a tree to search. Returning the tree here and resolving inside it is
     /// what makes `path:` behave like the checkout it usually is.
+    /// The `subdir` is deliberately *not* applied here. Re-rooting has to check what
+    /// the tree does with the path, not just what the path says — a component that is
+    /// a symlink leaves the tree while looking like it stays — and that is a question
+    /// about the disk, which this pure path function has no business answering.
+    /// Callers hand the result to [`crate::source::resolve_subdir`], which does.
     pub fn source_tree(&self, manifest_root: &Path) -> Option<PathBuf> {
         match &self.source {
             SourceSpec::Path(path) if path.is_absolute() => Some(path.clone()),
@@ -196,6 +203,7 @@ fn entry_from_skill(skill: &SkillEntry) -> CatalogEntry {
         source: skill.source.clone(),
         source_name: None,
         git_ref: None,
+        subdir: None,
         description: skill.description.clone(),
         labels: skill.labels.clone(),
     }
@@ -207,6 +215,7 @@ fn entry_from_source(source: &SourceEntry, id: SkillId) -> CatalogEntry {
         source: source.from.clone(),
         source_name: Some(source.name.clone()),
         git_ref: source.git_ref.clone(),
+        subdir: source.subdir.clone(),
         description: None,
         labels: source.labels.clone(),
     }

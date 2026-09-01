@@ -315,6 +315,23 @@ allow = ["W012:figma-to-code:sha256:abc123…"]
 `.agents/skills/<id>/` の順に skill を探します。実際に存在するレイアウトを
 カバーするためです。
 
+skill を bucket に分けて置くリポジトリはこのどれよりも深いので、`subdir` で
+場所を指定します。ツリーの根を付け替えるだけなので、それ以降は通常のレイアウトと
+同じに見えます。
+
+```toml
+[[source]]
+name = "mattpocock-skills"
+from = "github:mattpocock/skills"
+subdir = "skills/engineering"   # skills/engineering/codebase-design/SKILL.md
+skills = ["codebase-design", "domain-modeling"]
+```
+
+`path:` source にも同じように効きます。相対パスであること、`..` を含まないことが
+条件で、**source にそのディレクトリが無ければエラー**です。無いものを黙って空
+として扱うと、manifest の書き間違いが「上流から skill が消えた」という報告になって
+しまうためです。
+
 `description` は skill 自身の frontmatter を上書きする指定で、source が frontmatter
 を持たない場合——典型的には gist——にここで与えます。provider はいずれも description
 を要求するので、manifest にも frontmatter にも無ければ、`link` は妥当にならない

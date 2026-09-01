@@ -323,6 +323,22 @@ Inside a fetched tree, a skill is looked for at the root itself, at `<id>/`, at
 `skills/<id>/`, and at `.agents/skills/<id>/`, which covers the layouts that
 occur in practice.
 
+A repository that files its skills under buckets is deeper than any of those, so
+say where they are with `subdir`. It re-roots the tree, and everything after that
+sees the ordinary shape:
+
+```toml
+[[source]]
+name = "mattpocock-skills"
+from = "github:mattpocock/skills"
+subdir = "skills/engineering"   # skills/engineering/codebase-design/SKILL.md
+skills = ["codebase-design", "domain-modeling"]
+```
+
+It applies to a `path:` source the same way, must be relative and free of `..`,
+and is refused when the source does not have it — a missing subdirectory reads as
+a mistake in the manifest, not as skills that vanished upstream.
+
 `description` overrides the skill's own frontmatter, and is what you supply when
 the source carries none — a gist, typically. Every provider demands a
 description, so when neither the manifest nor the frontmatter has one, `link`
