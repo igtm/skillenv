@@ -302,7 +302,57 @@ pub(super) fn resolve_subdir(root: &Path, subdir: Option<&Path>) -> Result<PathB
         return Ok(root.to_path_buf());
     };
     validate_subdir(subdir)?;
-    Ok(root.join(subdir))
+    let resolved = root.join(subdir);
+    // Said here rather than left to discovery. A subdirectory that is not in the
+    // tree yields an empty one, and every skill wanted from it is then reported as
+    // "no longer contains" — which points at the upstream repository when the thing
+    // to fix is the manifest.
+    if !resolved.is_dir() {
+        return Err(SkillenvError::InvalidSource {
+            input: subdir.display().to_string(),
+            message: format!(
+                "no such subdirectory in the source tree at {}",
+                root.display()
+            ),
+        });
+    }
+
+    // `validate_subdir` reads the path as text, which settles `..` but says nothing
+    // about what the tree does with it. A checkout is content someone else controls,
+    // and git will happily create `skills/engineering` as a link to `/`: the join
+    // stays inside the checkout lexically, while every read through it lands outside.
+    // The walk in `accept_skill` cannot catch this either — it refuses a symlink it
+    // *encounters*, and a link in the root it is handed is resolved by the OS before
+    // the walk begins. Canonicalizing both sides is the only comparison a symlink
+    // cannot slip past.
+    let real_root = root
+        .canonicalize()
+        .map_err(|source| SkillenvError::ReadFile {
+            path: root.to_path_buf(),
+            source,
+        })?;
+    let real = resolved
+        .canonicalize()
+        .map_err(|source| SkillenvError::ReadFile {
+            path: resolved.clone(),
+            source,
+        })?;
+    if !real.starts_with(&real_root) {
+        return Err(SkillenvError::UnsafeSourceEntry {
+            path: resolved,
+            reason: format!(
+                "leads outside the source tree at {}, so the source controls what \
+                 would be read as a skill",
+                real_root.display()
+            ),
+        });
+    }
+    // The joined path, not the canonical one: callers compare what comes back
+    // against paths they built from the manifest root, and on macOS the cache sits
+    // under a `/var` that canonicalizes to `/private/var`. Canonicalizing only here
+    // would make those comparisons fail for reasons that have nothing to do with
+    // the subdirectory. It is checked, which is what was needed.
+    Ok(resolved)
 }
 
 /// Reject a subdirectory that could escape the tree it is relative to.
@@ -318,6 +368,12 @@ pub(super) fn validate_subdir(subdir: &Path) -> Result<()> {
 
     if subdir.is_absolute() {
         return invalid("subdirectory must be relative to the source root");
+    }
+    // An empty path has no components, so every check below passes it and the join
+    // is a no-op: the source is not re-rooted and nothing says so. Whatever the
+    // author meant, silently doing nothing is not it.
+    if subdir.components().next().is_none() {
+        return invalid("subdirectory must name a directory; omit the key to use the source root");
     }
     for component in subdir.components() {
         match component {
@@ -381,15 +437,58 @@ mod tests {
     #[test]
     fn an_ordinary_subdir_is_accepted() -> Result<()> {
         validate_subdir(Path::new("skills/writing"))?;
+        let checkout = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(checkout.path().join("skills/engineering")).unwrap();
         assert_eq!(
-            resolve_subdir(Path::new("/tmp/co"), Some(Path::new("skills")))?,
-            PathBuf::from("/tmp/co/skills")
+            resolve_subdir(checkout.path(), Some(Path::new("skills/engineering")))?,
+            checkout.path().join("skills/engineering")
         );
         assert_eq!(
-            resolve_subdir(Path::new("/tmp/co"), None)?,
-            PathBuf::from("/tmp/co")
+            resolve_subdir(checkout.path(), None)?,
+            checkout.path().to_path_buf()
         );
         Ok(())
+    }
+
+    /// A subdirectory that is not in the tree is the manifest's mistake, and saying
+    /// so here is the only place it reads as one: discovery would just come back
+    /// empty, and every skill wanted from the source would then be reported as
+    /// missing upstream.
+    #[test]
+    fn a_subdir_that_is_not_in_the_tree_is_named() {
+        let checkout = tempfile::TempDir::new().unwrap();
+        let error = resolve_subdir(checkout.path(), Some(Path::new("skills/nope")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("skills/nope"), "unexpected: {error}");
+        assert!(
+            error.contains("no such subdirectory"),
+            "unexpected: {error}"
+        );
+    }
+
+    /// The tree is content someone else controls, so a subdirectory that is textually
+    /// inside it can still be a link pointing anywhere. `accept_skill`'s symlink
+    /// refusal does not cover this: it walks from the resolved root, and the OS has
+    /// already followed the link by then.
+    #[cfg(unix)]
+    #[test]
+    fn a_subdir_symlinked_out_of_the_tree_is_refused() {
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(outside.path().join("kinko")).unwrap();
+
+        let checkout = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(checkout.path().join("skills")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), checkout.path().join("skills/engineering"))
+            .unwrap();
+
+        let error = resolve_subdir(checkout.path(), Some(Path::new("skills/engineering")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("outside the source tree"),
+            "unexpected: {error}"
+        );
     }
 
     /// Exercises the real runner against a local repository, so the hardened

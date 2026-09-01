@@ -77,6 +77,14 @@ pub struct SourceEntry {
     pub name: String,
     pub from: SourceSpec,
     pub git_ref: Option<String>,
+    /// Where the skills live inside the source, when they are not at one of the
+    /// layouts `locate_skill` already knows.
+    ///
+    /// A repository is free to file its skills under buckets — `mattpocock/skills`
+    /// keeps them in `skills/engineering/`, `skills/productivity/` and so on — and
+    /// nothing about that layout is knowable from the outside. Naming the directory
+    /// re-roots the source, so everything downstream sees the ordinary shape.
+    pub subdir: Option<PathBuf>,
     pub skills: SkillSelection,
     pub labels: Vec<String>,
 }
@@ -513,6 +521,8 @@ struct RawSource {
     #[serde(default, rename = "ref")]
     git_ref: Option<String>,
     #[serde(default)]
+    subdir: Option<String>,
+    #[serde(default)]
     skills: RawSelection,
     #[serde(default)]
     labels: Vec<String>,
@@ -615,6 +625,7 @@ impl RawManifest {
                 name: derived_source_name(&spec),
                 from: spec,
                 git_ref: None,
+                subdir: None,
                 skills: selection,
                 labels: Vec::new(),
             });
@@ -633,10 +644,32 @@ impl RawManifest {
         for raw in self.sources {
             let skills = read_selection(&raw.skills, &format!("source '{}' skills", raw.name))
                 .map_err(invalid)?;
+            let from = parse_source_spec(&raw.from)?;
+            let subdir = match raw.subdir {
+                // Refused here, where the message can still name the manifest and the
+                // line that wrote it. Waiting for the fetch would report a traversing
+                // path as one source failing, long after the point of decision.
+                Some(text) => {
+                    let path = PathBuf::from(&text);
+                    crate::source::validate_subdir(&path).map_err(|error| {
+                        invalid(format!("source '{}' subdir: {error}", raw.name))
+                    })?;
+                    if matches!(from, SourceSpec::Local) {
+                        return Err(invalid(format!(
+                            "source '{}' is local, which has no tree to re-root; \
+                             subdir applies to a fetched or path: source",
+                            raw.name
+                        )));
+                    }
+                    Some(path)
+                }
+                None => None,
+            };
             sources.push(SourceEntry {
                 name: raw.name,
-                from: parse_source_spec(&raw.from)?,
+                from,
                 git_ref: raw.git_ref,
+                subdir,
                 skills,
                 labels: raw.labels,
             });
@@ -992,6 +1025,62 @@ mod tests {
         assert_eq!(manifest.sources[0].git_ref.as_deref(), Some("v2"));
         assert_eq!(manifest.sources[0].labels, vec!["secrets".to_string()]);
         Ok(())
+    }
+
+    /// `subdir` names where the skills sit inside a source that files them under
+    /// buckets. Carried on the source, so every skill it contributes inherits it.
+    #[test]
+    fn a_source_can_name_the_subdirectory_its_skills_sit_in() -> Result<()> {
+        let manifest = parse(
+            "[[source]]\nname = \"matt\"\nfrom = \"github:mattpocock/skills\"\n\
+             subdir = \"skills/engineering\"\nskills = [\"codebase-design\"]\n",
+        )?;
+        assert_eq!(
+            manifest.sources[0].subdir,
+            Some(PathBuf::from("skills/engineering"))
+        );
+        Ok(())
+    }
+
+    /// Refused at parse time rather than at the fetch: this is a line someone wrote,
+    /// and the message can still point at it. `..` would read outside the checkout.
+    #[test]
+    fn a_traversing_subdir_is_refused_by_the_manifest() {
+        let error = parse(
+            "[[source]]\nname = \"matt\"\nfrom = \"github:o/r\"\n\
+             subdir = \"../../etc\"\nskills = [\"x\"]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("matt"), "should name the source: {error}");
+        assert!(error.contains("subdir"), "unexpected: {error}");
+    }
+
+    /// An empty path has no components, so every traversal check passes it and the
+    /// join is a no-op. Whatever the author meant, a source that silently is not
+    /// re-rooted is not it.
+    #[test]
+    fn an_empty_subdir_is_refused_rather_than_ignored() {
+        let error = parse(
+            "[[source]]\nname = \"matt\"\nfrom = \"github:o/r\"\n\
+             subdir = \"\"\nskills = [\"x\"]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("subdir"), "unexpected: {error}");
+    }
+
+    /// A local source has no tree to re-root: its skills are `skills/<id>/` in the
+    /// manifest's own directory. Accepting the key would silently do nothing.
+    #[test]
+    fn subdir_on_a_local_source_is_refused() {
+        let error = parse(
+            "[[source]]\nname = \"mine\"\nfrom = \"local\"\n\
+             subdir = \"nested\"\nskills = [\"x\"]\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("local"), "unexpected: {error}");
     }
 
     /// `["*"]` follows the whole source. A skill id can never be `*`, so a

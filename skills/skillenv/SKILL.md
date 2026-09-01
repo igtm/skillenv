@@ -174,6 +174,18 @@ allow = ["W012:figma-to-code:sha256:abc123..."]
 | `github:owner/repo` | GitHub |
 | `git@...` / `https://...` | 任意の git remote |
 
+取得したツリーの中で skill を探す場所は、ルート自身・`<id>/`・`skills/<id>/`・`.agents/skills/<id>/` の 4 つだけです。**skill を bucket に分けて置くリポジトリはこれより深い**ので、`subdir` で根を付け替えます。
+
+```toml
+[[source]]
+name = "mattpocock-skills"
+from = "github:mattpocock/skills"
+subdir = "skills/engineering"   # skills/engineering/codebase-design/SKILL.md
+skills = ["codebase-design", "domain-modeling"]
+```
+
+`path:` source にも効きます。相対パスで `..` を含まないことが条件で、指定したディレクトリが source に無ければエラーです（黙って空にすると、manifest の書き間違いが「上流から消えた」という報告に化けるため）。
+
 ### target の書き方
 
 `<provider>:<scope>` 形式。scope は `home`（`$HOME` 配下）か `repo`（実行中の repo）です。

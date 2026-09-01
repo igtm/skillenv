@@ -23,6 +23,24 @@ use crate::{Result, SkillenvError};
 /// Where fetched content lives, relative to the manifest root.
 pub(crate) const CACHE_DIR: &str = ".skillenv/cache";
 
+/// Reject a source subdirectory that could escape the tree it is relative to.
+///
+/// Re-exported so the manifest can refuse a traversing `subdir` at parse time,
+/// which is where a person can still see the line they wrote. `fetch_git` checks
+/// again on its own arguments, since it is a public entry point in its own right.
+pub fn validate_subdir(subdir: &Path) -> Result<()> {
+    git::validate_subdir(subdir)
+}
+
+/// Re-root a source tree at its `subdir`, refusing one that leaves the tree.
+///
+/// The one place re-rooting happens, so a `path:` source is screened exactly as a
+/// fetched one is. Splitting it would give two answers to "does this subdirectory
+/// stay inside the tree", and the weaker of the two would be the one that decides.
+pub fn resolve_subdir(root: &Path, subdir: Option<&Path>) -> Result<PathBuf> {
+    git::resolve_subdir(root, subdir)
+}
+
 /// Names never copied out of a fetched tree.
 ///
 /// `.git` because a shallow checkout carries one and it is not part of the skill;
@@ -256,6 +274,21 @@ pub fn accept_skill(
     destination: &Path,
     revision: Option<String>,
 ) -> Result<FetchedSkill> {
+    // The walk below refuses a symlink it *encounters*, and skips the root entry it
+    // was handed — so a skill directory that is itself a link was copied by its
+    // target. `locate_skill` follows links when it tests its candidates, so a source
+    // shipping `<id>` as a link to somewhere on this machine got that somewhere
+    // treated as the skill. Checked here, before the walk starts, because by then the
+    // OS has already resolved it and there is nothing left to see.
+    if source_dir
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(SkillenvError::UnsafeSourceEntry {
+            path: source_dir.to_path_buf(),
+            reason: "a symlink; a skill directory must be a real directory".to_string(),
+        });
+    }
     if !source_dir.join("SKILL.md").is_file() {
         return Err(SkillenvError::MissingSkillFile {
             path: source_dir.join("SKILL.md"),
@@ -720,6 +753,36 @@ mod tests {
 
         let target = TempDir::new().unwrap();
         assert!(accept_skill(source.path(), &target.path().join("out"), None).is_err());
+    }
+
+    /// The test above covers a link *inside* an otherwise legitimate skill. A link
+    /// that *is* the skill directory slipped past it: `WalkDir` skips the root entry,
+    /// and by the time the walk starts the OS has already followed the link. A source
+    /// only had to ship `<id>` as a link to somewhere on this machine, and
+    /// `locate_skill` — which follows links when it tests its candidates — would hand
+    /// that somewhere over as the skill.
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_directory_that_is_itself_a_symlink_is_refused() {
+        let elsewhere = skill_dir();
+        write(elsewhere.path(), "leaked.md", "secret\n");
+
+        let tree = TempDir::new().unwrap();
+        let linked = tree.path().join("kinko");
+        std::os::unix::fs::symlink(elsewhere.path(), &linked).unwrap();
+
+        // It is found, which is the point: the refusal has to come from `accept_skill`.
+        assert_eq!(locate_skill(tree.path(), "kinko"), Some(linked.clone()));
+
+        let target = TempDir::new().unwrap();
+        let error = accept_skill(&linked, &target.path().join("out"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("symlink"), "unexpected: {error}");
+        assert!(
+            !target.path().join("out/leaked.md").exists(),
+            "the link's target was copied anyway"
+        );
     }
 
     #[cfg(unix)]

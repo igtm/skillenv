@@ -634,6 +634,7 @@ mod tests {
             source: SourceSpec::Local,
             source_name: None,
             git_ref: None,
+            subdir: None,
             description: None,
             labels: Vec::new(),
         }
